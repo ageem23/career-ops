@@ -62,18 +62,18 @@
 - NUNCA compartir telefono
 - El tipo de contacto cambia el ENFASIS, no la estructura
 
-**Name verification gate (MANDATORY — do this BEFORE presenting the message to the user):**
+**Verificación de nombre OBLIGATORIA (hacer ANTES de presentar el mensaje al usuario):**
 
-Past incident: a `contacto` message was sent that addressed the right person by the wrong name. The user reviewed it but missed the slip. This gate exists to make that class of error impossible to ship silently.
+Incidente previo: se envió un `contacto` que se dirigía a la persona correcta con el nombre incorrecto. El usuario lo revisó pero no detectó el error. Esta verificación existe para que ese tipo de error sea imposible de pasar por alto.
 
-Before showing the final message, run this checklist out loud in the response:
+Antes de mostrar el mensaje final, ejecutar esta lista de verificación de manera explícita en la respuesta:
 
-1. **Exact-match check**: copy the salutation token from the drafted message (e.g. "Hi Sarah,") and compare it character-for-character against the locked-in `Recipient` line from step 3.5. Flag any mismatch — capitalization, accents, missing/extra characters, or wrong name entirely.
-2. **No-substitution check**: confirm the name in the message did not get auto-completed or pattern-matched to a more common spelling (Sara vs. Sarah, Stephen vs. Steven, José vs. Jose).
-3. **Right-person check**: re-state the LinkedIn URL of the recipient and confirm the message body's hook (company, role, project reference) actually corresponds to THAT person, not a previously-considered target.
-4. **Present format**: when you show the final message to the user, lead with a one-line confirmation:
-   > **Sending to:** {Full Name} ({linkedin URL}) — addressing them as "{salutation in message}"
+1. **Comprobación literal**: copiar el saludo del mensaje redactado (p. ej. "Hi Sarah,") y compararlo carácter por carácter con la línea `Recipient` confirmada en el paso 3.5. Marcar cualquier discrepancia — mayúsculas, acentos, caracteres faltantes/extra, o nombre completamente distinto.
+2. **Sin sustituciones**: confirmar que el nombre en el mensaje no se completó automáticamente con una variante más común (Sara vs. Sarah, Stephen vs. Steven, José vs. Jose).
+3. **Persona correcta**: reafirmar la URL de LinkedIn del destinatario y confirmar que el gancho del mensaje (empresa, rol, referencia a proyecto) corresponde a ESA persona, no a un objetivo considerado anteriormente.
+4. **Formato de presentación**: al mostrar el mensaje final al usuario, encabezar con una línea de confirmación:
+   > **Sending to:** {Nombre completo} ({LinkedIn URL}) — dirigido como "{saludo del mensaje}"
 
-   Then the message body. The user should be able to scan the salutation and the "Sending to" line side by side without hunting.
+   Luego el cuerpo del mensaje. La línea **Sending to:** es metadata de verificación previa al envío — **no** debe incluirse en el mensaje saliente ni contarse contra el límite de 300 caracteres de InMail. El usuario debe poder escanear el saludo y la línea "Sending to:" en paralelo sin tener que buscar.
 
-If any check fails or you're unsure, STOP and ask the user to confirm before proceeding. A wrong name in a cold outreach is unrecoverable — better to ask than to send.
+Si alguna verificación falla o tienes dudas, DETENERSE y pedir al usuario que confirme antes de continuar. Un nombre incorrecto en un mensaje en frío es irrecuperable — mejor preguntar que enviar.
