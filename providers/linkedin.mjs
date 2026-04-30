@@ -38,6 +38,7 @@ import { mkdirSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline';
+import { createHash } from 'crypto';
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -209,11 +210,18 @@ function log(msg) { console.log(`[linkedin] ${msg}`); }
 function warn(msg) { console.warn(`[linkedin] ⚠ ${msg}`); }
 
 function slugify(text) {
-  return String(text || '')
+  const slug = String(text || '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 80);
+  if (slug) return slug;
+  // Non-Latin titles (Japanese, Arabic, Cyrillic, etc.) strip to empty here.
+  // Fall back to a stable short hash of the input so each unique title still
+  // gets its own jds/<slug>.md file instead of every posting colliding on
+  // jds/.md.
+  const hash = createHash('sha1').update(String(text || '')).digest('hex').slice(0, 10);
+  return `jd-${hash}`;
 }
 
 function yamlEscape(str) {
@@ -231,7 +239,12 @@ function unwrapRedirect(href) {
     const nested = u.searchParams.get('url');
     if (!nested) return trimmed;
     const decoded = decodeURIComponent(nested);
-    new URL(decoded);
+    const decodedUrl = new URL(decoded);
+    // Reject javascript:, file:, data:, and other non-web schemes so they
+    // can't end up in the JD frontmatter or the persisted application URL.
+    if (decodedUrl.protocol !== 'http:' && decodedUrl.protocol !== 'https:') {
+      return '';
+    }
     return decoded;
   } catch {
     return trimmed;
