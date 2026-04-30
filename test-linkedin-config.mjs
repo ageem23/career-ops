@@ -108,6 +108,19 @@ function validateEntry(entry, idx) {
     errors.push(`"enabled" must be true or false, got ${JSON.stringify(entry.enabled)}`);
   }
 
+  // delay_pages / delay_searches (optional) — providers/linkedin.mjs treats
+  // these as [min, max] tuples passed to randomDelay(); a scalar or non-tuple
+  // produces NaN delays at runtime. Validate the shape here.
+  for (const key of ['delay_pages', 'delay_searches']) {
+    if (entry[key] == null) continue;
+    const v = entry[key];
+    if (!Array.isArray(v) || v.length !== 2 ||
+        !Number.isFinite(v[0]) || !Number.isFinite(v[1]) ||
+        v[0] < 0 || v[1] < 0 || v[0] > v[1]) {
+      errors.push(`"${key}" must be a [min, max] number tuple in milliseconds with 0 <= min <= max, got ${JSON.stringify(v)}`);
+    }
+  }
+
   // surface unknown top-level fields so typos don't get silently ignored
   const KNOWN = new Set([
     'name', 'provider', 'enabled', 'search',
@@ -134,7 +147,12 @@ function suggestDatePosted(input) {
 // ── Main ────────────────────────────────────────────────────────────
 
 const config = loadConfig();
-const entries = config?.tracked_companies || [];
+const rawEntries = config?.tracked_companies;
+if (rawEntries != null && !Array.isArray(rawEntries)) {
+  console.error(`Error: tracked_companies in ${PORTALS_PATH} must be a YAML list (array), got ${typeof rawEntries}.`);
+  process.exit(2);
+}
+const entries = rawEntries || [];
 const linkedinEntries = entries
   .map((e, i) => ({ entry: e, idx: i }))
   .filter(({ entry }) => entry?.provider === 'linkedin');
