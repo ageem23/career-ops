@@ -21,8 +21,25 @@
 #   5. Set enabled: false on companies you don't care about
 
 # -- Title filter --
-# The scanner uses these keywords to decide if a title is relevant.
-# At least 1 positive must match AND 0 negatives must match (case-insensitive).
+#
+# Three-stage match per scanned title:
+#   1. NEGATIVE — literal substring (case-insensitive). Hard reject.
+#   2. POSITIVE — literal substring. Definite accept.
+#   3. NEUTRAL  — neither hit; sent to the optional semantic phase.
+#
+# The semantic phase runs once at the end of each scan if a backend is
+# available. Backend resolution:
+#   1. ANTHROPIC_API_KEY set → Anthropic API (faster, separate billing)
+#   2. `claude` CLI in PATH  → Claude Code (subscription billing, +2-5s/scan)
+#   3. Neither               → neutrals are rejected
+# Override either with CAREER_OPS_SEMANTIC_BACKEND=api|cli.
+# Both backends use the positive list + archetypes (below) to classify
+# each neutral title as a semantic match or not.
+#
+# Archetypes are richer canonical descriptions that help the LLM catch
+# variants the literal positive list misses (e.g. "Sr. Director - Engineering"
+# matching "Director of Engineering", "Head of Platform" matching
+# "VP of Engineering"). They are NOT used for the literal-substring stage.
 
 title_filter:
   positive:
@@ -99,6 +116,17 @@ title_filter:
     - "Lead"
     - "Head"
     - "Director"
+  archetypes:
+    # [CUSTOMIZE — OPTIONAL] Canonical role-family descriptions used ONLY by
+    # the semantic phase (when ANTHROPIC_API_KEY is set). The LLM sees these
+    # alongside the positive list and uses them to decide whether neutral
+    # titles match. Phrase them as the kind of role, not specific keywords.
+    #
+    # Example for a senior engineering-leadership target:
+    # - "Senior engineering leadership at the Director, VP, or Head level"
+    # - "Engineering manager / staff EM / senior EM running a team"
+    # - "AI/ML platform engineering management (LLMOps, evals, agentic)"
+    # - "Solutions architect — pre-sales or post-sales senior IC"
 
 # -- Search queries --
 # Each query triggers a WebSearch. Use site: to filter by portal.
@@ -284,6 +312,39 @@ search_queries:
 # For Greenhouse companies, add api: field for faster structured JSON access.
 
 tracked_companies:
+
+  # -- LinkedIn (authenticated keyword search) --
+  #
+  # Each entry below runs ONE keyword search against LinkedIn's logged-in
+  # job board. On the first interactive run of `node scan.mjs`, a visible
+  # browser opens for login; press Enter once you're signed in and the scan
+  # continues. The session is saved at ~/.career-ops-auth/linkedin/profile/
+  # and reused headlessly on subsequent runs.
+  #
+  # For unattended runs (cron, /loop, /schedule), warm the session first:
+  #   node scan.mjs --login linkedin
+  # — otherwise the run will fail fast with a hint, since it can't prompt.
+  #
+  # Each accepted listing's full JD is written to `jds/<company>-<role>.md`
+  # and added to pipeline.md as `local:jds/...` (since LinkedIn URLs aren't
+  # reachable later without re-authenticating).
+  #
+  # Uncomment and customize the entries below to enable LinkedIn scanning:
+  #
+  # - name: "LinkedIn — Engineering Manager AI"
+  #   provider: linkedin
+  #   enabled: true
+  #   search: "Engineering Manager AI"
+  #   date_posted: "Week"            # "24" | "Week" | "Month" | omit
+  #   experience_level: ["Director"] # optional array
+  #   max_results: 25
+  #
+  # - name: "LinkedIn — VP of Engineering Healthcare"
+  #   provider: linkedin
+  #   enabled: true
+  #   search: "VP of Engineering Healthcare"
+  #   date_posted: "Month"
+  #   max_results: 25
 
   # -- AI Labs & LLM providers --
 

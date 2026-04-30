@@ -43,6 +43,7 @@ const parseYaml = yaml.load;
 
 const PORTALS_PATH = 'portals.yml';
 const SCAN_HISTORY_PATH = 'data/scan-history.tsv';
+const SEMANTIC_LOG_PATH = 'data/scan-semantic-log.tsv';
 const PIPELINE_PATH = 'data/pipeline.md';
 const APPLICATIONS_PATH = 'data/applications.md';
 const PROVIDERS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'providers');
@@ -98,16 +99,32 @@ function resolveProvider(entry, providers) {
 }
 
 // ── Title filter ────────────────────────────────────────────────────
+//
+// Returns an object exposing classify(title, opts) → 'reject' | 'accept' | 'neutral'.
+//
+//   reject  — title contains a negative keyword (hard reject, never recovered)
+//   accept  — title contains a positive keyword OR opts.skipPositive set
+//             (provider already pre-filtered, e.g. linkedin keyword search)
+//   neutral — neither positive nor negative; sent to the semantic phase
+//             (in scan.mjs main(), after parallelFetch completes) for an
+//             LLM-backed match against the positive list + archetypes.
+//
+// Negative is always literal-substring; deliberately NOT subject to the
+// semantic phase (those are intentional hard rejects).
 
 function buildTitleFilter(titleFilter) {
   const positive = (titleFilter?.positive || []).map(k => k.toLowerCase());
   const negative = (titleFilter?.negative || []).map(k => k.toLowerCase());
 
-  return (title) => {
-    const lower = title.toLowerCase();
-    const hasPositive = positive.length === 0 || positive.some(k => lower.includes(k));
-    const hasNegative = negative.some(k => lower.includes(k));
-    return hasPositive && !hasNegative;
+  return {
+    classify(title, opts = {}) {
+      const lower = title.toLowerCase();
+      if (negative.some(k => lower.includes(k))) return 'reject';
+      if (opts.skipPositive) return 'accept';
+      if (positive.length === 0) return 'accept';
+      if (positive.some(k => lower.includes(k))) return 'accept';
+      return 'neutral';
+    },
   };
 }
 
@@ -162,6 +179,15 @@ function loadSeenCompanyRoles() {
 
 // ── Pipeline writer ─────────────────────────────────────────────────
 
+// Format an entry line for pipeline.md. Includes location as a 4th field when
+// the provider supplied one — preserves it for downstream triage scoring.
+// Older 3-field lines remain valid since parsers treat the 4th field as
+// optional (see triage-pending.mjs and update-pipeline-scores.mjs).
+function formatPipelineLine(o) {
+  const base = `- [ ] ${o.url} | ${o.company} | ${o.title}`;
+  return o.location ? `${base} | ${o.location}` : base;
+}
+
 function appendToPipeline(offers) {
   if (offers.length === 0) return;
 
@@ -174,9 +200,7 @@ function appendToPipeline(offers) {
     // No Pendientes section — append at end before Procesadas
     const procIdx = text.indexOf('## Procesadas');
     const insertAt = procIdx === -1 ? text.length : procIdx;
-    const block = `\n${marker}\n\n` + offers.map(o =>
-      `- [ ] ${o.url} | ${o.company} | ${o.title}`
-    ).join('\n') + '\n\n';
+    const block = `\n${marker}\n\n` + offers.map(formatPipelineLine).join('\n') + '\n\n';
     text = text.slice(0, insertAt) + block + text.slice(insertAt);
   } else {
     // Find the end of existing Pendientes content (next ## or end)
@@ -184,9 +208,7 @@ function appendToPipeline(offers) {
     const nextSection = text.indexOf('\n## ', afterMarker);
     const insertAt = nextSection === -1 ? text.length : nextSection;
 
-    const block = '\n' + offers.map(o =>
-      `- [ ] ${o.url} | ${o.company} | ${o.title}`
-    ).join('\n') + '\n';
+    const block = '\n' + offers.map(formatPipelineLine).join('\n') + '\n';
     text = text.slice(0, insertAt) + block + text.slice(insertAt);
   }
 
@@ -204,6 +226,21 @@ function appendToScanHistory(offers, date) {
   ).join('\n') + '\n';
 
   appendFileSync(SCAN_HISTORY_PATH, lines, 'utf-8');
+}
+
+function appendToSemanticLog(rows, date) {
+  if (rows.length === 0) return;
+  if (!existsSync(SEMANTIC_LOG_PATH)) {
+    writeFileSync(SEMANTIC_LOG_PATH, 'date\tverdict\ttitle\tcompany\tprovider\n', 'utf-8');
+  }
+  const lines = rows.map(r =>
+    `${date}\t${r.verdict}\t${escapeTab(r.title)}\t${escapeTab(r.company)}\t${r.providerId}`
+  ).join('\n') + '\n';
+  appendFileSync(SEMANTIC_LOG_PATH, lines, 'utf-8');
+}
+
+function escapeTab(s) {
+  return String(s ?? '').replace(/\t/g, ' ').replace(/\n/g, ' ');
 }
 
 // ── Parallel fetch with concurrency limit ───────────────────────────
@@ -231,12 +268,33 @@ async function main() {
   const dryRun = args.includes('--dry-run');
   const companyFlag = args.indexOf('--company');
   const filterCompany = companyFlag !== -1 ? args[companyFlag + 1]?.toLowerCase() : null;
+  const loginFlag = args.indexOf('--login');
+  const loginProviderId = loginFlag !== -1 ? args[loginFlag + 1] : null;
 
   // 1. Load providers
   const providers = await loadProviders(PROVIDERS_DIR);
+  loadedProviders = providers;
   if (providers.size === 0) {
     console.error('Error: no providers loaded from providers/');
     process.exit(1);
+  }
+
+  // 1b. Login mode — delegate to a provider's login() method and exit.
+  if (loginProviderId) {
+    const provider = providers.get(loginProviderId);
+    if (!provider) {
+      console.error(`Error: unknown provider "${loginProviderId}". Available: ${[...providers.keys()].join(', ')}`);
+      process.exitCode = 1;
+      return;
+    }
+    if (typeof provider.login !== 'function') {
+      console.error(`Error: provider "${loginProviderId}" does not support --login`);
+      process.exitCode = 1;
+      return;
+    }
+    const ok = await provider.login();
+    process.exitCode = ok ? 0 : 1;
+    return;
   }
 
   // 2. Read portals.yml
@@ -272,36 +330,47 @@ async function main() {
   // 5. Fetch all APIs
   const date = new Date().toISOString().slice(0, 10);
   let totalFound = 0;
-  let totalFiltered = 0;
+  let totalFilteredNegative = 0;
+  let totalAcceptedLiteral = 0;
   let totalDupes = 0;
   const newOffers = [];
+  const neutrals = [];           // { job, providerId } — sent to semantic phase
   const errors = [...resolveErrors];
+
+  // Try-accept helper: applies dedup and pushes to newOffers if novel.
+  // Returns true if accepted, false if duplicate (counters bumped accordingly).
+  function tryAccept(job, source) {
+    if (seenUrls.has(job.url)) { totalDupes++; return false; }
+    const key = `${job.company.toLowerCase()}::${job.title.toLowerCase()}`;
+    if (seenCompanyRoles.has(key)) { totalDupes++; return false; }
+    seenUrls.add(job.url);
+    seenCompanyRoles.add(key);
+    newOffers.push({ ...job, source });
+    return true;
+  }
 
   const tasks = targets.map(company => async () => {
     const provider = company._provider;
     const ctx = company.transport === 'browser' ? makeBrowserCtx() : makeHttpCtx();
+    const skipPositive = provider.bypassPositiveFilter === true;
     try {
       const jobs = await provider.fetch(company, ctx);
       totalFound += jobs.length;
 
       for (const job of jobs) {
-        if (!titleFilter(job.title)) {
-          totalFiltered++;
+        const verdict = titleFilter.classify(job.title, { skipPositive });
+        if (verdict === 'reject') {
+          totalFilteredNegative++;
           continue;
         }
-        if (seenUrls.has(job.url)) {
-          totalDupes++;
+        if (verdict === 'neutral') {
+          neutrals.push({ job, providerId: provider.id });
           continue;
         }
-        const key = `${job.company.toLowerCase()}::${job.title.toLowerCase()}`;
-        if (seenCompanyRoles.has(key)) {
-          totalDupes++;
-          continue;
+        // verdict === 'accept'
+        if (tryAccept(job, `${provider.id}-api`)) {
+          totalAcceptedLiteral++;
         }
-        // Mark as seen to avoid intra-scan dupes
-        seenUrls.add(job.url);
-        seenCompanyRoles.add(key);
-        newOffers.push({ ...job, source: `${provider.id}-api` });
       }
     } catch (err) {
       errors.push({ company: company.name, error: err.message });
@@ -309,6 +378,80 @@ async function main() {
   });
 
   await parallelFetch(tasks, CONCURRENCY);
+
+  // 5b. Semantic phase — second-chance the neutral bucket against the
+  // positive keyword list + optional archetype descriptions.
+  //
+  // Backend selection (handled inside scan-semantic.mjs):
+  //   - CAREER_OPS_SEMANTIC_BACKEND=api|cli  (explicit override)
+  //   - ANTHROPIC_API_KEY set                → API (faster, separate billing)
+  //   - `claude` CLI in PATH                 → CLI (subscription billing)
+  //   - neither                              → no backend, neutrals rejected
+  //
+  // On call failure (rate limit, network, etc.), neutrals are rejected with
+  // the error surfaced. Negative filter has already run before this phase.
+  let totalAcceptedSemantic = 0;
+  let totalFilteredSemantic = 0;
+  let semanticError = null;
+
+  if (neutrals.length > 0) {
+    const { hasSemanticBackend, classifyTitles } = await import('./scan-semantic.mjs');
+    const backend = hasSemanticBackend();
+    if (!backend) {
+      console.log(`\nℹ ${neutrals.length} neutral titles rejected — set ANTHROPIC_API_KEY or install Claude Code (claude CLI) to enable semantic recovery`);
+      totalFilteredSemantic = neutrals.length;
+    } else {
+      console.log(`\nRunning semantic check on ${neutrals.length} neutral titles (backend: ${backend})...`);
+      try {
+        // Dedup titles before sending — the LLM doesn't need to see "Director, Engineering" twice.
+        const uniqueTitles = [...new Set(neutrals.map(n => n.job.title))];
+        const decisions = await classifyTitles({
+          positive: config.title_filter?.positive || [],
+          archetypes: config.title_filter?.archetypes || [],
+          titles: uniqueTitles,
+        });
+
+        // Persist every successfully-classified decision (accept + reject)
+        // so we can mine the log later for filter refinements via
+        // analyze-filter-patterns.mjs. Titles not in the decisions Map come
+        // from chunks that errored out — we don't log those (no verdict to
+        // record) and treat them as rejected for accept/reject accounting.
+        const semanticLogRows = [];
+        let unclassified = 0;
+        for (const { job, providerId } of neutrals) {
+          if (!decisions.has(job.title)) {
+            unclassified++;
+            continue;
+          }
+          const accepted = decisions.get(job.title);
+          semanticLogRows.push({
+            verdict: accepted ? 'ACCEPT' : 'REJECT',
+            title: job.title,
+            company: job.company,
+            providerId,
+          });
+        }
+        if (!dryRun) appendToSemanticLog(semanticLogRows, date);
+        if (unclassified > 0) {
+          console.log(`  ⚠ ${unclassified} titles unclassified (chunk failures) — treated as rejected`);
+        }
+
+        for (const { job, providerId } of neutrals) {
+          if (decisions.get(job.title)) {
+            if (tryAccept(job, `${providerId}-semantic`)) {
+              totalAcceptedSemantic++;
+            }
+          } else {
+            totalFilteredSemantic++;
+          }
+        }
+      } catch (err) {
+        semanticError = err.message;
+        console.log(`⚠ Semantic check failed: ${err.message} — rejecting neutrals`);
+        totalFilteredSemantic = neutrals.length;
+      }
+    }
+  }
 
   // 6. Write results
   if (!dryRun && newOffers.length > 0) {
@@ -322,9 +465,16 @@ async function main() {
   console.log(`${'━'.repeat(45)}`);
   console.log(`Companies scanned:     ${targets.length}`);
   console.log(`Total jobs found:      ${totalFound}`);
-  console.log(`Filtered by title:     ${totalFiltered} removed`);
+  console.log(`Filtered (negative):   ${totalFilteredNegative}`);
+  console.log(`Accepted (literal):    ${totalAcceptedLiteral}`);
+  if (neutrals.length > 0) {
+    console.log(`Neutrals (semantic):   ${totalAcceptedSemantic} matched / ${totalFilteredSemantic} rejected / ${neutrals.length} total`);
+  }
   console.log(`Duplicates:            ${totalDupes} skipped`);
   console.log(`New offers added:      ${newOffers.length}`);
+  if (semanticError) {
+    console.log(`\n⚠ Semantic phase error: ${semanticError}`);
+  }
 
   if (errors.length > 0) {
     console.log(`\nErrors (${errors.length}):`);
@@ -349,9 +499,25 @@ async function main() {
   console.log('→ Share results and get help: https://discord.gg/8pRpHETxa4');
 }
 
+// Tracked across main() and the finally hook so cleanup hits the same
+// provider instances that fetch() used.
+let loadedProviders = null;
+
+async function cleanupProviders() {
+  if (!loadedProviders) return;
+  await Promise.allSettled(
+    [...loadedProviders.values()]
+      .filter(p => typeof p.cleanup === 'function')
+      .map(p => p.cleanup())
+  );
+}
+
 main()
   .catch(err => {
     console.error('Fatal:', err.message);
     process.exitCode = 1;
   })
-  .finally(() => closeBrowser());
+  .finally(async () => {
+    await closeBrowser();
+    await cleanupProviders();
+  });

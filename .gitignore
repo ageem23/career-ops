@@ -1,13 +1,16 @@
 # Personal data (user fills these)
 cv.md
+article-digest.md
 data/applications.md
 data/pipeline.md
+data/scan-semantic-log.tsv
 data/scan-history.tsv
 reports/*.md
 !reports/.gitkeep
 output/*
 !output/.gitkeep
 batch/logs/*
+batch/bat*
 !batch/logs/.gitkeep
 batch/batch-state.tsv
 batch/batch-input.tsv
@@ -15,6 +18,12 @@ batch/tracker-additions/**/*.tsv
 !batch/tracker-additions/.gitkeep
 jds/*
 !jds/.gitkeep
+interview-prep/*
+tmp/*
+batch/*
+build-*
+.claude/pr*
+.claude/settings.json
 
 # User config and customization (never auto-updated)
 config/profile.yml

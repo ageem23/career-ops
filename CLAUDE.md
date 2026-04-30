@@ -64,7 +64,7 @@ AI-powered job search automation built on Claude Code: pipeline tracking, offer 
 | `followup-cadence.mjs` | Follow-up cadence calculator (JSON output) |
 | `data/follow-ups.md` | Follow-up history tracker |
 | `scan.mjs` | Zero-token portal scanner — loads plugins from `providers/` and dispatches per entry |
-| `providers/` | Provider plugins (Greenhouse, Ashby, Lever, `scraper.mjs` for HTML job boards, `apify.mjs` for any Apify actor). Drop a new `*.mjs` file to add a source; files prefixed with `_` are shared helpers |
+| `providers/` | Provider plugins (Greenhouse, Ashby, Lever, `scraper.mjs` for HTML job boards, `apify.mjs` for any Apify actor, `linkedin.mjs` for authenticated LinkedIn keyword search). Drop a new `*.mjs` file to add a source; files prefixed with `_` are shared helpers |
 | `check-liveness.mjs` | Job posting liveness checker |
 | `liveness-core.mjs` | Shared liveness logic (expired signals win over generic Apply text) |
 | `reports/` | Evaluation reports (format: `{###}-{company-slug}-{YYYY-MM-DD}.md`). Blocks A-F + G (Posting Legitimacy). Header includes `**Legitimacy:** {tier}`. |
@@ -77,16 +77,47 @@ AI-powered job search automation built on Claude Code: pipeline tracking, offer 
 export default {
   id: 'scraper',                       // matched against `provider:` in portals.yml
   detect(entry) { return null; },      // optional: auto-detect from careers_url
-  async fetch(entry, ctx) { ... }      // required: returns [{title,url,company,location}]
+  async fetch(entry, ctx) { ... },     // required: returns [{title,url,company,location}]
+  async login() { ... },               // optional: authenticated providers — `node scan.mjs --login <id>` invokes this
+  async cleanup() { ... },             // optional: called at scan exit; release browser contexts here
+  bypassPositiveFilter: false          // optional: set true for keyword-search providers (e.g. linkedin) — negative filter still applies
 };
 ```
 
 `tracked_companies` entries may set two optional fields to control dispatch:
 
-- **`provider: <id>`** — forces a specific plugin; skips all `detect()` auto-detection. Required for scraper and Apify entries.
+- **`provider: <id>`** — forces a specific plugin; skips all `detect()` auto-detection. Required for scraper, Apify, and LinkedIn entries.
 - **`transport: browser`** — routes `ctx.fetchText`/`ctx.fetchJson` through a pooled Playwright page instead of plain HTTP. Use when a site starts blocking bot traffic. Defaults to `http`.
 
 The `_http.mjs`, `_browser.mjs`, and `_apify.mjs` helpers are shared transport layers; they are NOT loaded as providers (underscore prefix). The `apify.mjs` provider requires `APIFY_TOKEN` in the environment — when unset, the entry errors cleanly and the rest of the scan continues. Each Apify entry declares its own `actor`, `input`, and `field_map` (for mapping the actor's output to `{title, url, company, location}`), so any Apify actor works without code changes.
+
+The `linkedin.mjs` provider drives an authenticated LinkedIn keyword search via a persistent Playwright profile (`~/.career-ops-auth/linkedin/profile/`). Each LinkedIn entry in `tracked_companies` is one keyword search (`provider: linkedin`, `search: "..."`, optional `date_posted`/`experience_level`/`max_results`). On an **interactive** first run, the provider triggers the login flow inline: a visible browser opens, the user logs in, presses Enter, and the scan continues — no separate setup step required. On non-interactive runs (cron, CI, `/loop`, `/schedule`), a missing session fails fast with a hint to run `node scan.mjs --login linkedin` from a terminal first. Concurrent LinkedIn entries share a single in-flight login via a singleton promise. `--login linkedin` remains as a power-user shortcut for proactively re-warming the session. Because LinkedIn URLs aren't reachable later without the session, the provider captures full JD text at scan time, writes `jds/<company>-<role>.md` with YAML frontmatter, and returns metadata using the `local:jds/...` URL convention.
+
+### Title Filter — Three-Stage Match
+
+Each title returned by a provider is classified into one of three buckets:
+
+1. **Reject** — title contains a literal keyword from `title_filter.negative`. Hard reject; never recovered.
+2. **Accept (literal)** — title contains a literal keyword from `title_filter.positive`. Definite accept.
+3. **Neutral** — neither hit. Sent to the optional **semantic phase** at the end of the scan.
+
+The semantic phase runs once per scan if a backend is available. Backend resolution (handled in [scan-semantic.mjs](scan-semantic.mjs)):
+1. `CAREER_OPS_SEMANTIC_BACKEND=api|cli` — explicit override
+2. `ANTHROPIC_API_KEY` set → **api** (Claude Haiku 4.5 via `@anthropic-ai/sdk`, ~500ms-1s per scan, separate billing)
+3. `claude` CLI in PATH → **cli** (Claude Code via `claude -p --model haiku`, ~2-5s spawn overhead, uses your Claude Code subscription quota)
+4. Neither → neutrals are rejected with a one-line note explaining how to enable semantic recovery
+
+Both backends use the same prompt and produce the same `Map<title, boolean>` result; the only differences are latency and which billing pool the request hits. On any call failure (rate limit, network, malformed response), neutrals are rejected and the error is surfaced. The negative list is always literal-only — semantic check never overrides a hard reject. Matches accepted by the semantic phase land in the pipeline with source `<provider-id>-semantic`.
+
+The optional `title_filter.archetypes` block in portals.yml contains canonical role-family descriptions used **only** by the semantic phase. Use it to capture role variants the literal positive list misses. Example:
+
+```yaml
+title_filter:
+  positive: ["Director of Engineering", "VP of Engineering", "Engineering Manager"]
+  archetypes:
+    - "Senior engineering leadership at the Director, VP, or Head level"
+    - "AI/ML platform engineering management (LLMOps, evals, agentic)"
+```
 
 ### OpenCode Commands
 

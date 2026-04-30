@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -14,6 +15,32 @@ import (
 	"github.com/santifer/career-ops/dashboard/internal/theme"
 	"github.com/santifer/career-ops/dashboard/internal/ui/screens"
 )
+
+// findCareerOpsRoot walks up from start looking for a directory that contains
+// applications.md or data/applications.md, so `go run .` works from anywhere
+// inside the project (e.g. the dashboard/ subdir). Returns start unchanged if
+// no marker is found within the walk cap.
+func findCareerOpsRoot(start string) string {
+	abs, err := filepath.Abs(start)
+	if err != nil {
+		return start
+	}
+	cur := abs
+	for i := 0; i < 6; i++ {
+		if _, err := os.Stat(filepath.Join(cur, "applications.md")); err == nil {
+			return cur
+		}
+		if _, err := os.Stat(filepath.Join(cur, "data", "applications.md")); err == nil {
+			return cur
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return start
+}
 
 type viewState int
 
@@ -156,6 +183,9 @@ func main() {
 	flag.Parse()
 
 	careerOpsPath := *pathFlag
+	if *pathFlag == "." {
+		careerOpsPath = findCareerOpsRoot(".")
+	}
 
 	// Load applications
 	apps := data.ParseApplications(careerOpsPath)
