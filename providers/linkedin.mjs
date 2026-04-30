@@ -48,12 +48,22 @@ const FEED_URL = 'https://www.linkedin.com/feed/';
 const LOGIN_URL = 'https://www.linkedin.com/login';
 
 const SELECTORS = {
-  xpathListingCard: "//button[starts-with(@aria-label, 'Dismiss') and contains(@aria-label, 'job')]/ancestor::div[@role='button']",
-  xpathApplyUrl: "//a[@aria-label='Apply on company website']",
-  xpathTitle: "//div[@data-display-contents='true']//a[contains(@href,'trackingId')]",
-  xpathCompany: "//a[contains(@href,'/company/')]",
-  xpathMoreButton: "//span[normalize-space(text())='more']",
-  jdContent: 'span[data-testid="expandable-text-box"]',
+  // Card listing — `div[data-job-id]` is the canonical wrapper LinkedIn uses
+  // for each job card on the search page. The previous "Dismiss button →
+  // ancestor div[role='button']" XPath stopped matching when LinkedIn dropped
+  // the per-card Dismiss control from the default search list.
+  listingCard: 'div[data-job-id]',
+  cardJobsViewLink: 'a[href*="/jobs/view/"]',
+
+  // Detail panel selectors. Primary uses dedicated CSS classes shipped with
+  // the unified top-card; fallback handles older variants and the bare h1
+  // case if LinkedIn renames the wrapper class again.
+  panelTitle: '.job-details-jobs-unified-top-card__job-title h1, h1.t-24, h1',
+  panelCompany: '.job-details-jobs-unified-top-card__company-name a, .job-details-jobs-unified-top-card__company-name',
+  panelApply: 'a[aria-label*="Apply"]:not([aria-label*="Easy"]):not([aria-label*="continue"])',
+  panelJdContent: '#job-details, .jobs-description__container, .jobs-box__html-content',
+  panelMoreButton: '.jobs-description__footer-button button, button.jobs-description__footer-button',
+
   loggedIn: 'a[aria-label*="My Network"]',
   xpathCurrentPage: "//button[@aria-current='true'][starts-with(@aria-label, 'Page')]",
   xpathPageButton: "//button[starts-with(@aria-label, 'Page')]",
@@ -67,7 +77,6 @@ const NOISE_LABELS = new Set([
 const MIN_TITLE_LENGTH = 4;
 const DEFAULT_DELAY_PAGES = [3000, 8000];
 const DEFAULT_DELAY_SEARCHES = [5000, 15000];
-const DATE_POSTED_LABEL = { '24': 'past 24 hours', 'Week': 'past week', 'Month': 'past month' };
 
 // ── Browser singleton ───────────────────────────────────────────────
 //
@@ -253,17 +262,30 @@ function unwrapRedirect(href) {
 
 // ── Search URL construction ─────────────────────────────────────────
 
+// LinkedIn's `f_TPR` parameter is the real time-posted filter — `r86400`
+// (past 24h), `r604800` (past week), `r2592000` (past month). The previous
+// implementation appended "posted in the past week" into the keyword string,
+// which made every search a literal-keyword match against descriptive text
+// and returned ~0 results. Path also corrected: `/jobs/search-results/`
+// renders a blank shell on direct navigation; `/jobs/search/` is the real
+// keyword-search entry point.
+const DATE_POSTED_TPR = { '24': 'r86400', 'Week': 'r604800', 'Month': 'r2592000' };
+
 function buildSearchUrl(entry) {
-  const dateSuffix = DATE_POSTED_LABEL[entry.date_posted] || '';
   const levels = Array.isArray(entry.experience_level) ? entry.experience_level : [];
-  const levelPrefix = levels.length ? levels.join(' or ') : '';
+  // experience_level is still concatenated as a keyword prefix rather than
+  // mapped to LinkedIn's f_E filter codes. The keyword form broadens the
+  // match (no semantic filter) but is not a real "Director-only" filter.
+  // Keeping current behavior here to limit blast radius; a follow-up could
+  // map ["Director"] → f_E=5, etc.
+  const levelPrefix = levels.length ? `${levels.join(' or ')} ` : '';
+  const keywords = `${levelPrefix}${entry.search}`;
 
-  let query = entry.search;
-  if (levelPrefix) query = `${levelPrefix} ${query}`;
-  if (dateSuffix) query += ` posted in the ${dateSuffix}`;
-
-  const params = new URLSearchParams({ keywords: query });
-  return `https://www.linkedin.com/jobs/search-results/?${params}`;
+  const params = new URLSearchParams({ keywords });
+  if (DATE_POSTED_TPR[entry.date_posted]) {
+    params.set('f_TPR', DATE_POSTED_TPR[entry.date_posted]);
+  }
+  return `https://www.linkedin.com/jobs/search/?${params}`;
 }
 
 // ── Page interaction primitives ─────────────────────────────────────
@@ -278,63 +300,49 @@ async function scrollToLoadResults(page) {
 }
 
 async function getCardCount(page) {
-  return page.evaluate(xpath => {
-    const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-    return result.snapshotLength;
-  }, SELECTORS.xpathListingCard);
+  return page.evaluate(sel => document.querySelectorAll(sel).length, SELECTORS.listingCard);
 }
 
 async function clickCard(page, index) {
-  return page.evaluate(({ xpath, idx }) => {
-    const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-    const card = result.snapshotItem(idx);
-    if (card) { card.click(); return true; }
-    return false;
-  }, { xpath: SELECTORS.xpathListingCard, idx: index });
+  return page.evaluate(({ sel, link, idx }) => {
+    const cards = document.querySelectorAll(sel);
+    const card = cards[idx];
+    if (!card) return false;
+    // Prefer the inner /jobs/view/ link — clicking the bare wrapper sometimes
+    // hits a non-clickable parent on certain LinkedIn variants. The link click
+    // still loads the right-pane detail without navigating.
+    const a = card.querySelector(link);
+    (a || card).click();
+    return true;
+  }, { sel: SELECTORS.listingCard, link: SELECTORS.cardJobsViewLink, idx: index });
 }
 
 async function extractDetailFromPanel(page) {
-  // Expand description if collapsed
-  const hasMore = await page.evaluate(xpath => {
-    const r = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-    const el = r.singleNodeValue;
-    if (el) { el.click(); return true; }
-    return false;
-  }, SELECTORS.xpathMoreButton);
-  if (hasMore) await sleep(500);
+  // Expand description if collapsed (best-effort; some panels render fully
+  // expanded already, in which case the button isn't present).
+  await page.evaluate(sel => {
+    const btn = document.querySelector(sel);
+    if (btn && typeof btn.click === 'function') btn.click();
+  }, SELECTORS.panelMoreButton);
+  await sleep(500);
 
   return page.evaluate(({ sel, noiseLabels, minLen }) => {
-    function xpathAll(expression) {
-      const result = document.evaluate(expression, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-      const items = [];
-      for (let i = 0; i < result.snapshotLength; i++) {
-        const it = result.snapshotItem(i);
-        if (it) items.push(it);
-      }
-      return items;
+    const titleEl = document.querySelector(sel.panelTitle);
+    let title = titleEl?.textContent?.trim() ?? '';
+    if (noiseLabels.includes(title.toLowerCase()) || title.length < minLen) {
+      title = '';
     }
 
-    const applyEl = xpathAll(sel.xpathApplyUrl)[0];
+    const companyEl = document.querySelector(sel.panelCompany);
+    const company = companyEl?.textContent?.trim() ?? '';
+
+    const applyEl = document.querySelector(sel.panelApply);
     const applicationUrl = applyEl?.href?.trim() ?? '';
 
-    const titleAnchors = xpathAll(sel.xpathTitle);
-    let title = '';
-    for (const a of titleAnchors) {
-      const text = a.textContent?.trim() ?? '';
-      if (text.length >= minLen && !noiseLabels.includes(text.toLowerCase())) {
-        title = text;
-        break;
-      }
-    }
-
-    const companyAnchors = xpathAll(sel.xpathCompany);
-    const company = companyAnchors[1]?.textContent?.trim() ?? '';
-
-    const jdEl = document.querySelector(sel.jdContent);
+    const jdEl = document.querySelector(sel.panelJdContent);
     const jdText = jdEl?.innerText?.trim() ?? '';
 
-    const url = window.location.href;
-    return { title, company, applicationUrl, jdText, url };
+    return { title, company, applicationUrl, jdText, url: window.location.href };
   }, { sel: SELECTORS, noiseLabels: [...NOISE_LABELS], minLen: MIN_TITLE_LENGTH });
 }
 
