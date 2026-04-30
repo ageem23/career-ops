@@ -19,27 +19,34 @@ import (
 // findCareerOpsRoot walks up from start looking for a directory that contains
 // applications.md or data/applications.md, so `go run .` works from anywhere
 // inside the project (e.g. the dashboard/ subdir). Returns start unchanged if
-// no marker is found within the walk cap.
+// no marker is reached before the filesystem root or if a non-NotExist stat
+// error is encountered.
 func findCareerOpsRoot(start string) string {
 	abs, err := filepath.Abs(start)
 	if err != nil {
 		return start
 	}
+	markers := []string{"applications.md", filepath.Join("data", "applications.md")}
 	cur := abs
-	for i := 0; i < 6; i++ {
-		if _, err := os.Stat(filepath.Join(cur, "applications.md")); err == nil {
-			return cur
-		}
-		if _, err := os.Stat(filepath.Join(cur, "data", "applications.md")); err == nil {
-			return cur
+	for {
+		for _, marker := range markers {
+			statPath := filepath.Join(cur, marker)
+			if _, statErr := os.Stat(statPath); statErr == nil {
+				return cur
+			} else if !os.IsNotExist(statErr) {
+				// Permission-denied or I/O error — surface it instead of
+				// silently treating it as "marker not found" and continuing.
+				fmt.Fprintf(os.Stderr, "warning: stat %s: %v\n", statPath, statErr)
+				return start
+			}
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
-			break
+			// Reached filesystem root without finding a marker.
+			return start
 		}
 		cur = parent
 	}
-	return start
 }
 
 type viewState int
