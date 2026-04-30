@@ -269,7 +269,17 @@ async function main() {
   const companyFlag = args.indexOf('--company');
   const filterCompany = companyFlag !== -1 ? args[companyFlag + 1]?.toLowerCase() : null;
   const loginFlag = args.indexOf('--login');
-  const loginProviderId = loginFlag !== -1 ? args[loginFlag + 1] : null;
+  let loginProviderId = null;
+  if (loginFlag !== -1) {
+    const next = args[loginFlag + 1];
+    // Bare --login (or --login --some-other-flag) is almost certainly a typo;
+    // falling through to a real scan would be a surprising side effect.
+    if (!next || next.startsWith('--')) {
+      console.error('Error: --login requires a provider id (e.g. `node scan.mjs --login linkedin`)');
+      process.exit(1);
+    }
+    loginProviderId = next;
+  }
 
   // 1. Load providers
   const providers = await loadProviders(PROVIDERS_DIR);
