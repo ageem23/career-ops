@@ -196,8 +196,12 @@ function scoreEntry(entry, recencyBonus) {
       score += 3;
       breakdown.push(`+3 remote`);
     } else if (/\b(sydney|australia|tokyo|japan|berlin|munich|london|uk|paris|france|amsterdam|netherlands|dublin|ireland|singapore|bangalore|india|hong kong|toronto|canada)\b/.test(location)) {
-      // Non-US location with no remote indicator — heavy penalty since the
-      // candidate is Chicago-based with no visa-sponsorship setup elsewhere.
+      // TODO(geo-config): hardcoded "Chicago-based, prefers remote in the US"
+      // bias is wrong for any other profile. Move the home-city, neutral-hubs,
+      // and non-applicable-region lists into config/profile.yml (e.g. under
+      // a `triage.geo` block) and read them here. Tracked separately —
+      // intentionally NOT changing this in the snapshot review pass since
+      // it's a profile-schema decision, not a fix.
       score -= 10;
       breakdown.push(`-10 non-US location (${location.slice(0, 30)})`);
     } else if (/\b(new york|nyc|san francisco|seattle|boston|austin|denver|atlanta|los angeles|miami)\b/.test(location)) {
