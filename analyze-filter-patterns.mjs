@@ -37,9 +37,22 @@ const argValue = (flag, def) => {
   const i = args.indexOf(flag);
   return i !== -1 ? args[i + 1] : def;
 };
-const sinceDays = parseInt(argValue('--since', '30'), 10);
-const minFreq = parseInt(argValue('--min-freq', '5'), 10);
-const topN = parseInt(argValue('--top', '20'), 10);
+// parseInt('--top', 10) silently returns NaN, which propagates into date math
+// and threshold comparisons and turns a typo into empty output instead of a
+// clear usage error. Validate up front and fail fast with the offending flag
+// in the message.
+function parsePositiveIntFlag(flag, def) {
+  const raw = argValue(flag, String(def));
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    console.error(`✗ ${flag} requires a positive integer, got ${JSON.stringify(raw)}`);
+    process.exit(1);
+  }
+  return n;
+}
+const sinceDays = parsePositiveIntFlag('--since', 30);
+const minFreq = parsePositiveIntFlag('--min-freq', 5);
+const topN = parsePositiveIntFlag('--top', 20);
 const includeBigrams = !args.includes('--no-bigrams');
 
 // Tokens we never suggest — too generic to be useful as filter keywords.
