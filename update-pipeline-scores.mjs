@@ -10,7 +10,11 @@ const STATE = 'batch/batch-state.tsv';
 const REPORTS = 'reports';
 
 // 1. URL → {status, report_num, score} from batch-state.tsv
-const stateLines = fs.readFileSync(STATE, 'utf8').split(/\r?\n/).filter(Boolean);
+// Treat a missing state file as "no completed runs yet" so a clean checkout
+// or a fresh setup can run this script without crashing.
+const stateLines = fs.existsSync(STATE)
+  ? fs.readFileSync(STATE, 'utf8').split(/\r?\n/).filter(Boolean)
+  : [];
 const urlMap = new Map();
 for (const line of stateLines.slice(1)) {
   const cols = line.split('\t');
@@ -20,12 +24,20 @@ for (const line of stateLines.slice(1)) {
   urlMap.set(url, { id, reportNum, score });
 }
 
-// 2. report_num → report file (for slug + date)
-const reportFiles = fs.readdirSync(REPORTS).filter(f => f.endsWith('.md'));
+// 2. report_num → report file (for slug + date) — same gentle fallback for
+// the reports directory.
+const reportFiles = fs.existsSync(REPORTS)
+  ? fs.readdirSync(REPORTS).filter(f => f.endsWith('.md'))
+  : [];
 const reportByNum = new Map();
 for (const f of reportFiles) {
   const m = f.match(/^(\d{3})-(.+)\.md$/);
   if (m) reportByNum.set(m[1], f);
+}
+
+if (urlMap.size === 0) {
+  console.log('No completed batch runs found — leaving pipeline.md untouched.');
+  process.exit(0);
 }
 
 // 3. Read pipeline.md
@@ -35,8 +47,12 @@ const lines = original.split(/\r?\n/);
 const pending = [];
 const processed = [];
 
+// Pipeline lines may be either http(s) URLs or `local:jds/<file>` references
+// (the convention LinkedIn-provider entries use because the search URL isn't
+// stable without an authenticated session). Match both — dropping local: URLs
+// here would silently delete every LinkedIn entry on rewrite.
 function findUrl(line) {
-  const m = line.match(/https?:\/\/\S+/);
+  const m = line.match(/(?:https?:\/\/|local:jds\/)\S+/);
   return m ? m[0] : null;
 }
 
