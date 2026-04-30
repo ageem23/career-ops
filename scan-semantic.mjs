@@ -83,15 +83,34 @@ The "matches" array lists the 1-based indices of candidates that match (ACCEPT).
 
 function extractJson(text) {
   // Models sometimes wrap JSON in code fences or add commentary despite
-  // instructions. Pull out the first {...} block.
+  // instructions. Pull out the first balanced {...} block.
   const fenceMatch = text.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
   if (fenceMatch) return JSON.parse(fenceMatch[1]);
-  const braceStart = text.indexOf('{');
-  const braceEnd = text.lastIndexOf('}');
-  if (braceStart >= 0 && braceEnd > braceStart) {
-    return JSON.parse(text.slice(braceStart, braceEnd + 1));
+
+  // Walk forward from the first '{' tracking depth (and string state, so a
+  // '{' or '}' inside a JSON string doesn't shift depth). Stop at the first
+  // balanced object — taking text.slice(start, lastIndexOf('}') + 1) would
+  // wrongly include any extra '}' the model emitted after the answer.
+  const start = text.indexOf('{');
+  if (start < 0) {
+    throw new Error(`No JSON object found in response: ${text.slice(0, 200)}`);
   }
-  throw new Error(`No JSON object found in response: ${text.slice(0, 200)}`);
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return JSON.parse(text.slice(start, i + 1));
+    }
+  }
+  throw new Error(`Unterminated JSON object in response: ${text.slice(start, start + 200)}`);
 }
 
 // ── Backend resolution ──────────────────────────────────────────────
@@ -127,8 +146,18 @@ function claudeCliInPath() {
 
 // Used by scan.mjs to decide whether to attempt the semantic phase at all.
 // Returns the resolved backend ('api' | 'cli') or null if neither is available.
+//
+// An invalid CAREER_OPS_SEMANTIC_BACKEND override is logged as a warning and
+// then returns null — the caller still falls back gracefully, but the user
+// sees their config typo on stderr instead of silently losing the semantic
+// phase.
 export function hasSemanticBackend() {
-  try { return resolveBackend(); } catch { return null; }
+  try {
+    return resolveBackend();
+  } catch (err) {
+    console.warn(`⚠ ${err.message}`);
+    return null;
+  }
 }
 
 // ── Public entry ────────────────────────────────────────────────────
