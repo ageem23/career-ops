@@ -28,11 +28,12 @@
 #   3. NEUTRAL  — neither hit; sent to the optional semantic phase.
 #
 # The semantic phase runs once at the end of each scan if a backend is
-# available. Backend resolution:
-#   1. ANTHROPIC_API_KEY set → Anthropic API (faster, separate billing)
-#   2. `claude` CLI in PATH  → Claude Code (subscription billing, +2-5s/scan)
-#   3. Neither               → neutrals are rejected
-# Override either with CAREER_OPS_SEMANTIC_BACKEND=api|cli.
+# available. Backend resolution (checked in this exact order — first match wins):
+#   1. CAREER_OPS_SEMANTIC_BACKEND=api|cli (explicit override; takes precedence
+#      over all other signals)
+#   2. ANTHROPIC_API_KEY set                → Anthropic API (faster, separate billing)
+#   3. `claude` CLI in PATH                 → Claude Code (subscription billing, +2-5s/scan)
+#   4. None of the above                    → neutrals are rejected
 # Both backends use the positive list + archetypes (below) to classify
 # each neutral title as a semantic match or not.
 #
@@ -118,9 +119,10 @@ title_filter:
     - "Director"
   archetypes:
     # [CUSTOMIZE — OPTIONAL] Canonical role-family descriptions used ONLY by
-    # the semantic phase (when ANTHROPIC_API_KEY is set). The LLM sees these
-    # alongside the positive list and uses them to decide whether neutral
-    # titles match. Phrase them as the kind of role, not specific keywords.
+    # the semantic phase. Both backends (Anthropic API and the `claude` CLI)
+    # see these alongside the positive list and use them to decide whether
+    # neutral titles match. Phrase them as the kind of role, not specific
+    # keywords.
     #
     # Example for a senior engineering-leadership target:
     # - "Senior engineering leadership at the Director, VP, or Head level"
