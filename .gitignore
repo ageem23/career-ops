@@ -20,7 +20,6 @@ jds/*
 !jds/.gitkeep
 interview-prep/*
 tmp/*
-batch/*
 build-*
 .claude/pr*
 .claude/settings.json
