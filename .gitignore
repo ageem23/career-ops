@@ -23,6 +23,7 @@ tmp/*
 build-*
 .claude/pr*
 .claude/settings.json
+batch/*
 
 # User config and customization (never auto-updated)
 config/profile.yml

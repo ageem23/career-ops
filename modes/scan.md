@@ -2,7 +2,7 @@
 
 Escanea portales de empleo configurados, filtra por relevancia de título, y añade nuevas ofertas al pipeline para evaluación posterior.
 
-> **Nota (v1.5+):** El escáner por defecto (`scan.mjs` / `npm run scan`) es **zero-token** y sólo consulta directamente las APIs públicas de Greenhouse, Ashby y Lever. Los niveles con Playwright/WebSearch descritos abajo son el flujo **agente** (ejecutado por Claude/Codex), no lo que hace `scan.mjs`. Si una empresa no tiene API Greenhouse/Ashby/Lever, `scan.mjs` la ignorará; para esos casos, el agente debe completar manualmente el Nivel 1 (Playwright) o Nivel 3 (WebSearch).
+> **Nota (v1.5+):** El escáner por defecto (`scan.mjs` / `npm run scan`) es **zero-token** y cubre Greenhouse, Ashby, Lever, Apify, LinkedIn (autenticado) y un scraper HTML genérico vía sus plugins en `providers/`. Los niveles con Playwright/WebSearch descritos abajo son el flujo **agente** (ejecutado por Claude/Codex), reservado para empresas que ningún plugin alcanza. **Empieza siempre con `scan.mjs`** — el flujo agente es complementario, no alternativo.
 
 ## Ejecución recomendada
 
@@ -15,6 +15,20 @@ Agent(
     run_in_background=True
 )
 ```
+
+## Salida al usuario (OBLIGATORIO)
+
+`scan.mjs` produce dos clases de información que el usuario debe ver:
+
+1. **Resumen del scan** — métricas, errores por empresa, lista de nuevas ofertas
+2. **Sugerencias de refinamiento del filtro** — bloque `📊 Filter refinement suggestions` que aparece al final cuando hay >= 50 títulos clasificados con verdicto. Estas sugerencias permiten al usuario añadir términos a `title_filter.positive`/`negative` en `portals.yml` con datos reales en mano.
+
+**Reglas de relayo:**
+
+- Capturar el stdout completo de `node scan.mjs` (idealmente vía `tee tmp/scan-{date}.log`).
+- Incluir SIEMPRE el bloque `📊 Filter refinement suggestions` literal en la respuesta al usuario cuando esté presente — no es ruido auxiliar, es feedback accionable que el usuario perdió la última vez que se omitió.
+- Si por alguna razón perdiste el stdout, leer `tmp/last-scan-suggestions.md` (escrito por `scan.mjs` en cada ejecución exitosa con sugerencias) y relayar su contenido.
+- Si no hay sugerencias (corpus pequeño o sin señal), no inventar — simplemente omitir esa sección.
 
 ## Configuración
 

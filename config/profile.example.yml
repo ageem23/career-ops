@@ -17,21 +17,36 @@ candidate:
   # canva_resume_design_id: "DAxxxxxxxxx"
 
 target_roles:
-  # Your North Star roles — what you're optimizing for
+  # Your North Star roles — what you're optimizing for.
   primary:
     - "Senior AI Engineer"
     - "Staff ML Engineer"
-  # Archetypes help the evaluation system score fit
+
+  # Archetypes drive two surfaces:
+  #   1. scan.mjs reads `semantic_description` per archetype and hands it to
+  #      the title-filter LLM (scan-semantic.mjs) to recover neutral titles
+  #      that don't hit a literal positive/negative keyword.
+  #   2. The agent reads this whole block at evaluation time as Block B
+  #      "North Star alignment" context — `name`, `level`, and `fit` shape
+  #      how strongly each archetype scores in reports.
+  # Per-archetype scoring narrative (proof points, framing) lives in
+  # `modes/_profile.md`, keyed by archetype name.
+  #
+  # `semantic_description` is optional — leave it off and scan.mjs falls
+  # back to broader keyword matching for that archetype.
   archetypes:
     - name: "AI/ML Engineer"
       level: "Senior/Staff"
       fit: "primary"        # primary = dream role, secondary = good fit, adjacent = stretch
+      semantic_description: "Senior or Staff AI/ML engineer building production model pipelines (training, eval, serving)"
     - name: "AI Product Manager"
       level: "Senior"
       fit: "secondary"
+      semantic_description: "Senior product manager owning an AI product surface (LLM features, agentic flows, model-driven UX)"
     - name: "Solutions Architect"
       level: "Mid-Senior"
       fit: "adjacent"
+      semantic_description: "Solutions architect — pre-sales or post-sales senior IC, technical role"
 
 narrative:
   # Your professional headline (1 line)

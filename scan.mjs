@@ -21,7 +21,7 @@
  *   node scan.mjs --company Cohere # scan a single company
  */
 
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'fs';
 import { pathToFileURL, fileURLToPath } from 'url';
 import path from 'path';
 import yaml from 'js-yaml';
@@ -42,6 +42,7 @@ const parseYaml = yaml.load;
 // ── Config ──────────────────────────────────────────────────────────
 
 const PORTALS_PATH = 'portals.yml';
+const PROFILE_PATH = 'config/profile.yml';
 const SCAN_HISTORY_PATH = 'data/scan-history.tsv';
 const SEMANTIC_LOG_PATH = 'data/scan-semantic-log.tsv';
 const PIPELINE_PATH = 'data/pipeline.md';
@@ -266,6 +267,7 @@ async function parallelFetch(tasks, limit) {
 async function main() {
   const args = process.argv.slice(2);
   const dryRun = args.includes('--dry-run');
+  const noSuggest = args.includes('--no-suggest');
   const companyFlag = args.indexOf('--company');
   const filterCompany = companyFlag !== -1 ? args[companyFlag + 1]?.toLowerCase() : null;
   const loginFlag = args.indexOf('--login');
@@ -316,6 +318,26 @@ async function main() {
   const config = parseYaml(readFileSync(PORTALS_PATH, 'utf-8'));
   const companies = config.tracked_companies || [];
   const titleFilter = buildTitleFilter(config.title_filter);
+
+  // Archetype descriptions for the semantic title-filter come from
+  // config/profile.yml (target_roles.archetypes[].semantic_description) so
+  // the user has a single place to edit. Fall back to the legacy
+  // portals.yml.title_filter.archetypes block for backward compatibility
+  // with setups that haven't migrated yet.
+  let semanticArchetypes = [];
+  if (existsSync(PROFILE_PATH)) {
+    try {
+      const profile = parseYaml(readFileSync(PROFILE_PATH, 'utf-8'));
+      semanticArchetypes = (profile?.target_roles?.archetypes || [])
+        .map(a => a?.semantic_description)
+        .filter(d => typeof d === 'string' && d.trim().length > 0);
+    } catch (err) {
+      console.error(`⚠️  Failed to read ${PROFILE_PATH}: ${err.message}`);
+    }
+  }
+  if (semanticArchetypes.length === 0) {
+    semanticArchetypes = config.title_filter?.archetypes || [];
+  }
 
   // 3. Resolve a provider for each enabled company
   const targets = [];
@@ -417,7 +439,7 @@ async function main() {
         const uniqueTitles = [...new Set(neutrals.map(n => n.job.title))];
         const decisions = await classifyTitles({
           positive: config.title_filter?.positive || [],
-          archetypes: config.title_filter?.archetypes || [],
+          archetypes: semanticArchetypes,
           titles: uniqueTitles,
         });
 
@@ -502,6 +524,75 @@ async function main() {
       console.log('\n(dry run — run without --dry-run to save results)');
     } else {
       console.log(`\nResults saved to ${PIPELINE_PATH} and ${SCAN_HISTORY_PATH}`);
+    }
+  }
+
+  // Filter-refinement suggestions from the semantic-log corpus. Surfaced
+  // here so the user sees high-confidence positive/negative candidates
+  // inline after every scan instead of having to remember a separate
+  // command. Skipped when --no-suggest is passed, when there are too few
+  // classified titles to be meaningful, or when no high-confidence terms
+  // surface above threshold.
+  //
+  // Also persisted to tmp/last-scan-suggestions.md so a subagent or
+  // /career-ops scan flow that doesn't relay stdout cleanly can still
+  // recover the suggestions from disk and surface them to the user.
+  if (!noSuggest && !dryRun) {
+    try {
+      const { summarizeForScan } = await import('./analyze-filter-patterns.mjs');
+      const suggest = summarizeForScan({ topN: 3 });
+      if (suggest && (suggest.suggestPositive.length || suggest.suggestNegative.length)) {
+        const lines = [];
+        const header = `📊 Filter refinement suggestions (last ${suggest.sinceDays}d, ${suggest.classifiedCount.toLocaleString()} classified titles):`;
+        console.log('\n' + header);
+        lines.push(header);
+
+        const renderSection = (label, items, exKey) => {
+          if (items.length === 0) return;
+          console.log(`  ${label}:`);
+          lines.push(`  ${label}:`);
+          for (const s of items) {
+            const pct = (s.precision * 100).toFixed(0);
+            const row = `    - "${s.term}" (${s.accCount}A/${s.rejCount}R, ${pct}% accept)`;
+            console.log(row);
+            lines.push(row);
+            const ex = s.examples[exKey][0];
+            if (ex) {
+              const exRow = `        e.g. ${ex.slice(0, 80)}`;
+              console.log(exRow);
+              lines.push(exRow);
+            }
+          }
+        };
+        renderSection('Add to title_filter.positive', suggest.suggestPositive, 'accept');
+        renderSection('Add to title_filter.negative', suggest.suggestNegative, 'reject');
+
+        const footer = `  → Full analysis: node analyze-filter-patterns.mjs   (--no-suggest to skip)`;
+        console.log(footer);
+        lines.push(footer);
+
+        // Persist a stable-name copy so subagents can recover after the fact.
+        try {
+          mkdirSync('tmp', { recursive: true });
+          const out = [
+            `# Last scan filter-refinement suggestions`,
+            `# Generated by scan.mjs at ${new Date().toISOString()}`,
+            ``,
+            ...lines,
+            ``,
+          ].join('\n');
+          writeFileSync('tmp/last-scan-suggestions.md', out);
+        } catch (err) {
+          console.error(`⚠ couldn't persist suggestions to tmp/last-scan-suggestions.md: ${err.message}`);
+        }
+      } else {
+        // No high-confidence signal — clear any stale suggestions file so a
+        // subagent doesn't re-surface yesterday's output.
+        try { unlinkSync('tmp/last-scan-suggestions.md'); } catch {}
+      }
+    } catch (err) {
+      // Don't let a suggestion-render failure break the scan summary.
+      console.error(`⚠ filter suggestions skipped: ${err.message}`);
     }
   }
 

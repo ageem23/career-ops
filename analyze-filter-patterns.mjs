@@ -19,41 +19,24 @@
  * Output: ranked tables with per-suggestion example titles, plus a final
  * "suggested portals.yml diff" block the user can copy-paste.
  *
- * Usage:
+ * CLI usage:
  *   node analyze-filter-patterns.mjs                    # default (last 30 days)
  *   node analyze-filter-patterns.mjs --since 7          # last 7 days only
  *   node analyze-filter-patterns.mjs --min-freq 10      # require >=10 occurrences
  *   node analyze-filter-patterns.mjs --top 30           # top 30 each direction
  *   node analyze-filter-patterns.mjs --no-bigrams       # tokens only
+ *
+ * Programmatic API (used by scan.mjs at end of scan):
+ *   import { summarizeForScan } from './analyze-filter-patterns.mjs';
+ *   const summary = summarizeForScan({ topN: 3 });
+ *   // → null  (log missing or below minClassified threshold)
+ *   //   | { classifiedCount, sinceDays, suggestPositive, suggestNegative }
  */
 
 import { readFileSync, existsSync } from 'fs';
+import { fileURLToPath } from 'node:url';
 
 const LOG_PATH = 'data/scan-semantic-log.tsv';
-
-// CLI args
-const args = process.argv.slice(2);
-const argValue = (flag, def) => {
-  const i = args.indexOf(flag);
-  return i !== -1 ? args[i + 1] : def;
-};
-// parseInt('--top', 10) silently returns NaN, which propagates into date math
-// and threshold comparisons and turns a typo into empty output instead of a
-// clear usage error. Validate up front and fail fast with the offending flag
-// in the message.
-function parsePositiveIntFlag(flag, def) {
-  const raw = argValue(flag, String(def));
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n <= 0) {
-    console.error(`✗ ${flag} requires a positive integer, got ${JSON.stringify(raw)}`);
-    process.exit(1);
-  }
-  return n;
-}
-const sinceDays = parsePositiveIntFlag('--since', 30);
-const minFreq = parsePositiveIntFlag('--min-freq', 5);
-const topN = parsePositiveIntFlag('--top', 20);
-const includeBigrams = !args.includes('--no-bigrams');
 
 // Tokens we never suggest — too generic to be useful as filter keywords.
 const STOPWORDS = new Set([
@@ -63,40 +46,7 @@ const STOPWORDS = new Set([
   'sr', 'jr', 'junior', 'intern',  // already covered by negative filter or seniority_boost
 ]);
 
-function fail(msg) { console.error(`✗ ${msg}`); process.exit(1); }
-
-if (!existsSync(LOG_PATH)) {
-  fail(`${LOG_PATH} not found. Run \`node scan.mjs\` once with the semantic phase to populate it.`);
-}
-
-// ── Load log ────────────────────────────────────────────────────────
-
-const raw = readFileSync(LOG_PATH, 'utf-8').split(/\r?\n/).filter(Boolean);
-if (raw.length < 2) fail(`${LOG_PATH} is empty.`);
-
-const sinceCutoff = (() => {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() - sinceDays);
-  return d.toISOString().slice(0, 10);
-})();
-
-const accepts = [];
-const rejects = [];
-for (const line of raw.slice(1)) {
-  const cols = line.split('\t');
-  if (cols.length < 5) continue;
-  const [date, verdict, title, company, provider] = cols;
-  if (date < sinceCutoff) continue;
-  const row = { date, title, company, provider };
-  if (verdict === 'ACCEPT') accepts.push(row);
-  else if (verdict === 'REJECT') rejects.push(row);
-}
-
-if (accepts.length === 0 && rejects.length === 0) {
-  fail(`No semantic decisions in the last ${sinceDays} days.`);
-}
-
-// ── Tokenize ────────────────────────────────────────────────────────
+// ── Pure helpers ────────────────────────────────────────────────────
 
 function tokenize(title) {
   return String(title)
@@ -115,7 +65,7 @@ function bigrams(tokens) {
   return out;
 }
 
-function indexCorpus(rows) {
+function indexCorpus(rows, includeBigrams) {
   // term → { freq: total occurrences, titles: Set of unique title strings }
   const tokens = new Map();
   const bgrams = new Map();
@@ -139,12 +89,7 @@ function indexCorpus(rows) {
   return { tokens, bgrams };
 }
 
-const accIdx = indexCorpus(accepts);
-const rejIdx = indexCorpus(rejects);
-
-// ── Score tokens ────────────────────────────────────────────────────
-
-function score(termMap, accMap, rejMap) {
+function score(accMap, rejMap, minFreq) {
   const allTerms = new Set([...accMap.keys(), ...rejMap.keys()]);
   const out = [];
   for (const term of allTerms) {
@@ -170,43 +115,133 @@ function score(termMap, accMap, rejMap) {
   return out;
 }
 
-const tokenScores = score('token', accIdx.tokens, rejIdx.tokens);
-const bigramScores = includeBigrams ? score('bigram', accIdx.bgrams, rejIdx.bgrams) : [];
-
-// ── Rank suggestions ────────────────────────────────────────────────
-
-function rankPositive(scores) {
+function rankPositive(scores, topN) {
   return scores
     .filter(s => s.precision >= 0.85 && s.accCount >= 3)
     .sort((a, b) => (b.precision - a.precision) || (b.total - a.total))
     .slice(0, topN);
 }
 
-function rankNegative(scores) {
+function rankNegative(scores, topN) {
   return scores
     .filter(s => s.precision <= 0.15 && s.rejCount >= 5)
     .sort((a, b) => (a.precision - b.precision) || (b.total - a.total))
     .slice(0, topN);
 }
 
-const positiveTokens = rankPositive(tokenScores);
-const negativeTokens = rankNegative(tokenScores);
-const positiveBigrams = rankPositive(bigramScores);
-const negativeBigrams = rankNegative(bigramScores);
+function loadDecisions(logPath, sinceDays) {
+  if (!existsSync(logPath)) return { error: `${logPath} not found` };
+  const raw = readFileSync(logPath, 'utf-8').split(/\r?\n/).filter(Boolean);
+  if (raw.length < 2) return { error: `${logPath} is empty` };
 
-// ── Output ──────────────────────────────────────────────────────────
+  const sinceCutoff = (() => {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() - sinceDays);
+    return d.toISOString().slice(0, 10);
+  })();
 
-const totalAccept = accepts.length;
-const totalReject = rejects.length;
-const totalAcceptUnique = new Set(accepts.map(r => r.title)).size;
-const totalRejectUnique = new Set(rejects.map(r => r.title)).size;
+  const accepts = [];
+  const rejects = [];
+  for (const line of raw.slice(1)) {
+    const cols = line.split('\t');
+    if (cols.length < 5) continue;
+    const [date, verdict, title, company, provider] = cols;
+    if (date < sinceCutoff) continue;
+    const row = { date, title, company, provider };
+    if (verdict === 'ACCEPT') accepts.push(row);
+    else if (verdict === 'REJECT') rejects.push(row);
+  }
+  if (accepts.length === 0 && rejects.length === 0) {
+    return { error: `No semantic decisions in the last ${sinceDays} days` };
+  }
+  return { accepts, rejects };
+}
 
-console.log('━'.repeat(72));
-console.log(`Filter Pattern Analysis — last ${sinceDays} days, min-freq ${minFreq}, top ${topN}`);
-console.log('━'.repeat(72));
-console.log(`Decisions:         ${totalAccept + totalReject} (${totalAccept} accept, ${totalReject} reject)`);
-console.log(`Unique titles:     ${totalAcceptUnique + totalRejectUnique} (${totalAcceptUnique} accept, ${totalRejectUnique} reject)`);
-console.log('');
+// ── Public API ──────────────────────────────────────────────────────
+
+/**
+ * Compute the full ranked analysis. Returns structured data with no I/O
+ * side effects — the CLI's output formatting is the caller's job.
+ *
+ * On failure (log missing/empty/no-data-in-window) returns `{ error }`.
+ */
+export function analyzeFilterPatterns({
+  logPath = LOG_PATH,
+  sinceDays = 30,
+  minFreq = 5,
+  topN = 20,
+  includeBigrams = true,
+} = {}) {
+  const decisions = loadDecisions(logPath, sinceDays);
+  if (decisions.error) return decisions;
+  const { accepts, rejects } = decisions;
+
+  const accIdx = indexCorpus(accepts, includeBigrams);
+  const rejIdx = indexCorpus(rejects, includeBigrams);
+
+  const tokenScores = score(accIdx.tokens, rejIdx.tokens, minFreq);
+  const bigramScores = includeBigrams ? score(accIdx.bgrams, rejIdx.bgrams, minFreq) : [];
+
+  return {
+    sinceDays,
+    minFreq,
+    topN,
+    totalAccept: accepts.length,
+    totalReject: rejects.length,
+    totalAcceptUnique: new Set(accepts.map(r => r.title)).size,
+    totalRejectUnique: new Set(rejects.map(r => r.title)).size,
+    positiveTokens: rankPositive(tokenScores, topN),
+    negativeTokens: rankNegative(tokenScores, topN),
+    positiveBigrams: rankPositive(bigramScores, topN),
+    negativeBigrams: rankNegative(bigramScores, topN),
+  };
+}
+
+/**
+ * Compact summary used by scan.mjs at end of scan. Returns null when:
+ *   - log file missing
+ *   - log has fewer than `minClassified` rows in the window (cold start
+ *     where suggestions would be statistical noise)
+ *
+ * Otherwise returns just the top-N each direction (tokens only — bigrams
+ * are noisier and the scan footer needs to stay tight).
+ */
+export function summarizeForScan({
+  logPath = LOG_PATH,
+  sinceDays = 30,
+  topN = 3,
+  minClassified = 50,
+} = {}) {
+  const result = analyzeFilterPatterns({
+    logPath,
+    sinceDays,
+    minFreq: 5,
+    topN,
+    includeBigrams: false,
+  });
+  if (result.error) return null;
+  const total = result.totalAccept + result.totalReject;
+  if (total < minClassified) return null;
+  return {
+    classifiedCount: total,
+    sinceDays,
+    suggestPositive: result.positiveTokens,
+    suggestNegative: result.negativeTokens,
+  };
+}
+
+// ── CLI entrypoint ──────────────────────────────────────────────────
+
+function parsePositiveIntFlag(args, flag, def) {
+  const i = args.indexOf(flag);
+  const raw = i !== -1 ? args[i + 1] : String(def);
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    console.error(`✗ ${flag} requires a positive integer, got ${JSON.stringify(raw)}`);
+    process.exit(1);
+  }
+  return n;
+}
 
 function printTable(label, suggestions, direction) {
   if (suggestions.length === 0) {
@@ -228,38 +263,60 @@ function printTable(label, suggestions, direction) {
   console.log('');
 }
 
-console.log('═══ POSITIVE candidates (high precision = reliable accept signal) ═══\n');
-printTable('TOKENS:', positiveTokens, 'positive');
-if (includeBigrams) printTable('BIGRAMS:', positiveBigrams, 'positive');
+function main() {
+  const args = process.argv.slice(2);
+  const sinceDays = parsePositiveIntFlag(args, '--since', 30);
+  const minFreq = parsePositiveIntFlag(args, '--min-freq', 5);
+  const topN = parsePositiveIntFlag(args, '--top', 20);
+  const includeBigrams = !args.includes('--no-bigrams');
 
-console.log('═══ NEGATIVE candidates (low precision = reliable reject signal) ═══\n');
-printTable('TOKENS:', negativeTokens, 'negative');
-if (includeBigrams) printTable('BIGRAMS:', negativeBigrams, 'negative');
-
-// ── Suggested diff ──────────────────────────────────────────────────
-
-console.log('━'.repeat(72));
-console.log('SUGGESTED portals.yml CHANGES (review before applying — these are heuristic)');
-console.log('━'.repeat(72));
-console.log('');
-
-if (positiveTokens.length || positiveBigrams.length) {
-  console.log('# Add to title_filter.positive:');
-  for (const s of [...positiveTokens, ...positiveBigrams].slice(0, topN)) {
-    console.log(`    - "${s.term}"`);
+  const result = analyzeFilterPatterns({ sinceDays, minFreq, topN, includeBigrams });
+  if (result.error) {
+    console.error(`✗ ${result.error}`);
+    process.exit(1);
   }
+
+  console.log('━'.repeat(72));
+  console.log(`Filter Pattern Analysis — last ${sinceDays} days, min-freq ${minFreq}, top ${topN}`);
+  console.log('━'.repeat(72));
+  console.log(`Decisions:         ${result.totalAccept + result.totalReject} (${result.totalAccept} accept, ${result.totalReject} reject)`);
+  console.log(`Unique titles:     ${result.totalAcceptUnique + result.totalRejectUnique} (${result.totalAcceptUnique} accept, ${result.totalRejectUnique} reject)`);
   console.log('');
+
+  console.log('═══ POSITIVE candidates (high precision = reliable accept signal) ═══\n');
+  printTable('TOKENS:', result.positiveTokens, 'positive');
+  if (includeBigrams) printTable('BIGRAMS:', result.positiveBigrams, 'positive');
+
+  console.log('═══ NEGATIVE candidates (low precision = reliable reject signal) ═══\n');
+  printTable('TOKENS:', result.negativeTokens, 'negative');
+  if (includeBigrams) printTable('BIGRAMS:', result.negativeBigrams, 'negative');
+
+  console.log('━'.repeat(72));
+  console.log('SUGGESTED portals.yml CHANGES (review before applying — these are heuristic)');
+  console.log('━'.repeat(72));
+  console.log('');
+
+  if (result.positiveTokens.length || result.positiveBigrams.length) {
+    console.log('# Add to title_filter.positive:');
+    for (const s of [...result.positiveTokens, ...result.positiveBigrams].slice(0, topN)) {
+      console.log(`    - "${s.term}"`);
+    }
+    console.log('');
+  }
+
+  if (result.negativeTokens.length || result.negativeBigrams.length) {
+    console.log('# Add to title_filter.negative:');
+    for (const s of [...result.negativeTokens, ...result.negativeBigrams].slice(0, topN)) {
+      console.log(`    - "${s.term}"`);
+    }
+    console.log('');
+  }
+
+  console.log('Note: examine the sample titles before adding any keyword. A high-precision');
+  console.log('term may still be a poor fit if the sample reveals it captures the wrong');
+  console.log('archetype. Adding terms reduces work in the semantic phase but a bad');
+  console.log('positive will let through noise; a bad negative will silently drop matches.');
 }
 
-if (negativeTokens.length || negativeBigrams.length) {
-  console.log('# Add to title_filter.negative:');
-  for (const s of [...negativeTokens, ...negativeBigrams].slice(0, topN)) {
-    console.log(`    - "${s.term}"`);
-  }
-  console.log('');
-}
-
-console.log('Note: examine the sample titles before adding any keyword. A high-precision');
-console.log('term may still be a poor fit if the sample reveals it captures the wrong');
-console.log('archetype. Adding terms reduces work in the semantic phase but a bad');
-console.log('positive will let through noise; a bad negative will silently drop matches.');
+const isCli = process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url);
+if (isCli) main();

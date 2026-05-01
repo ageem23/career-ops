@@ -117,18 +117,15 @@ title_filter:
     - "Lead"
     - "Head"
     - "Director"
-  archetypes:
-    # [CUSTOMIZE — OPTIONAL] Canonical role-family descriptions used ONLY by
-    # the semantic phase. Both backends (Anthropic API and the `claude` CLI)
-    # see these alongside the positive list and use them to decide whether
-    # neutral titles match. Phrase them as the kind of role, not specific
-    # keywords.
-    #
-    # Example for a senior engineering-leadership target:
-    # - "Senior engineering leadership at the Director, VP, or Head level"
-    # - "Engineering manager / staff EM / senior EM running a team"
-    # - "AI/ML platform engineering management (LLMOps, evals, agentic)"
-    # - "Solutions architect — pre-sales or post-sales senior IC"
+  # Archetype descriptions for the semantic phase live in
+  # config/profile.yml (target_roles.archetypes[].semantic_description).
+  # That single source feeds both the title-filter LLM (this section) and
+  # Block B "North Star alignment" scoring at evaluation time. See the
+  # canonical example in config/profile.example.yml.
+  #
+  # Legacy fallback: if profile.yml has no archetypes block, you may still
+  # add a `title_filter.archetypes:` list of free-text sentences here and
+  # scan.mjs will use it. Prefer profile.yml for new setups.
 
 # -- Search queries --
 # Each query triggers a WebSearch. Use site: to filter by portal.
