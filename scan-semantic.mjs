@@ -31,16 +31,16 @@ import fs from 'node:fs';
 
 const MODEL = 'claude-haiku-4-5-20251001';
 const MODEL_ALIAS = 'haiku';      // CLI accepts aliases, version drift-safe
-const MAX_TOKENS = 4096;
-const CLI_TIMEOUT_MS = 240_000;   // Per chunk — generous; CLI latency varies with model load.
+const MAX_TOKENS = 8192;          // Headroom for {"matches":[…]} when most of a 1500-chunk matches.
+const CLI_TIMEOUT_MS = 360_000;   // Per chunk — generous ceiling for large single-call payloads.
 
-// Cap titles per LLM call. Two reasons:
-//   1. CLI: claude -p with 2K+ titles times out (model has to read all input,
-//      and CLI startup + model latency add up).
-//   2. Output budget: even with the compact {"matches":[...]} format, very
-//      large chunks risk truncated output if many titles match.
-// 250 keeps each call to ~5-15s on CLI, well under the timeout.
-const CHUNK_SIZE = 250;
+// Cap titles per LLM call. Sized so a typical scan finishes in ONE call
+// (saves ~15-30s of per-chunk spawn overhead on the CLI path):
+//   - Haiku 4.5's 200K context fits well over 5K titles in input
+//   - At 1500 titles, all-match output is ~5-7K tokens, under MAX_TOKENS=8192
+//   - CLI runtime stays under CLI_TIMEOUT_MS at this size in practice
+// Larger scans still chunk safely as a fallback.
+const CHUNK_SIZE = 1500;
 
 function buildPrompt({ positive, archetypes, titles }) {
   const targetLines = [];
