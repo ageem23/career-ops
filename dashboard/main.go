@@ -118,6 +118,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.theme,
 			msg.Path, msg.Title,
 			m.pipeline.Width(), m.pipeline.Height(),
+			msg.App, msg.CareerOpsPath,
 		)
 		m.state = viewReport
 		return m, nil
