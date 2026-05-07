@@ -1,6 +1,7 @@
 package screens
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/santifer/career-ops/dashboard/internal/model"
 	"github.com/santifer/career-ops/dashboard/internal/theme"
 )
 
@@ -16,27 +18,36 @@ type ViewerClosedMsg struct{}
 
 // ViewerModel implements an integrated file viewer screen.
 type ViewerModel struct {
-	lines        []string
-	title        string
-	scrollOffset int
-	width        int
-	height       int
-	theme        theme.Theme
+	lines         []string
+	title         string
+	scrollOffset  int
+	width         int
+	height        int
+	theme         theme.Theme
+	app           model.CareerApplication
+	careerOpsPath string
+	hasApp        bool
+	statusPicker  bool
+	statusCursor  int
 }
 
 // NewViewerModel creates a new file viewer for the given path.
-func NewViewerModel(t theme.Theme, path, title string, width, height int) ViewerModel {
+// If app.ReportPath is non-empty, the viewer enables in-place status changes.
+func NewViewerModel(t theme.Theme, path, title string, width, height int, app model.CareerApplication, careerOpsPath string) ViewerModel {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		content = []byte("Error reading file: " + err.Error())
 	}
 
 	return ViewerModel{
-		lines:  strings.Split(string(content), "\n"),
-		title:  title,
-		width:  width,
-		height: height,
-		theme:  t,
+		lines:         strings.Split(string(content), "\n"),
+		title:         title,
+		width:         width,
+		height:        height,
+		theme:         t,
+		app:           app,
+		careerOpsPath: careerOpsPath,
+		hasApp:        app.ReportPath != "" || app.Company != "",
 	}
 }
 
@@ -52,9 +63,18 @@ func (m *ViewerModel) Resize(width, height int) {
 func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.statusPicker {
+			return m.handleStatusPicker(msg)
+		}
 		switch msg.String() {
 		case "q", "esc":
 			return m, func() tea.Msg { return ViewerClosedMsg{} }
+
+		case "c":
+			if m.hasApp {
+				m.statusPicker = true
+				m.statusCursor = 0
+			}
 
 		case "down", "j":
 			maxScroll := len(m.lines) - m.bodyHeight()
@@ -107,6 +127,61 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	return m, nil
 }
 
+func (m ViewerModel) handleStatusPicker(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.statusPicker = false
+		return m, nil
+
+	case "down", "j":
+		m.statusCursor++
+		if m.statusCursor >= len(statusOptions) {
+			m.statusCursor = len(statusOptions) - 1
+		}
+
+	case "up", "k":
+		m.statusCursor--
+		if m.statusCursor < 0 {
+			m.statusCursor = 0
+		}
+
+	case "enter":
+		m.statusPicker = false
+		newStatus := statusOptions[m.statusCursor].label
+		app := m.app
+		path := m.careerOpsPath
+		return m, func() tea.Msg {
+			return PipelineUpdateStatusMsg{
+				CareerOpsPath: path,
+				App:           app,
+				NewStatus:     newStatus,
+			}
+		}
+
+	default:
+		key := strings.ToLower(msg.String())
+		if len(key) == 1 {
+			for i, opt := range statusOptions {
+				if opt.shortcut == key {
+					m.statusCursor = i
+					m.statusPicker = false
+					newStatus := opt.label
+					app := m.app
+					path := m.careerOpsPath
+					return m, func() tea.Msg {
+						return PipelineUpdateStatusMsg{
+							CareerOpsPath: path,
+							App:           app,
+							NewStatus:     newStatus,
+						}
+					}
+				}
+			}
+		}
+	}
+	return m, nil
+}
+
 func (m ViewerModel) bodyHeight() int {
 	h := m.height - 4 // header + footer + padding
 	if h < 3 {
@@ -120,7 +195,40 @@ func (m ViewerModel) View() string {
 	body := m.renderBody()
 	footer := m.renderFooter()
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	view := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	if m.statusPicker {
+		view = m.overlayStatusPicker(view)
+	}
+	return view
+}
+
+func (m ViewerModel) overlayStatusPicker(body string) string {
+	bodyLines := strings.Split(body, "\n")
+
+	pickerWidth := 30
+	padStyle := lipgloss.NewStyle().Padding(0, 2)
+	borderStyle := lipgloss.NewStyle().
+		Foreground(m.theme.Blue).
+		Bold(true)
+
+	var picker []string
+	picker = append(picker, padStyle.Render(borderStyle.Render("Change status:")))
+
+	for i, opt := range statusOptions {
+		style := lipgloss.NewStyle().Foreground(m.theme.Text).Width(pickerWidth)
+		if i == m.statusCursor {
+			style = style.Background(m.theme.Overlay).Bold(true)
+		}
+		prefix := "  "
+		if i == m.statusCursor {
+			prefix = "> "
+		}
+		label := fmt.Sprintf("%s (%s)", opt.label, strings.ToUpper(opt.shortcut))
+		picker = append(picker, padStyle.Render(style.Render(prefix+label)))
+	}
+
+	bodyLines = append(bodyLines, picker...)
+	return strings.Join(bodyLines, "\n")
 }
 
 func (m ViewerModel) renderHeader() string {
@@ -550,9 +658,12 @@ func (m ViewerModel) renderFooter() string {
 	keyStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Text)
 	descStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
 
-	return style.Render(
-		keyStyle.Render("↑↓") + descStyle.Render(" scroll  ") +
-			keyStyle.Render("PgUp/Dn") + descStyle.Render(" page  ") +
-			keyStyle.Render("g/G") + descStyle.Render(" top/end  ") +
-			keyStyle.Render("Esc") + descStyle.Render(" back"))
+	parts := keyStyle.Render("↑↓") + descStyle.Render(" scroll  ") +
+		keyStyle.Render("PgUp/Dn") + descStyle.Render(" page  ") +
+		keyStyle.Render("g/G") + descStyle.Render(" top/end  ")
+	if m.hasApp {
+		parts += keyStyle.Render("c") + descStyle.Render(" change status  ")
+	}
+	parts += keyStyle.Render("Esc") + descStyle.Render(" back")
+	return style.Render(parts)
 }

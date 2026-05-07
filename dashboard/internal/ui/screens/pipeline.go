@@ -19,9 +19,11 @@ type PipelineClosedMsg struct{}
 
 // PipelineOpenReportMsg is emitted when a report should be opened in FileViewer.
 type PipelineOpenReportMsg struct {
-	Path   string
-	Title  string
-	JobURL string
+	Path          string
+	Title         string
+	JobURL        string
+	App           model.CareerApplication
+	CareerOpsPath string
 }
 
 // PipelineOpenURLMsg is emitted when a job URL should be opened in browser.
@@ -93,7 +95,21 @@ var pipelineTabs = []pipelineTab{
 
 var sortCycle = []string{sortScore, sortDate, sortCompany, sortStatus}
 
-var statusOptions = []string{"Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP"}
+type statusOption struct {
+	label    string
+	shortcut string // key that selects this option in the picker
+}
+
+var statusOptions = []statusOption{
+	{"Evaluated", "e"},
+	{"Applied", "a"},
+	{"Responded", "r"},
+	{"Interview", "i"},
+	{"Offer", "o"},
+	{"Rejected", "x"}, // x not r — r is taken by Responded
+	{"Discarded", "d"},
+	{"SKIP", "s"},
+}
 
 // statusGroupOrder defines display order for grouped view.
 var statusGroupOrder = []string{"interview", "offer", "responded", "applied", "evaluated", "skip", "rejected", "discarded"}
@@ -307,8 +323,15 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 			fullPath := filepath.Join(m.careerOpsPath, app.ReportPath)
 			title := fmt.Sprintf("%s — %s", app.Company, app.Role)
 			jobURL := app.JobURL
+			careerPath := m.careerOpsPath
 			return m, func() tea.Msg {
-				return PipelineOpenReportMsg{Path: fullPath, Title: title, JobURL: jobURL}
+				return PipelineOpenReportMsg{
+					Path:          fullPath,
+					Title:         title,
+					JobURL:        jobURL,
+					App:           app,
+					CareerOpsPath: careerPath,
+				}
 			}
 		}
 
@@ -398,12 +421,35 @@ func (m PipelineModel) handleStatusPicker(msg tea.KeyMsg) (PipelineModel, tea.Cm
 	case "enter":
 		m.statusPicker = false
 		if app, ok := m.CurrentApp(); ok {
-			newStatus := statusOptions[m.statusCursor]
+			newStatus := statusOptions[m.statusCursor].label
 			return m, func() tea.Msg {
 				return PipelineUpdateStatusMsg{
 					CareerOpsPath: m.careerOpsPath,
 					App:           app,
 					NewStatus:     newStatus,
+				}
+			}
+		}
+
+	default:
+		// Letter shortcut — apply the matching status directly.
+		key := strings.ToLower(msg.String())
+		if len(key) == 1 {
+			for i, opt := range statusOptions {
+				if opt.shortcut == key {
+					m.statusCursor = i
+					m.statusPicker = false
+					if app, ok := m.CurrentApp(); ok {
+						newStatus := opt.label
+						return m, func() tea.Msg {
+							return PipelineUpdateStatusMsg{
+								CareerOpsPath: m.careerOpsPath,
+								App:           app,
+								NewStatus:     newStatus,
+							}
+						}
+					}
+					return m, nil
 				}
 			}
 		}
@@ -903,7 +949,8 @@ func (m PipelineModel) overlayStatusPicker(body string) string {
 		if i == m.statusCursor {
 			prefix = "> "
 		}
-		picker = append(picker, padStyle.Render(style.Render(prefix+opt)))
+		label := fmt.Sprintf("%s (%s)", opt.label, strings.ToUpper(opt.shortcut))
+		picker = append(picker, padStyle.Render(style.Render(prefix+label)))
 	}
 
 	// Append picker to body
