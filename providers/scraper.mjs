@@ -83,10 +83,12 @@ function compilePattern(pattern, entryName) {
 
 function absolutizeUrl(url, baseUrl) {
   if (/^https?:\/\//i.test(url)) return url;
-  if (url.startsWith('//')) return 'https:' + url;
+  // Resolve against the full baseUrl (including its path) so path-relative
+  // hrefs like "job/123" or "../job/123" inherit the correct directory.
+  // The URL constructor also handles protocol-relative URLs ("//foo.com/...")
+  // by inheriting the base scheme, so no special-case branch is needed.
   try {
-    const base = new URL(baseUrl);
-    return new URL(url, `${base.protocol}//${base.host}`).toString();
+    return new URL(url, baseUrl).toString();
   } catch {
     return url;
   }
@@ -149,14 +151,45 @@ function buildPageUrl(baseUrl, page, pageParam) {
 
 // List pages on busy sites (notably builtin.com) sometimes take 10–20s to
 // respond, blowing past the default 10s fetch timeout. Use a longer timeout
-// and one retry on abort — much cheaper than losing a whole entry.
+// and one retry on transient failures — much cheaper than losing a whole
+// entry, while NOT amplifying load on sites that are returning permanent
+// errors (4xx, invalid URL, expired Apify rentals, etc.).
 const LIST_FETCH_TIMEOUT_MS = 30_000;
 const LIST_FETCH_RETRY_DELAY_MS = 1_500;
+
+// Heuristic: only retry errors that plausibly resolve on a second attempt.
+// _http.mjs marks HTTP error responses with err.status; everything else is
+// either an abort (per-request timeout fired), an undici cause-coded
+// connection failure, or a generic "fetch failed" wrapping a network error.
+function isTransientFetchError(err) {
+  if (!err) return false;
+  if (err.name === 'AbortError') return true;
+  if (typeof err.status === 'number') {
+    return err.status >= 500 && err.status < 600; // retry 5xx, not 4xx
+  }
+  const causeCode = err.cause?.code;
+  const transientCauses = new Set([
+    'UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_SOCKET',
+    'ECONNRESET',
+    'ECONNREFUSED',
+    'ETIMEDOUT',
+    'EAI_AGAIN',
+  ]);
+  if (causeCode && transientCauses.has(causeCode)) return true;
+  if (err.code && transientCauses.has(err.code)) return true;
+  // Bare "fetch failed" without status or recognized cause is treated as
+  // transient because undici uses it for transport-level failures (DNS,
+  // TLS reset, partial body) that often clear on retry.
+  if (typeof err.message === 'string' && err.message.includes('fetch failed')) return true;
+  return false;
+}
 
 async function fetchWithRetry(ctx, url) {
   try {
     return await ctx.fetchText(url, { timeoutMs: LIST_FETCH_TIMEOUT_MS });
   } catch (err) {
+    if (!isTransientFetchError(err)) throw err;
     await new Promise(r => setTimeout(r, LIST_FETCH_RETRY_DELAY_MS));
     return await ctx.fetchText(url, { timeoutMs: LIST_FETCH_TIMEOUT_MS });
   }
