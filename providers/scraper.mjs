@@ -11,17 +11,28 @@
 //       careers_url: "https://example.com/jobs?q=foo"
 //       provider: scraper
 //       url_must_include: "/careers/"
-//       list_item_pattern: '"jobTitle":"([^"]+)","jobUrl":"([^"]+)"'   # group 1=title, 2=url
+//       list_item_pattern: '"jobTitle":"([^"]+)","jobUrl":"([^"]+)"'   # default: g1=title, g2=url
 //
 // Use single-quoted YAML strings for `list_item_pattern` so backslashes are
 // preserved literally. The string is compiled with `new RegExp(s, 'g')` —
 // the `g` flag is added automatically. To disable URL filtering, set
 // `url_must_include: ""`.
 //
-// Company name isn't available at the list-page level — the source site only
-// exposes it on the detail page. Scan time uses a unique-per-job placeholder
-// (`Scraper #{id}`) so dedup works correctly; the real company name is
-// filled in by the pipeline mode when extracting the full JD.
+// Capture-group mapping (optional): when the source-page markup puts the
+// company name next to the title/URL, widen the regex to capture all three
+// and tell the scraper which group is which:
+//
+//       list_item_pattern: '<span>([^<]+)</span>...href="(/job/[^"]+)"...>([^<]+)</a>'
+//       title_group: 3        # default 1
+//       url_group: 2          # default 2
+//       company_group: 1      # default 0 (= unused, fall back to "Scraper #{id}")
+//
+// When the list page doesn't expose the company (no `company_group`), the
+// entry falls back to `Scraper #{id}` and the real name gets filled in
+// later by the pipeline mode when it extracts the full JD.
+//
+// Relative URLs (e.g. `/job/...`) are absolutized against `careers_url` so
+// the resulting pipeline entry is fetchable later.
 
 const MAX_PAGES = 20;
 // Defensive cap for `list_item_pattern` execution. Patterns are compiled from
@@ -70,7 +81,23 @@ function compilePattern(pattern, entryName) {
   }
 }
 
-function extractJobsFromHtml(html, pattern, urlMustInclude, entryName) {
+function absolutizeUrl(url, baseUrl) {
+  if (/^https?:\/\//i.test(url)) return url;
+  if (url.startsWith('//')) return 'https:' + url;
+  try {
+    const base = new URL(baseUrl);
+    return new URL(url, `${base.protocol}//${base.host}`).toString();
+  } catch {
+    return url;
+  }
+}
+
+function extractJobsFromHtml(html, pattern, urlMustInclude, entryName, opts = {}) {
+  const titleGroup = opts.titleGroup || 1;
+  const urlGroup = opts.urlGroup || 2;
+  const companyGroup = opts.companyGroup || 0; // 0 = unused
+  const baseUrl = opts.baseUrl || '';
+
   const jobs = [];
   const seen = new Set();
   pattern.lastIndex = 0;
@@ -81,16 +108,23 @@ function extractJobsFromHtml(html, pattern, urlMustInclude, entryName) {
       console.error(`⚠️  scraper: ${entryName} hit MAX_MATCHES_PER_PAGE (${MAX_MATCHES_PER_PAGE}) — truncating; check list_item_pattern for runaway matching`);
       break;
     }
-    const title = decodeText(m[1]);
-    const url = decodeText(m[2]);
+    const title = decodeText(m[titleGroup] || '');
+    let url = decodeText(m[urlGroup] || '');
+    if (!title || !url) continue;
+    if (baseUrl) url = absolutizeUrl(url, baseUrl);
     if (urlMustInclude && !url.includes(urlMustInclude)) continue;
     if (seen.has(url)) continue;
     seen.add(url);
     const id = extractIdFromUrl(url);
+    let company = `Scraper #${id}`;
+    if (companyGroup && m[companyGroup]) {
+      const c = decodeText(m[companyGroup]).trim();
+      if (c) company = c;
+    }
     jobs.push({
       title,
       url,
-      company: `Scraper #${id}`,
+      company,
       location: '',
     });
   }
@@ -113,6 +147,21 @@ function buildPageUrl(baseUrl, page, pageParam) {
   return `${baseUrl}${sep}${pageParam}=${page}`;
 }
 
+// List pages on busy sites (notably builtin.com) sometimes take 10–20s to
+// respond, blowing past the default 10s fetch timeout. Use a longer timeout
+// and one retry on abort — much cheaper than losing a whole entry.
+const LIST_FETCH_TIMEOUT_MS = 30_000;
+const LIST_FETCH_RETRY_DELAY_MS = 1_500;
+
+async function fetchWithRetry(ctx, url) {
+  try {
+    return await ctx.fetchText(url, { timeoutMs: LIST_FETCH_TIMEOUT_MS });
+  } catch (err) {
+    await new Promise(r => setTimeout(r, LIST_FETCH_RETRY_DELAY_MS));
+    return await ctx.fetchText(url, { timeoutMs: LIST_FETCH_TIMEOUT_MS });
+  }
+}
+
 export default {
   id: 'scraper',
 
@@ -132,6 +181,12 @@ export default {
     const pattern = compilePattern(entry.list_item_pattern, entry.name);
     const urlMustInclude = entry.url_must_include;
     const pageParam = entry.page_param || 'page';
+    const extractOpts = {
+      titleGroup: entry.title_group || 1,
+      urlGroup: entry.url_group || 2,
+      companyGroup: entry.company_group || 0,
+      baseUrl,
+    };
 
     const all = [];
     const seenUrls = new Set();
@@ -140,12 +195,12 @@ export default {
       const pageUrl = buildPageUrl(baseUrl, page, pageParam);
       let html;
       try {
-        html = await ctx.fetchText(pageUrl);
+        html = await fetchWithRetry(ctx, pageUrl);
       } catch (err) {
         if (page === 1) throw err;
         break;
       }
-      const pageJobs = extractJobsFromHtml(html, pattern, urlMustInclude, entry.name);
+      const pageJobs = extractJobsFromHtml(html, pattern, urlMustInclude, entry.name, extractOpts);
       if (pageJobs.length === 0) break;
 
       let novel = 0;
