@@ -37,14 +37,6 @@
  */
 
 /**
- * Returned by `detect()` when a provider claims an entry. `url` is
- * informational (used in logs); routing only checks for a non-null return.
- *
- * @typedef {object} DetectHit
- * @property {string} url
- */
-
-/**
  * Options forwarded to the underlying `fetch` call.
  *
  * @typedef {object} FetchOptions
@@ -71,7 +63,7 @@
  *
  * @typedef {object} Provider
  * @property {string} id                                                       Unique across all loaded providers.
- * @property {((entry: PortalEntry) => (DetectHit | null))} [detect]           Optional auto-detection.
+ * @property {((entry: PortalEntry) => boolean)} [detect]                      Optional auto-detection from careers_url; truthy means this provider claims the entry.
  * @property {(entry: PortalEntry, ctx: Context) => Promise<Job[]>} fetch      Required.
  */
 

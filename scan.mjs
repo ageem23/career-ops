@@ -6,7 +6,7 @@
  * Providers live in providers/*.mjs and are loaded at startup. Each provider
  * exports a default object with:
  *   - id: string — matched against `provider:` in portals.yml
- *   - detect(entry): {url}|null — optional auto-detection from careers_url
+ *   - detect(entry): boolean — optional auto-detection from careers_url
  *   - fetch(entry, ctx): [{title,url,company,location}] — required
  *
  * Files prefixed with _ are shared helpers (e.g. _http.mjs) and are never

@@ -16,8 +16,7 @@ export default {
   id: 'ashby',
 
   detect(entry) {
-    const apiUrl = resolveApiUrl(entry);
-    return apiUrl ? { url: apiUrl } : null;
+    return resolveApiUrl(entry) !== null;
   },
 
   async fetch(entry, ctx) {
