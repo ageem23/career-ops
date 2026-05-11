@@ -32,6 +32,15 @@ import path from 'path';
 import os from 'os';
 import { createHash } from 'crypto';
 import yaml from 'js-yaml';
+
+// Load .env so ANTHROPIC_API_KEY is visible — without this, hasSemanticBackend()
+// falls through to the CLI path even when the user has the key configured.
+// Matches scan.mjs's pattern; wrapped in try/catch so minimal installs work.
+try {
+  const { config } = await import('dotenv');
+  config();
+} catch {}
+
 import { hasSemanticBackend } from './scan-semantic.mjs';
 import { fetchText } from './providers/_http.mjs';
 import { fetchText as browserFetchText, closeBrowser } from './providers/_browser.mjs';
