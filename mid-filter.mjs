@@ -1,21 +1,25 @@
 #!/usr/bin/env node
-// mid-filter.mjs — JD-snippet archetype filter for `## Pendientes` in pipeline.md.
+// mid-filter.mjs — JD-snippet + full-profile filter for `## Pendientes` in pipeline.md.
 //
 // Why: title-only filters can't distinguish role scope when the same title
 // (e.g. "Director of Engineering") spans 5-person startups to 50K-person
 // enterprises. Full Sonnet batch evaluations CAN distinguish, but at ~3-5 min
 // per job. This sits in between: pull a ~1500-char JD snippet, send a batched
-// Haiku call with the candidate's archetypes from config/profile.yml, and
-// reject scores < threshold before they reach the full batch.
+// Haiku call with the candidate's full profile (CV + archetypes + comp/location
+// preferences from config/profile.yml), and reject scores < threshold before
+// they reach the full batch.
 //
 // Strategy:
 //   1. Parse pending entries from data/pipeline.md
 //   2. For each entry, fetch a JD snippet:
 //      - local:jds/{file}.md → strip frontmatter, take body
 //      - http(s)://...       → HTTP fetch, strip HTML tags, find the meat
-//   3. Batch the snippets through Haiku with archetype context
-//   4. Move scores < threshold to ## Filtered (mid-{date})
-//   5. Keep accepted entries unchanged in ## Pendientes
+//   3. Build a static system context (CV + profile + archetypes + rubric) used
+//      across all chunks. API path enables prompt caching on this block.
+//   4. Per chunk, send only the jobs as the user message — first chunk pays
+//      full price, subsequent chunks hit the cache.
+//   5. Move scores < threshold to ## Filtered (mid-{date})
+//   6. Keep accepted entries unchanged in ## Pendientes
 //
 // Usage:
 //   node mid-filter.mjs                  # apply (writes backup .bak)
@@ -23,24 +27,35 @@
 //   node mid-filter.mjs --min-score 3.5  # tighter threshold (default 3)
 //   node mid-filter.mjs --snippet-chars 2000  # bigger snippet (default 1500)
 
-import { readFileSync, writeFileSync, copyFileSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, copyFileSync, unlinkSync, mkdirSync, existsSync } from 'fs';
 import path from 'path';
 import os from 'os';
+import { createHash } from 'crypto';
 import yaml from 'js-yaml';
 import { hasSemanticBackend } from './scan-semantic.mjs';
 import { fetchText } from './providers/_http.mjs';
+import { fetchText as browserFetchText, closeBrowser } from './providers/_browser.mjs';
 
 const PIPELINE = 'data/pipeline.md';
 const PROFILE = 'config/profile.yml';
+const CV_PATH = 'cv.md';
+const JDS_DIR = 'jds';
 
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes('--dry-run');
+const REFRESH = args.includes('--refresh');       // bypass JD cache read
+const NO_BROWSER = args.includes('--no-browser'); // skip Playwright fallback
 const argValue = (flag, def) => {
   const i = args.indexOf(flag);
   return i >= 0 ? args[i + 1] : def;
 };
 const MIN_SCORE = parseFloat(argValue('--min-score', '3'));
 const SNIPPET_CHARS = parseInt(argValue('--snippet-chars', '1500'), 10);
+// Default to single-threaded fetch with a polite delay — many job-board
+// origins (dice, builtin, etc.) start returning 4xx or empty SPA shells when
+// they see concurrent connections from the same IP.
+const FETCH_CONCURRENCY = parseInt(argValue('--concurrency', '1'), 10);
+const FETCH_DELAY_MS = parseInt(argValue('--delay-ms', '750'), 10);
 
 // Match scan-semantic.mjs: same model, same env-var conventions.
 const MODEL = 'claude-haiku-4-5-20251001';
@@ -51,8 +66,10 @@ const CLI_TIMEOUT_MS = 360_000;
 // is ~1500 chars vs ~50 per title. 30 jobs × 1500 chars = ~45K char prompt;
 // well under the model context window with headroom for archetype context.
 const CHUNK_SIZE = 30;
-const FETCH_CONCURRENCY = 3;
 const FETCH_TIMEOUT_MS = 30_000;
+// Below this much cleaned text, HTTP probably returned an SPA shell or
+// boilerplate — retry with the browser transport.
+const MIN_USABLE_TEXT = 500;
 
 const backend = hasSemanticBackend();
 if (!backend) {
@@ -74,6 +91,92 @@ if (archetypes.length === 0) {
   process.exit(1);
 }
 console.log(`${archetypes.length} archetypes loaded`);
+
+// ── CV + extended profile for the static system context ────────────
+let cvText;
+try {
+  cvText = readFileSync(CV_PATH, 'utf8').trim();
+} catch (err) {
+  console.error(`Could not read ${CV_PATH}: ${err.message}`);
+  process.exit(1);
+}
+console.log(`CV loaded (${cvText.length} chars)`);
+
+const candidate = profile?.candidate || {};
+const narrative = profile?.narrative || {};
+const compensation = profile?.compensation || {};
+const candidateLocation = profile?.location || {};
+const primaryTargets = profile?.target_roles?.primary || [];
+
+const SYSTEM_CONTEXT = (() => {
+  const archetypeBlock = archetypes
+    .map((a, i) => `${i + 1}. **${a.name}** (${a.level}, ${a.fit} fit) — ${a.description}`)
+    .join('\n');
+  const primaryBlock = primaryTargets.length
+    ? primaryTargets.map(t => `- ${t}`).join('\n')
+    : '(none specified)';
+  const supersBlock = (narrative.superpowers || []).map(s => `- ${s}`).join('\n') || '(none specified)';
+  const locLine = [candidateLocation.city, candidateLocation.country].filter(Boolean).join(', ');
+  const visa = candidateLocation.visa_status ? ` (${candidateLocation.visa_status})` : '';
+
+  return `You filter job descriptions for a candidate to decide whether each is worth a full evaluation. Score each job against BOTH the candidate's target archetypes AND the candidate's actual CV experience.
+
+# Candidate profile
+
+**Name:** ${candidate.full_name || '(unspecified)'}
+**Headline:** ${narrative.headline || '(unspecified)'}
+**Location:** ${locLine}${visa}
+
+## Compensation & location preferences
+- Target total comp: ${compensation.target_range || '(unspecified)'}
+- Walk-away floor: ${compensation.minimum || '(unspecified)'}
+- Location flexibility: ${compensation.location_flexibility || '(unspecified)'}
+
+## Superpowers
+${supersBlock}
+
+## Exit story
+${narrative.exit_story || '(none)'}
+
+## Target roles (primary)
+${primaryBlock}
+
+## Target archetypes
+A job is a STRONG fit when it represents the same kind of role as a PRIMARY archetype at a comparable level/scope/function. Mismatches in level (IC vs management), function (sales-track vs eng-track), or scope (single-team vs org-level) score LOW even if the title matches.
+
+${archetypeBlock}
+
+# Candidate CV
+
+${cvText}
+
+# Scoring rubric (integer 1-5)
+
+Score reflects how worth-it a full evaluation would be. Two dimensions combine into one integer score:
+
+A. **Archetype fit** — does the JD represent one of the target archetypes at the right level/scope/function?
+B. **CV alignment** — does the candidate's actual experience (per the CV above) plausibly map to what the JD requires — tech stack, domain, industry, seniority?
+
+- **5** = strong PRIMARY archetype match AND CV experience clearly maps. A no-brainer to evaluate.
+- **4** = strong primary archetype match with one minor mismatch (adjacent domain or slight scope difference), OR strong SECONDARY archetype match with clean CV fit.
+- **3** = decent match — borderline. Adjacent archetype with right level, OR primary archetype with a notable CV gap (e.g. required tech stack the CV can't credibly bridge).
+- **2** = weak match — clearly off on one dimension: wrong function (sales/SE/RVP for an eng-VP archetype), wrong level (IC engineer for management archetype), wrong scope (single-team for org-level archetype), or hard tech-stack mismatch.
+- **1** = no match — wrong domain (civil/mechanical/electrical engineering for a software archetype), wrong function (CRM functional consulting, pure infra ops, support), or a hard filter triggered.
+
+## Hard signals to flag in reason (push score to 1-2)
+- Required tech stack/credentials the CV clearly lacks (e.g. JD requires 5+ years production Python ML; CV is .NET-only)
+- Industry license required not in CV (PE, MD, defense clearance, regulated specialization)
+- Visible total comp clearly below the walk-away floor (${compensation.minimum || 'N/A'})
+- On-site only outside the candidate's commute range for a non-remote role
+
+# Output format
+Return ONLY a JSON object — no preamble, no commentary, no markdown fences:
+{"scores": [{"id": 1, "score": N, "archetype": "name or null", "reason": "<= 14 words"}, ...]}
+
+The "scores" array MUST have exactly one entry per job in the user message, in order. "id" is the 1-based job index. "score" is integer 1-5. "archetype" is the best-fit archetype name from the list above, or null if no match. "reason" is a short fragment (≤ 14 words) noting the dominant factor — archetype match, CV gap, or hard signal.`;
+})();
+
+console.log(`system context: ${SYSTEM_CONTEXT.length} chars (cached across chunks on API backend)`);
 
 // ── Pipeline parser ─────────────────────────────────────────────────
 const text = readFileSync(PIPELINE, 'utf8');
@@ -146,38 +249,141 @@ function extractMeat(plain) {
   return plain.slice(200, 200 + SNIPPET_CHARS);
 }
 
+// ── JD cache helpers ────────────────────────────────────────────────
+// On HTTP fetch success we save the cleaned JD text under jds/{slug}.md with
+// the same frontmatter shape the linkedin provider uses, then rewrite the
+// pipeline entry's URL to `local:jds/...`. Future mid-filter runs and the
+// downstream batch evaluator can reuse the cached file instead of re-fetching.
+function slugify(text) {
+  const slug = String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+  if (slug) return slug;
+  return 'jd-' + createHash('sha1').update(String(text || '')).digest('hex').slice(0, 10);
+}
+
+function yamlEscape(str) {
+  const s = String(str ?? '').replace(/\n/g, ' ').trim();
+  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function cachePathFor(entry) {
+  const slug = slugify(`${entry.company}-${entry.title}`);
+  return path.join(JDS_DIR, `${slug}.md`);
+}
+
+function readCachedJd(entry) {
+  const filepath = cachePathFor(entry);
+  if (!existsSync(filepath)) return null;
+  try {
+    return { content: readFileSync(filepath, 'utf8'), localUrl: `local:${filepath.replace(/\\/g, '/')}` };
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedJd(entry, plainText) {
+  mkdirSync(JDS_DIR, { recursive: true });
+  const filepath = cachePathFor(entry);
+  if (existsSync(filepath)) return `local:${filepath.replace(/\\/g, '/')}`;
+  const today = new Date().toISOString().slice(0, 10);
+  const content = `---
+title: ${yamlEscape(entry.title)}
+company: ${yamlEscape(entry.company)}
+url: ${yamlEscape(entry.url)}
+application_url: ""
+scraped: "${today}"
+source: mid-filter
+---
+
+# ${entry.title} — ${entry.company}
+
+${plainText}
+`;
+  writeFileSync(filepath, content, 'utf-8');
+  return `local:${filepath.replace(/\\/g, '/')}`;
+}
+
 async function fetchSnippet(entry) {
   if (entry.url.startsWith('local:')) {
     const filePath = entry.url.slice('local:'.length);
     try {
       const content = readFileSync(filePath, 'utf8');
       const body = stripFrontmatter(content).replace(/\s+/g, ' ').trim();
-      return { snippet: extractMeat(body), source: 'local' };
+      return { snippet: extractMeat(body), source: 'local', cachedUrl: null };
     } catch (err) {
-      return { snippet: '', source: 'local-missing', error: err.message };
+      return { snippet: '', source: 'local-missing', error: err.message, cachedUrl: null };
     }
   }
+
+  // JD cache: hit serves the snippet AND rewrites the pipeline URL to local:.
+  if (!REFRESH) {
+    const cached = readCachedJd(entry);
+    if (cached) {
+      const body = stripFrontmatter(cached.content).replace(/\s+/g, ' ').trim();
+      return { snippet: extractMeat(body), source: 'cache', cachedUrl: cached.localUrl };
+    }
+  }
+
+  // HTTP fetch first.
+  let plain = '';
+  let source = 'http-fail';
+  let httpError = null;
   try {
     const html = await fetchText(entry.url, { timeoutMs: FETCH_TIMEOUT_MS });
-    return { snippet: extractMeat(htmlToText(html)), source: 'http' };
+    plain = htmlToText(html);
+    if (plain.length >= MIN_USABLE_TEXT) source = 'http';
   } catch (err) {
-    return { snippet: '', source: 'http-fail', error: (err.message || String(err)).slice(0, 120) };
+    httpError = (err.message || String(err)).slice(0, 120);
   }
+
+  // Browser fallback when HTTP threw or returned a short / SPA-shell body.
+  if (!NO_BROWSER && plain.length < MIN_USABLE_TEXT) {
+    try {
+      const html = await browserFetchText(entry.url, { timeoutMs: FETCH_TIMEOUT_MS });
+      const browserPlain = htmlToText(html);
+      if (browserPlain.length > plain.length) {
+        plain = browserPlain;
+        source = 'browser';
+      }
+    } catch (err) {
+      // Browser failed too — keep whatever (likely empty) we had.
+    }
+  }
+
+  if (!plain || plain.length < 100) {
+    return { snippet: '', source: source === 'http' ? 'http-thin' : 'http-fail', error: httpError, cachedUrl: null };
+  }
+
+  // Cache and rewrite the pipeline URL.
+  let cachedUrl = null;
+  try { cachedUrl = writeCachedJd(entry, plain); } catch {}
+  return { snippet: extractMeat(plain), source, cachedUrl };
 }
 
-async function runWithConcurrency(items, n, fn, label) {
+async function runWithConcurrency(items, n, fn, label, delayMs = 0) {
   const results = new Array(items.length);
   let cursor = 0;
   let done = 0;
   const total = items.length;
   let lastReport = 0;
+  const reportThreshold = n === 1 ? 1 : 25;
   const workers = Array.from({ length: n }, async () => {
+    let firstForWorker = true;
     while (true) {
       const idx = cursor++;
       if (idx >= items.length) break;
+      // Space requests per-worker. With n=1 this is global; with n>1 it
+      // spaces each worker's stream while letting workers interleave.
+      if (!firstForWorker && delayMs > 0) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+      firstForWorker = false;
       results[idx] = await fn(items[idx]);
       done++;
-      if (label && (done - lastReport >= 25 || done === total)) {
+      if (label && (done - lastReport >= reportThreshold || done === total)) {
         process.stdout.write(`\r  ${label}: ${done}/${total}`);
         lastReport = done;
       }
@@ -188,74 +394,63 @@ async function runWithConcurrency(items, n, fn, label) {
   return results;
 }
 
-console.log('\nfetching JD snippets...');
-const snippets = await runWithConcurrency(entries, FETCH_CONCURRENCY, fetchSnippet, 'fetched');
-const localOk = snippets.filter(s => s.source === 'local').length;
-const httpOk = snippets.filter(s => s.source === 'http').length;
-const localMiss = snippets.filter(s => s.source === 'local-missing').length;
-const httpFail = snippets.filter(s => s.source === 'http-fail').length;
-console.log(`  ${localOk} local, ${httpOk} http, ${localMiss} local-missing, ${httpFail} http-fail`);
+console.log(`\nfetching JD snippets (concurrency=${FETCH_CONCURRENCY}, delay=${FETCH_DELAY_MS}ms)...`);
+const snippets = await runWithConcurrency(entries, FETCH_CONCURRENCY, fetchSnippet, 'fetched', FETCH_DELAY_MS);
+const tally = snippets.reduce((acc, s) => { acc[s.source] = (acc[s.source] || 0) + 1; return acc; }, {});
+const tallyStr = Object.entries(tally).map(([k, v]) => `${v} ${k}`).join(', ');
+console.log(`  ${tallyStr}`);
 
 const evaluable = [];
 const unevaluable = [];
 for (let i = 0; i < entries.length; i++) {
-  if (snippets[i].snippet) evaluable.push({ ...entries[i], snippet: snippets[i].snippet });
-  else unevaluable.push({ ...entries[i], reason: snippets[i].source });
+  const cachedUrl = snippets[i].cachedUrl;
+  if (snippets[i].snippet) {
+    evaluable.push({ ...entries[i], snippet: snippets[i].snippet, cachedUrl });
+  } else {
+    unevaluable.push({ ...entries[i], reason: snippets[i].source, cachedUrl });
+  }
 }
 console.log(`${evaluable.length} evaluable, ${unevaluable.length} unevaluable (kept by default)`);
 
 // ── Haiku scoring ───────────────────────────────────────────────────
-function buildPrompt(items) {
-  const archetypeList = archetypes
-    .map((a, i) => `${i + 1}. **${a.name}** (${a.level}, ${a.fit} fit) — ${a.description}`)
-    .join('\n');
+// Per-chunk user message: just the jobs. All static context (CV, profile,
+// archetypes, rubric, output format) lives in SYSTEM_CONTEXT above and is
+// cached on the API backend across chunks.
+function buildUserChunk(items) {
   const jobList = items
     .map((it, i) => {
       const company = it.company || '(unknown)';
+      const location = it.location ? ` | ${it.location}` : '';
       const snippet = it.snippet.replace(/\s+/g, ' ').trim().slice(0, SNIPPET_CHARS);
-      return `### Job ${i + 1}: ${company} — ${it.title}\n${snippet}`;
+      return `### Job ${i + 1}: ${company} — ${it.title}${location}\n${snippet}`;
     })
     .join('\n\n');
 
-  return `You score whether each job description matches the candidate's target archetypes.
+  return `# Jobs to score (${items.length} jobs)
 
-# Candidate target archetypes
-A job is a STRONG fit when it represents the same kind of role as ANY archetype below at a comparable level. Mismatches in level (IC vs management), function (sales-track VP vs eng-track VP), or scope (regional GTM head vs eng head) score LOW even if the title matches.
-
-${archetypeList}
-
-# Scoring rubric (1-5, integer)
-- 5 = excellent match — title, level, scope, and function all align with a primary archetype
-- 4 = strong match — solid alignment, possibly with a minor mismatch (e.g. adjacent domain)
-- 3 = decent match — borderline; could fit a secondary archetype or a primary with notable scope mismatch
-- 2 = weak match — title may fit but the role is wrong scope, function, or level
-- 1 = no match — clearly off-archetype (IC engineer for a management archetype, sales VP for an eng VP archetype, etc.)
-
-# Jobs to score
 ${jobList}
 
-# Output format
-Return ONLY a JSON object, no preamble, no commentary, no markdown fences:
-{"scores": [{"id": 1, "score": N, "archetype": "name or null", "reason": "<= 12 words"}, ...]}
-
-The "scores" array MUST have exactly ${items.length} entries, one per job, in order. "id" is the 1-based job index. "score" is an integer 1-5. "archetype" is the best-fit archetype name from the list above, or null if no match. "reason" is a short fragment explaining the score — no period needed.`;
+Return ONLY the JSON object with exactly ${items.length} entries, in order.`;
 }
 
-async function callApi(prompt) {
+async function callApi(userChunk) {
   const { default: Anthropic } = await import('@anthropic-ai/sdk');
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const res = await client.messages.create({
     model: MODEL,
     max_tokens: MAX_TOKENS,
-    messages: [{ role: 'user', content: prompt }],
+    system: [
+      { type: 'text', text: SYSTEM_CONTEXT, cache_control: { type: 'ephemeral' } },
+    ],
+    messages: [{ role: 'user', content: userChunk }],
   });
   return res.content.filter(b => b.type === 'text').map(b => b.text).join('');
 }
 
-async function callCli(prompt) {
+async function callCli(userChunk) {
   const { spawn } = await import('node:child_process');
   const tmpFile = path.join(os.tmpdir(), `career-ops-mid-${process.pid}-${Date.now()}.md`);
-  writeFileSync(tmpFile, prompt, 'utf-8');
+  writeFileSync(tmpFile, SYSTEM_CONTEXT + '\n\n' + userChunk, 'utf-8');
   try {
     return await new Promise((resolve, reject) => {
       const args = [
@@ -315,10 +510,10 @@ const t0 = Date.now();
 for (let ci = 0; ci < chunks.length; ci++) {
   const chunk = chunks[ci];
   console.log(`  chunk ${ci + 1}/${chunks.length} (${chunk.length} jobs)`);
-  const prompt = buildPrompt(chunk);
+  const userChunk = buildUserChunk(chunk);
   let response;
   try {
-    response = backend === 'api' ? await callApi(prompt) : await callCli(prompt);
+    response = backend === 'api' ? await callApi(userChunk) : await callCli(userChunk);
   } catch (err) {
     console.log(`    ⚠ chunk failed: ${err.message}`);
     for (const it of chunk) verdicts.set(it.url, { score: null, archetype: null, reason: 'chunk-failed' });
@@ -385,8 +580,18 @@ sample([...scored].sort((a, b) => (b.score || 0) - (a.score || 0)));
 console.log(`\n  Sample rejected (lowest scores):`);
 sample([...rejects].sort((a, b) => (a.score || 0) - (b.score || 0)));
 
+// Rewrite the Pendientes line to point at the cached local: URL when we
+// have one — keeps downstream tools off the network on re-runs.
+function rebuildEntryLine(a) {
+  if (!a.cachedUrl || a.url.startsWith('local:')) return a.raw;
+  const parts = [`- [ ] ${a.cachedUrl}`, a.company, a.title];
+  if (a.location) parts.push(a.location);
+  return parts.join(' | ');
+}
+
 if (DRY_RUN) {
   console.log('\n(dry-run — no changes written)');
+  await closeBrowser();
   process.exit(0);
 }
 
@@ -396,7 +601,8 @@ console.log(`\n📦 backup → ${PIPELINE}.bak`);
 
 const today = new Date().toISOString().slice(0, 10);
 const newPendientes = ['## Pendientes', ''];
-for (const a of accepts) newPendientes.push(a.raw);
+const rewritten = accepts.filter(a => a.cachedUrl && !a.url.startsWith('local:')).length;
+for (const a of accepts) newPendientes.push(rebuildEntryLine(a));
 newPendientes.push('');
 
 const filtered = [
@@ -415,5 +621,7 @@ const tail = lines.slice(pEnd);
 writeFileSync(PIPELINE, [...head, ...newPendientes, ...filtered, ...tail].join('\n'));
 
 console.log(`✅ wrote ${PIPELINE}`);
-console.log(`   Pendientes: ${accepts.length}`);
+console.log(`   Pendientes: ${accepts.length} (${rewritten} URLs rewritten to local:jds/)`);
 console.log(`   Filtered:   ${rejects.length}`);
+
+await closeBrowser();
