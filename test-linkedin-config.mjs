@@ -121,11 +121,15 @@ function validateEntry(entry, idx) {
     }
   }
 
-  // surface unknown top-level fields so typos don't get silently ignored
+  // surface unknown top-level fields so typos don't get silently ignored.
+  // Keep this list in sync with the fields LinkedIn provider actually
+  // reads in providers/linkedin.mjs (location, geo_id, distance, work_mode
+  // were missed here and triggered false "unknown field" warnings).
   const KNOWN = new Set([
     'name', 'provider', 'enabled', 'search',
     'date_posted', 'experience_level', 'max_results',
     'delay_pages', 'delay_searches',
+    'location', 'geo_id', 'distance', 'work_mode',
   ]);
   for (const key of Object.keys(entry)) {
     if (!KNOWN.has(key)) {
