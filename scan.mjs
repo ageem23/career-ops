@@ -129,6 +129,29 @@ function buildTitleFilter(titleFilter) {
   };
 }
 
+// ── Location filter ─────────────────────────────────────────────────
+// Optional. If `location_filter` is absent from portals.yml, all locations pass.
+// Semantics:
+//   - Empty location string → pass (don't penalize missing data)
+//   - `block` matches → reject (takes precedence over allow)
+//   - `allow` empty → pass (already cleared block)
+//   - `allow` non-empty → must match at least one keyword
+// All matches are case-insensitive substring.
+
+function buildLocationFilter(locationFilter) {
+  if (!locationFilter) return () => true;
+  const allow = (locationFilter.allow || []).map(k => k.toLowerCase());
+  const block = (locationFilter.block || []).map(k => k.toLowerCase());
+
+  return (location) => {
+    if (!location) return true;
+    const lower = location.toLowerCase();
+    if (block.length > 0 && block.some(k => lower.includes(k))) return false;
+    if (allow.length === 0) return true;
+    return allow.some(k => lower.includes(k));
+  };
+}
+
 // ── Dedup ───────────────────────────────────────────────────────────
 
 function loadSeenUrls() {
@@ -217,13 +240,15 @@ function appendToPipeline(offers) {
 }
 
 function appendToScanHistory(offers, date) {
-  // Ensure file + header exist
+  // Ensure file + header exist. Location appended as 7th column for non-breaking
+  // backward compat — older scan-history.tsv files with 6 columns still parse fine
+  // since loadSeenUrls only reads column 0.
   if (!existsSync(SCAN_HISTORY_PATH)) {
-    writeFileSync(SCAN_HISTORY_PATH, 'url\tfirst_seen\tportal\ttitle\tcompany\tstatus\n', 'utf-8');
+    writeFileSync(SCAN_HISTORY_PATH, 'url\tfirst_seen\tportal\ttitle\tcompany\tstatus\tlocation\n', 'utf-8');
   }
 
   const lines = offers.map(o =>
-    `${o.url}\t${date}\t${o.source}\t${o.title}\t${o.company}\tadded`
+    `${o.url}\t${date}\t${o.source}\t${o.title}\t${o.company}\tadded\t${o.location || ''}`
   ).join('\n') + '\n';
 
   appendFileSync(SCAN_HISTORY_PATH, lines, 'utf-8');
@@ -318,6 +343,7 @@ async function main() {
   const config = parseYaml(readFileSync(PORTALS_PATH, 'utf-8'));
   const companies = config.tracked_companies || [];
   const titleFilter = buildTitleFilter(config.title_filter);
+  const locationFilter = buildLocationFilter(config.location_filter);
 
   // Archetype descriptions for the semantic title-filter come from
   // config/profile.yml (target_roles.archetypes[].semantic_description) so
@@ -363,6 +389,7 @@ async function main() {
   const date = new Date().toISOString().slice(0, 10);
   let totalFound = 0;
   let totalFilteredNegative = 0;
+  let totalFilteredLocation = 0;
   let totalAcceptedLiteral = 0;
   let totalDupes = 0;
   const newOffers = [];
@@ -393,6 +420,12 @@ async function main() {
         const verdict = titleFilter.classify(job.title, { skipPositive });
         if (verdict === 'reject') {
           totalFilteredNegative++;
+          continue;
+        }
+        // Location filter (from upstream/main) runs after title-reject so we
+        // don't waste a check on jobs that wouldn't pass title anyway.
+        if (!locationFilter(job.location)) {
+          totalFilteredLocation++;
           continue;
         }
         if (verdict === 'neutral') {
@@ -498,6 +531,7 @@ async function main() {
   console.log(`Companies scanned:     ${targets.length}`);
   console.log(`Total jobs found:      ${totalFound}`);
   console.log(`Filtered (negative):   ${totalFilteredNegative}`);
+  console.log(`Filtered (location):   ${totalFilteredLocation}`);
   console.log(`Accepted (literal):    ${totalAcceptedLiteral}`);
   if (neutrals.length > 0) {
     console.log(`Neutrals (semantic):   ${totalAcceptedSemantic} matched / ${totalFilteredSemantic} rejected / ${neutrals.length} total`);

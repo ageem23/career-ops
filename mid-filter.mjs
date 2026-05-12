@@ -88,7 +88,14 @@ if (!backend) {
 console.log(`backend: ${backend} | min-score: ${MIN_SCORE} | snippet: ${SNIPPET_CHARS} chars`);
 
 // ── Archetypes from profile.yml ─────────────────────────────────────
-const profile = yaml.load(readFileSync(PROFILE, 'utf8'));
+let profile;
+try {
+  profile = yaml.load(readFileSync(PROFILE, 'utf8'));
+} catch (err) {
+  console.error(`Could not read ${PROFILE}: ${err.message}`);
+  console.error(`Run onboarding to create config/profile.yml from config/profile.example.yml.`);
+  process.exit(1);
+}
 const archetypes = (profile?.target_roles?.archetypes || []).map(a => ({
   name: a.name,
   level: a.level || 'unspecified',
@@ -188,7 +195,14 @@ The "scores" array MUST have exactly one entry per job in the user message, in o
 console.log(`system context: ${SYSTEM_CONTEXT.length} chars (cached across chunks on API backend)`);
 
 // ── Pipeline parser ─────────────────────────────────────────────────
-const text = readFileSync(PIPELINE, 'utf8');
+let text;
+try {
+  text = readFileSync(PIPELINE, 'utf8');
+} catch (err) {
+  console.error(`Could not read ${PIPELINE}: ${err.message}`);
+  console.error(`Pipeline file is created by scan.mjs — run a scan first or paste URLs manually.`);
+  process.exit(1);
+}
 const lines = text.split(/\r?\n/);
 let pStart = -1;
 let pEnd = lines.length;
@@ -273,6 +287,68 @@ function slugify(text) {
   return 'jd-' + createHash('sha1').update(String(text || '')).digest('hex').slice(0, 10);
 }
 
+// ── URL validation (path traversal + SSRF guards) ───────────────────
+// `entry.url` comes from data/pipeline.md, which is intentionally hand-
+// editable. Without validation a crafted line like `local:../../.env` or
+// `http://127.0.0.1:8080/admin` would let mid-filter read arbitrary files or
+// probe the local network. Constrain both branches before any I/O.
+
+const JDS_DIR_ABS = path.resolve(JDS_DIR);
+
+// Hostnames and IPv4/IPv6 ranges that are not legitimate job-posting hosts.
+// String-only check — no DNS resolution. Mid-filter runs on the user's machine
+// against their own pipeline file, so we cover the obvious abuses (loopback,
+// link-local, RFC1918) and accept that a sophisticated DNS-rebinding attack is
+// out of scope.
+function isPrivateOrLocalHost(host) {
+  if (!host) return true;
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')) return true;
+  if (h === '0.0.0.0' || h === '::' || h === '::1' || h === '[::1]') return true;
+  // IPv4 ranges: 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16
+  const m4 = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (m4) {
+    const [a, b] = m4.slice(1).map(Number);
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    return false;
+  }
+  // IPv6 unique local (fc00::/7) and link-local (fe80::/10)
+  if (/^f[cd][0-9a-f]{2}:/i.test(h) || /^fe[89ab][0-9a-f]:/i.test(h)) return true;
+  return false;
+}
+
+function validateEntryUrl(url) {
+  if (!url) return { kind: 'invalid', reason: 'empty url' };
+  if (url.startsWith('local:')) {
+    const rel = url.slice('local:'.length);
+    if (!rel) return { kind: 'invalid', reason: 'empty local path' };
+    const resolved = path.resolve(rel);
+    // resolved must sit inside JDS_DIR_ABS (catches `..` traversal and
+    // absolute paths pointing elsewhere). path.relative returns '..' or
+    // a leading '..' when the target escapes the base.
+    const rel2 = path.relative(JDS_DIR_ABS, resolved);
+    if (rel2.startsWith('..') || path.isAbsolute(rel2)) {
+      return { kind: 'invalid', reason: 'local path escapes jds/' };
+    }
+    return { kind: 'local', filePath: resolved };
+  }
+  let parsed;
+  try { parsed = new URL(url); } catch {
+    return { kind: 'invalid', reason: 'unparseable url' };
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return { kind: 'invalid', reason: `unsupported scheme ${parsed.protocol}` };
+  }
+  if (isPrivateOrLocalHost(parsed.hostname)) {
+    return { kind: 'invalid', reason: `private/local host ${parsed.hostname}` };
+  }
+  return { kind: 'remote', url };
+}
+
 function yamlEscape(str) {
   const s = String(str ?? '').replace(/\n/g, ' ').trim();
   return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
@@ -293,10 +369,13 @@ function readCachedJd(entry) {
   }
 }
 
-function writeCachedJd(entry, plainText) {
+function writeCachedJd(entry, plainText, { overwrite = false } = {}) {
   mkdirSync(JDS_DIR, { recursive: true });
   const filepath = cachePathFor(entry);
-  if (existsSync(filepath)) return `local:${filepath.replace(/\\/g, '/')}`;
+  // --refresh threads through as `overwrite: true` from the call site so a
+  // refresh run actually replaces the stale cached JD instead of silently
+  // re-reading the same content.
+  if (existsSync(filepath) && !overwrite) return `local:${filepath.replace(/\\/g, '/')}`;
   const today = new Date().toISOString().slice(0, 10);
   const content = `---
 title: ${yamlEscape(entry.title)}
@@ -316,10 +395,16 @@ ${plainText}
 }
 
 async function fetchSnippet(entry) {
-  if (entry.url.startsWith('local:')) {
-    const filePath = entry.url.slice('local:'.length);
+  // Validate before any I/O so a crafted pending entry can't read files
+  // outside jds/ or trigger SSRF against loopback/private hosts.
+  const v = validateEntryUrl(entry.url);
+  if (v.kind === 'invalid') {
+    return { snippet: '', source: 'invalid-url', error: v.reason, cachedUrl: null };
+  }
+
+  if (v.kind === 'local') {
     try {
-      const content = readFileSync(filePath, 'utf8');
+      const content = readFileSync(v.filePath, 'utf8');
       const body = stripFrontmatter(content).replace(/\s+/g, ' ').trim();
       return { snippet: extractMeat(body), source: 'local', cachedUrl: null };
     } catch (err) {
@@ -341,7 +426,7 @@ async function fetchSnippet(entry) {
   let source = 'http-fail';
   let httpError = null;
   try {
-    const html = await fetchText(entry.url, { timeoutMs: FETCH_TIMEOUT_MS });
+    const html = await fetchText(v.url, { timeoutMs: FETCH_TIMEOUT_MS });
     plain = htmlToText(html);
     if (plain.length >= MIN_USABLE_TEXT) source = 'http';
   } catch (err) {
@@ -351,7 +436,7 @@ async function fetchSnippet(entry) {
   // Browser fallback when HTTP threw or returned a short / SPA-shell body.
   if (!NO_BROWSER && plain.length < MIN_USABLE_TEXT) {
     try {
-      const html = await browserFetchText(entry.url, { timeoutMs: FETCH_TIMEOUT_MS });
+      const html = await browserFetchText(v.url, { timeoutMs: FETCH_TIMEOUT_MS });
       const browserPlain = htmlToText(html);
       if (browserPlain.length > plain.length) {
         plain = browserPlain;
@@ -368,7 +453,7 @@ async function fetchSnippet(entry) {
 
   // Cache and rewrite the pipeline URL.
   let cachedUrl = null;
-  try { cachedUrl = writeCachedJd(entry, plain); } catch {}
+  try { cachedUrl = writeCachedJd(entry, plain, { overwrite: REFRESH }); } catch {}
   return { snippet: extractMeat(plain), source, cachedUrl };
 }
 
@@ -614,20 +699,76 @@ const rewritten = accepts.filter(a => a.cachedUrl && !a.url.startsWith('local:')
 for (const a of accepts) newPendientes.push(rebuildEntryLine(a));
 newPendientes.push('');
 
-const filtered = [
-  `## Filtered (mid-${today})`,
-  '',
-  `<!-- ${rejects.length} entries removed by mid-filter.mjs on ${today}. Threshold: score < ${MIN_SCORE}. To restore, move lines back to ## Pendientes. -->`,
-  '',
-];
-for (const r of rejects) {
-  filtered.push(`- [~] ${r.url} | ${r.company} | ${r.title} | mid:${r.score}/${r.archetype || '?'}: ${r.reason}`);
-}
-filtered.push('');
+const newRejectLines = rejects.map(r =>
+  `- [~] ${r.url} | ${r.company} | ${r.title} | mid:${r.score}/${r.archetype || '?'}: ${r.reason}`,
+);
 
 const head = lines.slice(0, pStart);
-const tail = lines.slice(pEnd);
-writeFileSync(PIPELINE, [...head, ...newPendientes, ...filtered, ...tail].join('\n'));
+let tail = lines.slice(pEnd);
+
+// Idempotent Filtered handling: if today's `## Filtered (mid-{today})`
+// section already exists in tail, MERGE the new rejects into it (dedup by
+// URL) instead of prepending a duplicate header. URL-keyed dedup means a
+// rerun on the same day is a no-op when no new rejects appeared, and adds
+// only genuinely new lines otherwise.
+const todayHeader = `## Filtered (mid-${today})`;
+let mergedTail;
+let existingIdx = -1;
+for (let i = 0; i < tail.length; i++) {
+  if (tail[i].trim() === todayHeader) { existingIdx = i; break; }
+}
+
+if (existingIdx >= 0) {
+  // Find end of existing block (next `## ` header or end of tail).
+  let endIdx = tail.length;
+  for (let i = existingIdx + 1; i < tail.length; i++) {
+    if (tail[i].startsWith('## ')) { endIdx = i; break; }
+  }
+  // Extract existing reject lines so we can dedup against the new ones.
+  const existingRejects = [];
+  const seenUrls = new Set();
+  const URL_RE = /^- \[~\] (\S+)/;
+  for (let i = existingIdx + 1; i < endIdx; i++) {
+    const line = tail[i];
+    const m = line.match(URL_RE);
+    if (m) {
+      if (seenUrls.has(m[1])) continue;
+      seenUrls.add(m[1]);
+      existingRejects.push(line);
+    }
+  }
+  // Append new lines that aren't already present by URL.
+  for (const line of newRejectLines) {
+    const m = line.match(URL_RE);
+    if (m && !seenUrls.has(m[1])) {
+      seenUrls.add(m[1]);
+      existingRejects.push(line);
+    }
+  }
+  const totalCount = existingRejects.length;
+  const mergedSection = [
+    todayHeader,
+    '',
+    `<!-- ${totalCount} entries removed by mid-filter.mjs on ${today} (merged across runs). Threshold: score < ${MIN_SCORE}. To restore, move lines back to ## Pendientes. -->`,
+    '',
+    ...existingRejects,
+    '',
+  ];
+  mergedTail = [...tail.slice(0, existingIdx), ...mergedSection, ...tail.slice(endIdx)];
+} else {
+  // No existing same-day section — prepend a fresh one before tail.
+  const freshSection = [
+    todayHeader,
+    '',
+    `<!-- ${rejects.length} entries removed by mid-filter.mjs on ${today}. Threshold: score < ${MIN_SCORE}. To restore, move lines back to ## Pendientes. -->`,
+    '',
+    ...newRejectLines,
+    '',
+  ];
+  mergedTail = [...freshSection, ...tail];
+}
+
+writeFileSync(PIPELINE, [...head, ...newPendientes, ...mergedTail].join('\n'));
 
 console.log(`✅ wrote ${PIPELINE}`);
 console.log(`   Pendientes: ${accepts.length} (${rewritten} URLs rewritten to local:jds/)`);
