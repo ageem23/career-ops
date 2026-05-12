@@ -67,6 +67,7 @@ AI-powered job search automation built on Claude Code: pipeline tracking, offer 
 | `scan.mjs` | Zero-token portal scanner — hits Greenhouse/Ashby/Lever APIs directly, zero LLM cost |
 | `check-liveness.mjs` | Job posting liveness checker |
 | `liveness-core.mjs` | Shared liveness logic (expired signals win over generic Apply text) |
+| `mid-filter.mjs` | JD-snippet archetype filter — Haiku-powered mid-tier scoring between title filter and full Sonnet batch. Reads `## Pendientes`, fetches a ~1500-char JD snippet per entry, scores against `config/profile.yml` archetypes, moves rejects (score < threshold) to `## Filtered (mid-{date})`. Cheap and cuts the size/scope title-noise that title-only filters can't catch. |
 | `reports/` | Evaluation reports (format: `{###}-{company-slug}-{YYYY-MM-DD}.md`). Blocks A-F + G (Posting Legitimacy). Header includes `**Legitimacy:** {tier}`. |
 
 ### OpenCode Commands
