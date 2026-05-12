@@ -269,7 +269,10 @@ function unwrapRedirect(href) {
 // and returned ~0 results. Path also corrected: `/jobs/search-results/`
 // renders a blank shell on direct navigation; `/jobs/search/` is the real
 // keyword-search entry point.
-const DATE_POSTED_TPR = { '24': 'r86400', 'Week': 'r604800', 'Month': 'r2592000' };
+const DATE_POSTED_TPR = { '24': 'r86400', '2': 'r172800', 'Week': 'r604800', 'Month': 'r2592000' };
+
+// f_WT filter codes for LinkedIn's Work Mode toggles.
+const WORK_MODE_F_WT = { 'On-site': '1', 'Remote': '2', 'Hybrid': '3' };
 
 function buildSearchUrl(entry) {
   const levels = Array.isArray(entry.experience_level) ? entry.experience_level : [];
@@ -284,6 +287,21 @@ function buildSearchUrl(entry) {
   const params = new URLSearchParams({ keywords });
   if (DATE_POSTED_TPR[entry.date_posted]) {
     params.set('f_TPR', DATE_POSTED_TPR[entry.date_posted]);
+  }
+  if (entry.location) {
+    params.set('location', entry.location);
+  }
+  if (entry.geo_id) {
+    params.set('geoId', String(entry.geo_id));
+  }
+  if (entry.distance !== undefined && entry.distance !== null) {
+    params.set('distance', String(entry.distance));
+  }
+  if (Array.isArray(entry.work_mode) && entry.work_mode.length) {
+    const codes = entry.work_mode
+      .map(mode => WORK_MODE_F_WT[mode])
+      .filter(Boolean);
+    if (codes.length) params.set('f_WT', codes.join(','));
   }
   return `https://www.linkedin.com/jobs/search/?${params}`;
 }
