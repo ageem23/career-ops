@@ -102,15 +102,26 @@ async function waitForRun(runId, token, deadline, timeoutMs) {
   const url = `${APIFY_API_BASE}/actor-runs/${runId}`;
   let lastError;
   while (Date.now() < deadline) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
     try {
-      const body = await fetchJsonOnce(url, { headers: authHeaders(token) });
+      // Cap the per-request timeout by the remaining budget so a single slow
+      // poll can't blow past `timeoutMs` before the abort logic runs.
+      const body = await fetchJsonOnce(
+        url,
+        { headers: authHeaders(token) },
+        Math.min(PER_REQUEST_TIMEOUT_MS, remainingMs),
+      );
       const run = body?.data;
       if (run && TERMINAL_STATUSES.has(run.status)) return run;
       lastError = undefined;
     } catch (err) {
       lastError = err;
     }
-    await sleep(POLL_INTERVAL_MS);
+    // Same cap for the sleep — if the budget is almost gone, don't waste it
+    // on a fixed interval before the loop exits.
+    const sleepMs = Math.min(POLL_INTERVAL_MS, deadline - Date.now());
+    if (sleepMs > 0) await sleep(sleepMs);
   }
   await abortRun(runId, token);
   const suffix = lastError ? ` (last error: ${lastError.message})` : '';
@@ -129,6 +140,12 @@ async function fetchDatasetItems(runId, token) {
 export async function runActor(actorId, input, { timeoutMs = DEFAULT_RUN_TIMEOUT_MS } = {}) {
   const token = process.env.APIFY_TOKEN;
   if (!token) throw new Error('APIFY_TOKEN not set');
+  // Validate up front — a NaN or negative timeoutMs would yield a malformed
+  // deadline (Date.now() + NaN = NaN) and the loop in waitForRun would never
+  // enter, producing a confusing "did not finish within 0s" error.
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error(`apify: invalid timeoutMs ${JSON.stringify(timeoutMs)} (must be a positive finite number of milliseconds)`);
+  }
 
   const deadline = Date.now() + timeoutMs;
   const runId = await startRun(actorId, input, token);
