@@ -68,7 +68,7 @@ Listar el primario y los alternativos en una tabla. Antes de mostrarla, buscar e
 - Buscar la fila mas reciente con `Company` == empresa del contacto y status activo (`Applied` / `Responded` / `Interview` / `Evaluated`).
 - Si hay match, escribir el numero de la columna `#` en la columna `App#` de la tabla. Si no hay match, escribir `-`.
 
-```
+```markdown
 | # | Nombre | Rol | Empresa | App# | LinkedIn |
 |---|--------|-----|---------|------|----------|
 | 1 | Jane Doe | Recruiter | Acme | 412 | linkedin.com/in/jane-doe |

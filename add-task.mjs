@@ -75,8 +75,15 @@ function validate(args) {
     throw new Error(`--type must be one of: ${[...ALLOWED_TYPES].join(', ')}`);
   }
   if (!args.title || !args.title.trim()) throw new Error('--title is required');
-  if (args.due && !/^\d{4}-\d{2}-\d{2}$/.test(args.due)) {
-    throw new Error('--due must be YYYY-MM-DD');
+  if (args.due) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(args.due)) {
+      throw new Error('--due must be YYYY-MM-DD');
+    }
+    // Reject impossible dates like 2026-02-30 by round-tripping through Date.
+    const d = new Date(args.due + 'T00:00:00Z');
+    if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== args.due) {
+      throw new Error(`--due ${args.due} is not a real calendar date`);
+    }
   }
   if (args.app !== undefined) {
     const n = parseInt(args.app, 10);
