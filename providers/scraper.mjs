@@ -35,6 +35,8 @@
 // the resulting pipeline entry is fetchable later.
 
 const MAX_PAGES = 20;
+import { assertSafeHttpUrl } from './_http.mjs';
+
 // Defensive cap for `list_item_pattern` execution. Patterns are compiled from
 // portals.yml — a runaway regex on a large page can spin for a long time. Stop
 // well above any realistic single-page result count.
@@ -94,11 +96,45 @@ function absolutizeUrl(url, baseUrl) {
   }
 }
 
+// Parse a scraped URL into a same-origin-and-public guard. Returns the parsed
+// URL on success, or null if the URL should be dropped. Cases dropped:
+//   - unparseable / non-string input
+//   - non-http(s) scheme (javascript:, data:, file:)
+//   - private/loopback host (delegates to _http.mjs's central SSRF list)
+//   - different origin than the careers_url it was scraped from
+//     (defends against the scrape page injecting off-domain links)
+function validateScrapedUrl(url, baseOrigin) {
+  let parsed;
+  try { parsed = new URL(url); } catch { return null; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  try { assertSafeHttpUrl(parsed.toString()); } catch { return null; }
+  if (baseOrigin && parsed.origin !== baseOrigin) return null;
+  return parsed;
+}
+
+// Validate a capture-group config value at fetch time. `undefined`/`null`
+// falls back to the default; any other invalid shape (non-integer, negative,
+// or string that doesn't parse) throws a clear configuration error so the
+// user sees the problem at startup instead of an empty result set.
+function requireGroupIndex(value, fallback, field, entryName, { allowZero = false } = {}) {
+  if (value == null) return fallback;
+  const idx = Number(value);
+  const min = allowZero ? 0 : 1;
+  if (!Number.isInteger(idx) || idx < min) {
+    throw new Error(
+      `scraper: entry ${entryName} has invalid ${field}=${JSON.stringify(value)} ` +
+      `(must be an integer ≥${min})`,
+    );
+  }
+  return idx;
+}
+
 function extractJobsFromHtml(html, pattern, urlMustInclude, entryName, opts = {}) {
   const titleGroup = opts.titleGroup || 1;
   const urlGroup = opts.urlGroup || 2;
   const companyGroup = opts.companyGroup || 0; // 0 = unused
   const baseUrl = opts.baseUrl || '';
+  const baseOrigin = opts.baseOrigin || '';
 
   const jobs = [];
   const seen = new Set();
@@ -114,7 +150,14 @@ function extractJobsFromHtml(html, pattern, urlMustInclude, entryName, opts = {}
     let url = decodeText(m[urlGroup] || '');
     if (!title || !url) continue;
     if (baseUrl) url = absolutizeUrl(url, baseUrl);
-    if (urlMustInclude && !url.includes(urlMustInclude)) continue;
+    // Validate scheme + private-host + same-origin BEFORE accepting the URL.
+    // Without this, a hostile search-results page could inject off-domain
+    // or javascript:/data: hrefs that downstream tools blindly fetch.
+    const parsed = validateScrapedUrl(url, baseOrigin);
+    if (!parsed) continue;
+    // url_must_include matches against the pathname (not the full URL string)
+    // so a query-string bait like `?next=/job/` can't masquerade as a job link.
+    if (urlMustInclude && !parsed.pathname.includes(urlMustInclude)) continue;
     if (seen.has(url)) continue;
     seen.add(url);
     const id = extractIdFromUrl(url);
@@ -204,6 +247,16 @@ export default {
   async fetch(entry, ctx) {
     const baseUrl = entry.careers_url;
     if (!baseUrl) throw new Error(`scraper: entry ${entry.name} missing careers_url`);
+    // Validate careers_url upfront — same SSRF rules as the rest of the
+    // pipeline (no loopback, no RFC1918, no non-http(s) schemes). Throws a
+    // clear config error if the URL is internal or malformed.
+    let baseParsed;
+    try {
+      assertSafeHttpUrl(baseUrl);
+      baseParsed = new URL(baseUrl);
+    } catch (err) {
+      throw new Error(`scraper: entry ${entry.name} has invalid careers_url: ${err.message}`);
+    }
 
     if (entry.list_item_pattern == null || entry.list_item_pattern === '') {
       throw new Error(`scraper: entry ${entry.name} missing list_item_pattern`);
@@ -215,10 +268,12 @@ export default {
     const urlMustInclude = entry.url_must_include;
     const pageParam = entry.page_param || 'page';
     const extractOpts = {
-      titleGroup: entry.title_group || 1,
-      urlGroup: entry.url_group || 2,
-      companyGroup: entry.company_group || 0,
+      titleGroup: requireGroupIndex(entry.title_group, 1, 'title_group', entry.name),
+      urlGroup: requireGroupIndex(entry.url_group, 2, 'url_group', entry.name),
+      // company_group is optional — 0 means "unused, fall back to Scraper #id"
+      companyGroup: requireGroupIndex(entry.company_group, 0, 'company_group', entry.name, { allowZero: true }),
       baseUrl,
+      baseOrigin: baseParsed.origin,
     };
 
     const all = [];
