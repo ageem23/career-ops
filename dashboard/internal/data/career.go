@@ -583,12 +583,16 @@ func replaceStatusInLine(line, oldStatus, newStatus string) string {
 }
 
 // AppendApplicationNote appends a note fragment to the Notes column of the
-// application row identified by reportNumber. Joined to existing notes with " | ".
+// application row identified by reportNumber. Joined to existing notes with
+// "; " (a non-pipe separator so the table parser still sees a single column).
 // No-op if the application is not found.
 func AppendApplicationNote(careerOpsPath, reportNumber, note string) error {
 	if reportNumber == "" || note == "" {
 		return nil
 	}
+	// Pipes inside a markdown table cell fracture the row when split by '|'.
+	// Replace them with the broken-bar U+00A6 so the cell stays single-column.
+	note = strings.ReplaceAll(note, "|", "¦")
 	filePath := filepath.Join(careerOpsPath, "applications.md")
 	content, err := os.ReadFile(filePath)
 	if err != nil {
@@ -622,7 +626,7 @@ func AppendApplicationNote(careerOpsPath, reportNumber, note string) error {
 		if notesField == "" {
 			newNotes = note
 		} else {
-			newNotes = notesField + " | " + note
+			newNotes = notesField + "; " + note
 		}
 		rebuilt := body[:lastPipe+1] + " " + newNotes
 		if trailingPipe {

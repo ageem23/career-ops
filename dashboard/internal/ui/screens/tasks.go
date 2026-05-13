@@ -246,6 +246,9 @@ func (m TasksModel) handleInput(msg tea.KeyMsg) (TasksModel, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyRunes, tea.KeySpace:
+		if len([]rune(m.inputBuf)) >= 200 {
+			return m, nil
+		}
 		m.inputBuf += string(msg.Runes)
 		return m, nil
 	}

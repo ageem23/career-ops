@@ -274,17 +274,28 @@ func (m *appModel) handleTaskAdd(msg screens.TasksAddMsg) {
 
 // handleTaskRefresh re-runs sync-tasks.mjs and reloads.
 func (m *appModel) handleTaskRefresh() {
-	syncScript := filepath.Join(m.careerOpsPath, "sync-tasks.mjs")
-	if _, err := os.Stat(syncScript); err == nil {
-		cmd := exec.Command("node", syncScript)
-		cmd.Dir = m.careerOpsPath
-		if out, err := cmd.CombinedOutput(); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: sync-tasks failed: %v\n%s\n", err, string(out))
-		}
-	}
+	runSyncTasks(m.careerOpsPath)
 	tasks := data.ParseTasks(m.careerOpsPath)
 	m.tasks = m.tasks.WithReloadedTasks(tasks)
 	m.tasks.SetFlash("Tasks synced.")
+}
+
+// runSyncTasks shells out to sync-tasks.mjs. Best-effort: missing node, missing
+// script, or a non-zero exit all log to stderr and return without blocking.
+func runSyncTasks(careerOpsPath string) {
+	syncScript := filepath.Join(careerOpsPath, "sync-tasks.mjs")
+	if _, err := os.Stat(syncScript); err != nil {
+		return
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: node not found in PATH; task sync disabled\n")
+		return
+	}
+	cmd := exec.Command("node", syncScript)
+	cmd.Dir = careerOpsPath
+	if out, err := cmd.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: sync-tasks failed: %v\n%s\n", err, string(out))
+	}
 }
 
 // autoCreateInterviewThankYou appends a thank-you task on Interview transition,
@@ -354,14 +365,7 @@ func main() {
 
 	// Reconcile cadence -> tasks before loading the UI. Best-effort: a failure
 	// here (node missing, script error) should not block the dashboard.
-	syncScript := filepath.Join(careerOpsPath, "sync-tasks.mjs")
-	if _, err := os.Stat(syncScript); err == nil {
-		cmd := exec.Command("node", syncScript)
-		cmd.Dir = careerOpsPath
-		if out, err := cmd.CombinedOutput(); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: sync-tasks failed: %v\n%s\n", err, string(out))
-		}
-	}
+	runSyncTasks(careerOpsPath)
 
 	// Load applications
 	apps := data.ParseApplications(careerOpsPath)

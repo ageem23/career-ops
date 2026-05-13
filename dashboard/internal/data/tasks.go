@@ -150,6 +150,10 @@ func readTasksFile(careerOpsPath string) (headerLines []string, dataRows []strin
 }
 
 func writeTasksFile(careerOpsPath string, headerLines, dataRows []string) error {
+	path := tasksFilePath(careerOpsPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
 	var body strings.Builder
 	for _, l := range headerLines {
 		body.WriteString(l)
@@ -159,7 +163,7 @@ func writeTasksFile(careerOpsPath string, headerLines, dataRows []string) error 
 		body.WriteString(r)
 		body.WriteString("\n")
 	}
-	return os.WriteFile(tasksFilePath(careerOpsPath), []byte(body.String()), 0644)
+	return os.WriteFile(path, []byte(body.String()), 0644)
 }
 
 // UpdateTaskStatus rewrites the matching task row with a new status and completion
@@ -274,6 +278,9 @@ func parseRowParts(parts []string) model.Task {
 // file with a canonical header if missing.
 func AppendFollowupHistory(careerOpsPath string, appNum int, date, company, role, channel, contact, notes string) error {
 	path := followupsFilePath(careerOpsPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
 	content, err := os.ReadFile(path)
 	var headerLines []string
 	var rows []string

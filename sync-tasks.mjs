@@ -17,7 +17,7 @@
  *      node sync-tasks.mjs --json     (machine-readable result)
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
@@ -63,11 +63,16 @@ function parseTasks() {
     const num = parseInt(parts[1]);
     if (isNaN(num)) continue;
     if (num > maxNum) maxNum = num;
+    let appNum = null;
+    if (parts[4] && parts[4] !== '-') {
+      const parsed = parseInt(parts[4]);
+      if (Number.isFinite(parsed)) appNum = parsed;
+    }
     tasks.push({
       num,
       created: parts[2],
       due: parts[3],
-      appNum: parts[4] === '-' ? null : parseInt(parts[4]),
+      appNum,
       company: parts[5],
       type: parts[6],
       title: parts[7],
@@ -114,6 +119,7 @@ function formatRow(task) {
 }
 
 function writeTasks(allTasks) {
+  mkdirSync(dirname(TASKS_FILE), { recursive: true });
   const rows = allTasks.map(formatRow).join('\n');
   const content = HEADER + (rows ? rows + '\n' : '');
   writeFileSync(TASKS_FILE, content, 'utf-8');
