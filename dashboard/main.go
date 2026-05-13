@@ -232,30 +232,34 @@ func (m *appModel) handleTaskMarkStatus(msg screens.TasksMarkStatusMsg) {
 	if msg.NewStatus == "done" && updated.Type == "followup" && updated.AppNumber > 0 {
 		apps := data.ParseApplications(m.careerOpsPath)
 		app, ok := data.FindApplicationByNumber(apps, updated.AppNumber)
-		role := ""
-		reportNumber := ""
-		if ok {
-			role = app.Role
-			reportNumber = app.ReportNumber
+		if !ok {
+			// Without the application row we can't write a meaningful Notes
+			// entry, and writing only the follow-up history would leave the
+			// two files permanently out of sync. Skip the whole cascade.
+			fmt.Fprintf(os.Stderr, "WARN: app #%d not found; skipping follow-up cascade\n", updated.AppNumber)
+		} else {
+			if err := data.AppendFollowupHistory(
+				m.careerOpsPath,
+				updated.AppNumber, today, updated.Company, app.Role,
+				"Dashboard", "-", updated.Title,
+			); err != nil {
+				fmt.Fprintf(os.Stderr, "WARN: follow-up history append failed: %v\n", err)
+			}
+			cycle := cycleFromTitle(updated.Title)
+			note := fmt.Sprintf("Follow-up %s sent %s", cycle, today)
+			if err := data.AppendApplicationNote(m.careerOpsPath, app.ReportNumber, note); err != nil {
+				fmt.Fprintf(os.Stderr, "WARN: application note append failed: %v\n", err)
+			}
+			m.reloadPipelineData()
 		}
-		if err := data.AppendFollowupHistory(
-			m.careerOpsPath,
-			updated.AppNumber, today, updated.Company, role,
-			"Dashboard", "-", updated.Title,
-		); err != nil {
-			fmt.Fprintf(os.Stderr, "WARN: follow-up history append failed: %v\n", err)
-		}
-		cycle := cycleFromTitle(updated.Title)
-		note := fmt.Sprintf("Follow-up %s sent %s", cycle, today)
-		if err := data.AppendApplicationNote(m.careerOpsPath, reportNumber, note); err != nil {
-			fmt.Fprintf(os.Stderr, "WARN: application note append failed: %v\n", err)
-		}
-		m.reloadPipelineData()
 	}
 
 	tasks := data.ParseTasks(m.careerOpsPath)
 	m.tasks = m.tasks.WithReloadedTasks(tasks)
 	verb := map[string]string{"done": "completed", "skipped": "skipped"}[msg.NewStatus]
+	if verb == "" {
+		verb = "updated"
+	}
 	m.tasks.SetFlash(fmt.Sprintf("Task #%d %s.", updated.Number, verb))
 }
 
@@ -290,6 +294,9 @@ func (m *appModel) handleTaskRefresh() {
 func runSyncTasks(careerOpsPath string) {
 	syncScript := filepath.Join(careerOpsPath, "sync-tasks.mjs")
 	if _, err := os.Stat(syncScript); err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "warning: stat %s: %v\n", syncScript, err)
+		}
 		return
 	}
 	if _, err := exec.LookPath("node"); err != nil {
@@ -332,6 +339,9 @@ func autoCreateInterviewThankYou(careerOpsPath string, app model.CareerApplicati
 
 // cycleFromTitle extracts the cycle marker from a generated follow-up title,
 // e.g. "Follow up #2 — ..." → "2". Returns "1" when no marker is found.
+// ASCII-digit only by design: the marker is emitted verbatim by sync-tasks.mjs
+// in the format "Follow up #<n> — …", so localized digits would mean the title
+// generator and parser are out of sync — not a localization gap here.
 func cycleFromTitle(title string) string {
 	const prefix = "Follow up #"
 	idx := strings.Index(title, prefix)

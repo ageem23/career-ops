@@ -108,17 +108,27 @@ function plannedFollowups(cadence) {
 function alreadyTracked(tasks, plan) {
   // A planned followup is already represented if a task with same App# + type=followup
   // and cycle marker in title exists in ANY status (pending/done/skipped).
-  const marker = `Follow up #${plan.cycle}`;
+  // Anchor the cycle number against a non-digit boundary so `#1` does not match
+  // `#10/#11/…` once cadence reaches double digits.
+  const exact = `Follow up #${plan.cycle}`;
+  const prefix = `${exact} `;
   return tasks.some(t =>
     t.type === 'followup' &&
     t.appNum === plan.appNum &&
-    t.title.startsWith(marker)
+    (t.title === exact || t.title.startsWith(prefix))
   );
+}
+
+// escapeField replaces characters that would fracture the pipe-delimited row,
+// so values from external sources (company names, free-form notes) can never
+// corrupt the table on the next parseTasks() pass.
+function escapeField(value) {
+  return String(value ?? '').replace(/\|/g, '¦').replace(/\r?\n/g, ' ');
 }
 
 function formatRow(task) {
   const appCol = task.appNum === null || task.appNum === undefined ? '-' : String(task.appNum);
-  return `| ${task.num} | ${task.created} | ${task.due || '-'} | ${appCol} | ${task.company || '-'} | ${task.type} | ${task.title} | ${task.status} | ${task.completed || '-'} | ${task.notes || ''} |`;
+  return `| ${task.num} | ${task.created} | ${task.due || '-'} | ${appCol} | ${escapeField(task.company) || '-'} | ${escapeField(task.type)} | ${escapeField(task.title)} | ${escapeField(task.status)} | ${task.completed || '-'} | ${escapeField(task.notes)} |`;
 }
 
 function writeTasks(allTasks) {
