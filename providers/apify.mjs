@@ -1,0 +1,213 @@
+// Generic Apify provider — runs any Apify actor and maps its dataset items to
+// the {title, url, company, location} shape scan.mjs expects. All variation
+// (which actor, what input, how to read fields from items) lives in
+// portals.yml, not in code.
+//
+// Usage in portals.yml:
+//
+//   tracked_companies:
+//     - name: "Indeed — VP Engineering (Chicago)"
+//       provider: apify
+//       actor: misceres/indeed-scraper
+//       input:
+//         position: "VP of Engineering"
+//         location: "Chicago, IL"
+//         country: "US"
+//         maxItems: 25
+//       field_map:
+//         title:    [positionName, title]    # array = first non-empty wins
+//         url:      url
+//         company:  [company, companyName]
+//         location: [location, formattedLocation]
+//       enabled: true
+//
+// `field_map` values can be a string (single key), an array of strings (try
+// each in order), or a dotted path for nested fields (e.g. "company.name").
+// `title` and `url` are required keys; items missing either are dropped.
+//
+// Optional `description` mapping causes the JD body to be persisted to
+// `jds/{slug}.md` (with YAML frontmatter for title/company/url/scraped/source)
+// and the returned record's `url` is replaced with `local:jds/{slug}.md`.
+// Downstream tools (mid-filter, batch evaluation) read that file directly
+// instead of re-fetching the remote URL — eliminates Indeed/ZipRecruiter
+// HTTP failures and avoids paying for the same Apify run twice. Original
+// remote URL is preserved in the frontmatter and on the returned record as
+// `_remote_url`. Add the field like any other:
+//
+//     field_map:
+//       description: [description, descriptionText, descriptionHTML, jobDescription]
+//
+// If the description field is missing/short for a given item (<50 chars
+// after HTML strip), the item falls through to the old behavior — remote
+// URL kept, no JD file written.
+//
+// Optional `defaults` block fills in fields that the actor's output doesn't
+// expose at all. Useful for single-tenant sources like a Workday board, where
+// every item is from the same employer:
+//
+//     defaults:
+//       company: "Mondelez International"
+//
+// Optional `timeout_ms` overrides the 180s default actor-run timeout. Useful
+// for slow scrapers that need a few minutes to walk a large board.
+//
+// Requires APIFY_TOKEN in the environment. When unset, this entry errors
+// cleanly and the rest of the scan continues.
+
+import { mkdirSync, writeFileSync, existsSync } from 'fs';
+import { createHash } from 'crypto';
+import { join } from 'path';
+import { hasToken, runActor } from './_apify.mjs';
+
+const JDS_DIR = 'jds';
+const MIN_JD_BODY_CHARS = 50;
+
+function getPath(obj, path) {
+  return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+}
+
+function pickField(item, spec) {
+  const keys = Array.isArray(spec) ? spec : [spec];
+  for (const k of keys) {
+    const v = getPath(item, k);
+    if (v != null && v !== '') return v;
+  }
+  return '';
+}
+
+const ALLOWED_DEFAULT_KEYS = new Set(['title', 'url', 'company', 'location']);
+
+// ── Local-JD writer (mirrors providers/linkedin.mjs format) ─────────
+
+function slugify(text) {
+  const slug = String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+  if (slug) return slug;
+  // Non-Latin titles strip to empty — fall back to a stable short hash so
+  // every unique title still gets its own jds/<slug>.md file.
+  const hash = createHash('sha1').update(String(text || '')).digest('hex').slice(0, 10);
+  return `jd-${hash}`;
+}
+
+function yamlEscape(str) {
+  const s = String(str ?? '').replace(/\n/g, ' ').trim();
+  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+// Lightweight HTML → text. Most Apify scrapers return rich HTML in their
+// description fields; we don't need a full parser, just enough to make the
+// JD readable for downstream snippet extraction and full evaluation.
+function htmlToText(s) {
+  const raw = String(s || '');
+  if (!raw || !/[<&]/.test(raw)) return raw.trim();
+  return raw
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<li[^>]*>/gi, '- ')
+    .replace(/<\/li>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// Write `jds/{slug}.md` and return its relative path. If the file already
+// exists (same slug from a prior scan), the existing file is preserved and
+// its path is returned — first save wins, scan-history dedups the rest.
+function saveJd(normalized, descriptionBody, sourceLabel) {
+  mkdirSync(JDS_DIR, { recursive: true });
+  const slug = slugify(`${normalized.company}-${normalized.title}`);
+  const filename = `${slug}.md`;
+  const filepath = join(JDS_DIR, filename);
+  if (existsSync(filepath)) return `${JDS_DIR}/${filename}`;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const content = `---
+title: ${yamlEscape(normalized.title)}
+company: ${yamlEscape(normalized.company)}
+url: ${yamlEscape(normalized.url)}
+location: ${yamlEscape(normalized.location)}
+scraped: "${today}"
+source: ${sourceLabel}
+---
+
+# ${normalized.title} — ${normalized.company}
+
+${descriptionBody}
+`;
+  writeFileSync(filepath, content, 'utf-8');
+  return `${JDS_DIR}/${filename}`;
+}
+
+function normalizeItem(item, fieldMap, defaults) {
+  const out = {
+    title: String(pickField(item, fieldMap.title) || ''),
+    url: String(pickField(item, fieldMap.url) || ''),
+    company: fieldMap.company ? String(pickField(item, fieldMap.company) || '') : '',
+    location: fieldMap.location ? String(pickField(item, fieldMap.location) || '') : '',
+  };
+  for (const [k, v] of Object.entries(defaults || {})) {
+    if (!ALLOWED_DEFAULT_KEYS.has(k)) continue;
+    if (!out[k]) out[k] = String(v);
+  }
+  return out;
+}
+
+export default {
+  id: 'apify',
+
+  // No auto-detect — Apify entries must declare provider: apify.
+  detect() { return null; },
+
+  async fetch(entry, _ctx) {
+    if (!hasToken()) {
+      throw new Error('APIFY_TOKEN not set — skip this source or set the token in .env');
+    }
+    if (!entry.actor) {
+      throw new Error(`apify: entry ${entry.name} missing 'actor' (e.g. misceres/indeed-scraper)`);
+    }
+    if (!entry.field_map || !entry.field_map.title || !entry.field_map.url) {
+      throw new Error(`apify: entry ${entry.name} missing field_map.title and/or field_map.url`);
+    }
+
+    const opts = {};
+    if (entry.timeout_ms != null) opts.timeoutMs = entry.timeout_ms;
+    const items = await runActor(entry.actor, entry.input || {}, opts);
+
+    const useLocalJd = entry.field_map.description != null;
+    // Use the actor slug as the `source:` label in the JD frontmatter
+    // (e.g. "misceres/indeed-scraper" → "misceres-indeed-scraper") so it's
+    // easy to grep saved JDs by origin later.
+    const sourceLabel = String(entry.actor || 'apify').replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+
+    return items
+      .map(item => {
+        const normalized = normalizeItem(item, entry.field_map, entry.defaults);
+        if (!normalized.title || !normalized.url) return null;
+        if (!useLocalJd) return normalized;
+        const descriptionRaw = pickField(item, entry.field_map.description);
+        const descriptionBody = htmlToText(descriptionRaw);
+        if (!descriptionBody || descriptionBody.length < MIN_JD_BODY_CHARS) {
+          return normalized; // fall through to remote URL when JD is missing/short
+        }
+        const remoteUrl = normalized.url;
+        const jdPath = saveJd(normalized, descriptionBody, sourceLabel);
+        normalized.url = `local:${jdPath}`;
+        normalized._remote_url = remoteUrl;
+        return normalized;
+      })
+      .filter(j => j && j.title && j.url);
+  },
+};
