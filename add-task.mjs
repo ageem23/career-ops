@@ -30,6 +30,9 @@ import { fileURLToPath } from 'url';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 const TASKS_FILE = join(CAREER_OPS, 'data/tasks.md');
+const APPS_FILE = existsSync(join(CAREER_OPS, 'data/applications.md'))
+  ? join(CAREER_OPS, 'data/applications.md')
+  : join(CAREER_OPS, 'applications.md');
 
 const ALLOWED_TYPES = new Set(['followup', 'contact', 'interview', 'manual']);
 
@@ -86,6 +89,23 @@ function validate(args) {
 // can't fracture the table on the next parseTasks() pass.
 function escapeField(value) {
   return String(value ?? '').replace(/\|/g, '¦').replace(/\r?\n/g, ' ');
+}
+
+// lookupApp finds an application row by tracker number and returns
+// {company, role} so callers don't have to specify --company / --notes
+// redundantly when they already have the App#.
+function lookupApp(appNum) {
+  if (!existsSync(APPS_FILE)) return null;
+  const content = readFileSync(APPS_FILE, 'utf-8');
+  for (const line of content.split('\n')) {
+    if (!line.startsWith('|')) continue;
+    const parts = line.split('|').map(s => s.trim());
+    if (parts.length < 5) continue;
+    const n = parseInt(parts[1], 10);
+    if (!Number.isFinite(n) || n !== appNum) continue;
+    return { company: parts[3] || '', role: parts[4] || '' };
+  }
+  return null;
 }
 
 function readRows() {
@@ -145,6 +165,14 @@ function main() {
 
   const { header, rows, nextNum } = readRows();
 
+  // Auto-fill company from applications.md when --app is given without
+  // --company so the task stays in sync with the tracker row.
+  let company = args.company || '';
+  if (args.app && !company) {
+    const appRow = lookupApp(args.app);
+    if (appRow) company = appRow.company;
+  }
+
   if (alreadyHas(rows, args.type, args.title, args.app)) {
     const result = { status: 'duplicate', message: 'matching pending task already exists' };
     if (args.json) console.log(JSON.stringify(result));
@@ -157,7 +185,7 @@ function main() {
     created: todayLocal(),
     due: args.due || '',
     appNum: args.app,
-    company: args.company || '',
+    company,
     type: args.type,
     title: args.title.trim(),
     notes: args.notes || '',

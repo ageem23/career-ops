@@ -50,19 +50,26 @@
    | # | Nombre | Rol | Empresa | LinkedIn |
    ```
 
+   **Antes** de preguntar al candidato si quiere guardar, **buscar el App#** en `data/applications.md`:
+   - Si el contacto es para una empresa que ya esta en el tracker (match por columna Company), capturar el numero `#` de la fila mas reciente con status activo (`Applied` / `Responded` / `Interview` / `Evaluated`).
+   - Anotar el `App#` junto al contacto. Si no hay match, marcar `App#: -`.
+
+   Esto asegura que la tarea quede vinculada a la aplicacion para que el dashboard pueda abrir el reporte desde la vista de tareas (tecla Enter).
+
    Preguntar al candidato:
    > "¿Agrego estos contactos como tareas en el dashboard? (todos / ninguno / numeros como `1,3`)"
 
    Si responde "todos" o numeros especificos, **siempre** presentar un bloque copy-paste con un comando `add-task.mjs` por contacto. Esto es **obligatorio** porque la misma instruccion corre en Claude Code (con shell) y en Claude web (sin shell) -- el bloque copy-paste funciona en ambos contextos sin cambios:
 
    ```bash
-   node add-task.mjs --type contact --title "LinkedIn: Jane Doe (Recruiter)" --company "Acme" --notes "linkedin.com/in/jane-doe"
-   node add-task.mjs --type contact --title "LinkedIn: John Smith (Hiring Manager)" --company "Acme" --notes "linkedin.com/in/john-smith" --app 412
+   node add-task.mjs --type contact --app 412 --title "LinkedIn: Jane Doe (Recruiter)" --notes "linkedin.com/in/jane-doe"
+   node add-task.mjs --type contact --app 412 --title "LinkedIn: John Smith (Hiring Manager)" --notes "linkedin.com/in/john-smith"
    ```
 
    Reglas para el bloque:
    - Un comando por linea, sin barras invertidas de continuacion (asi se puede pegar entero).
-   - Si el contacto esta asociado a una aplicacion en `data/applications.md`, agregar `--app {numero}`.
+   - **Siempre** incluir `--app {numero}` cuando exista match en el tracker. `add-task.mjs` auto-rellena `--company` desde `data/applications.md`, asi que no es necesario pasar `--company` cuando hay `--app`.
+   - Si no hay match en el tracker, omitir `--app` y pasar `--company "{Empresa}"` explicitamente.
    - `--title` debe usar el patron `LinkedIn: {Nombre} ({Rol})`. `--notes` debe contener la URL de LinkedIn.
    - Citar comillas dobles externas; escapar comillas internas con `\"`.
 
