@@ -215,6 +215,22 @@ async function checkSession(page) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const randomDelay = ([min, max]) => Math.floor(Math.random() * (max - min) + min);
 
+// Defensive — if a user supplies a scalar/string for delay_pages or
+// delay_searches and the standalone validator (test-linkedin-config.mjs)
+// was skipped, randomDelay() would throw a destructuring TypeError mid-scan.
+// Fall back to the default tuple instead so bad config degrades safely.
+function normalizeDelayTuple(value, fallback) {
+  if (
+    Array.isArray(value) &&
+    value.length === 2 &&
+    Number.isFinite(value[0]) &&
+    Number.isFinite(value[1]) &&
+    value[0] >= 0 &&
+    value[0] <= value[1]
+  ) return value;
+  return fallback;
+}
+
 function log(msg) { console.log(`[linkedin] ${msg}`); }
 function warn(msg) { console.warn(`[linkedin] ⚠ ${msg}`); }
 
@@ -407,11 +423,22 @@ async function goToNextPage(page) {
 function saveJd(detail) {
   mkdirSync(JDS_DIR, { recursive: true });
   const slug = slugify(`${detail.company}-${detail.title}`);
-  const filename = `${slug}.md`;
+  // Two different LinkedIn postings can share the same company+title (e.g.
+  // multiple openings of "Engineering Manager" at the same company, or two
+  // teams hiring for the same role). Hash the posting URL to give each one
+  // a distinct file — falls back to the application URL or the slug itself
+  // when no URL is available, so behavior remains deterministic.
+  const unique = createHash('sha1')
+    .update(detail.url || detail.applicationUrl || `${detail.company}-${detail.title}`)
+    .digest('hex')
+    .slice(0, 10);
+  const filename = `${slug}-${unique}.md`;
   const filepath = join(JDS_DIR, filename);
 
-  // Don't overwrite if already exists (multiple keyword searches may surface
-  // the same role; first save wins, scan-history dedups subsequent hits).
+  // Don't overwrite if the same posting was already saved (multiple keyword
+  // searches may surface the same role; first save wins, scan-history dedups
+  // subsequent hits). The per-posting hash ensures distinct postings don't
+  // collide on the slug.
   if (existsSync(filepath)) return `${JDS_DIR}/${filename}`;
 
   const today = new Date().toISOString().slice(0, 10);
@@ -436,7 +463,7 @@ ${detail.jdText}
 
 async function runSearch(page, entry) {
   const max = entry.max_results || 25;
-  const delayPages = entry.delay_pages || DEFAULT_DELAY_PAGES;
+  const delayPages = normalizeDelayTuple(entry.delay_pages, DEFAULT_DELAY_PAGES);
   const url = buildSearchUrl(entry);
 
   log(`Search: ${entry.search}`);
