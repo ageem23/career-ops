@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -14,6 +15,39 @@ import (
 	"github.com/santifer/career-ops/dashboard/internal/theme"
 	"github.com/santifer/career-ops/dashboard/internal/ui/screens"
 )
+
+// findCareerOpsRoot walks up from start looking for a directory that contains
+// applications.md or data/applications.md, so `go run .` works from anywhere
+// inside the project (e.g. the dashboard/ subdir). Returns start unchanged if
+// no marker is reached before the filesystem root or if a non-NotExist stat
+// error is encountered.
+func findCareerOpsRoot(start string) string {
+	abs, err := filepath.Abs(start)
+	if err != nil {
+		return start
+	}
+	markers := []string{"applications.md", filepath.Join("data", "applications.md")}
+	cur := abs
+	for {
+		for _, marker := range markers {
+			statPath := filepath.Join(cur, marker)
+			if _, statErr := os.Stat(statPath); statErr == nil {
+				return cur
+			} else if !os.IsNotExist(statErr) {
+				// Permission-denied or I/O error — surface it instead of
+				// silently treating it as "marker not found" and continuing.
+				fmt.Fprintf(os.Stderr, "warning: stat %s: %v\n", statPath, statErr)
+				return start
+			}
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			// Reached filesystem root without finding a marker.
+			return start
+		}
+		cur = parent
+	}
+}
 
 type viewState int
 
@@ -84,6 +118,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.theme,
 			msg.Path, msg.Title,
 			m.pipeline.Width(), m.pipeline.Height(),
+			msg.App, msg.CareerOpsPath,
 		)
 		m.state = viewReport
 		return m, nil
@@ -156,6 +191,9 @@ func main() {
 	flag.Parse()
 
 	careerOpsPath := *pathFlag
+	if *pathFlag == "." {
+		careerOpsPath = findCareerOpsRoot(".")
+	}
 
 	// Load applications
 	apps := data.ParseApplications(careerOpsPath)
