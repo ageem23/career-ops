@@ -30,6 +30,13 @@ type TasksAddMsg struct {
 // TasksRefreshMsg requests a full tasks reload (e.g. re-run sync-tasks.mjs).
 type TasksRefreshMsg struct{}
 
+// TasksOpenReportMsg requests opening the linked application's report.
+// The main app looks up the application by tracker number and routes to the
+// existing report viewer.
+type TasksOpenReportMsg struct {
+	AppNumber int
+}
+
 // TasksFlash is a transient banner shown above the help bar after an action.
 type tasksFlash struct {
 	text  string
@@ -79,6 +86,12 @@ func (m *TasksModel) Resize(width, height int) {
 	m.width = width
 	m.height = height
 }
+
+// Width returns the current width.
+func (m TasksModel) Width() int { return m.width }
+
+// Height returns the current height.
+func (m TasksModel) Height() int { return m.height }
 
 // WithReloadedTasks rebuilds the model with fresh tasks while preserving the
 // active tab and a best-effort cursor on the same task number.
@@ -201,6 +214,13 @@ func (m TasksModel) handleKey(msg tea.KeyMsg) (TasksModel, tea.Cmd) {
 				m.cursor = 0
 			}
 			m.adjustScroll()
+		}
+	case "enter":
+		if t, ok := m.currentTask(); ok && t.AppNumber > 0 {
+			appNum := t.AppNumber
+			return m, func() tea.Msg {
+				return TasksOpenReportMsg{AppNumber: appNum}
+			}
 		}
 	case "c":
 		if t, ok := m.currentTask(); ok && t.Status == "pending" {
@@ -573,6 +593,7 @@ func (m TasksModel) renderHelp() string {
 
 	keys := keyStyle.Render("↑↓/jk") + descStyle.Render(" nav  ") +
 		keyStyle.Render("Tab/←→") + descStyle.Render(" tabs  ") +
+		keyStyle.Render("Enter") + descStyle.Render(" report  ") +
 		keyStyle.Render("c") + descStyle.Render(" complete  ") +
 		keyStyle.Render("s") + descStyle.Render(" skip  ") +
 		keyStyle.Render("n") + descStyle.Render(" new  ") +

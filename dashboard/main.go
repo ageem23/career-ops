@@ -69,6 +69,7 @@ type appModel struct {
 	progress        screens.ProgressModel
 	tasks           screens.TasksModel
 	state           viewState
+	viewerSource    viewState // which screen opened the report viewer
 	careerOpsPath   string
 	theme           theme.Theme
 	progressMetrics model.ProgressMetrics
@@ -135,11 +136,12 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pipeline.Width(), m.pipeline.Height(),
 			msg.App, msg.CareerOpsPath,
 		)
+		m.viewerSource = viewPipeline
 		m.state = viewReport
 		return m, nil
 
 	case screens.ViewerClosedMsg:
-		m.state = viewPipeline
+		m.state = m.viewerSource
 		return m, nil
 
 	case screens.PipelineOpenProgressMsg:
@@ -188,6 +190,25 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		tasks := data.ParseTasks(m.careerOpsPath)
 		m.tasks = m.tasks.WithReloadedTasks(tasks)
 		m.tasks.SetFlash("Tasks synced.")
+		return m, nil
+
+	case screens.TasksOpenReportMsg:
+		apps := data.ParseApplications(m.careerOpsPath)
+		app, ok := data.FindApplicationByNumber(apps, msg.AppNumber)
+		if !ok || app.ReportPath == "" {
+			m.tasks.SetFlash(fmt.Sprintf("No report linked for app #%d.", msg.AppNumber))
+			return m, nil
+		}
+		fullPath := filepath.Join(m.careerOpsPath, app.ReportPath)
+		title := fmt.Sprintf("%s — %s", app.Company, app.Role)
+		m.viewer = screens.NewViewerModel(
+			m.theme,
+			fullPath, title,
+			m.tasks.Width(), m.tasks.Height(),
+			app, m.careerOpsPath,
+		)
+		m.viewerSource = viewTasks
+		m.state = viewReport
 		return m, nil
 
 	case screens.PipelineOpenURLMsg:
