@@ -22,8 +22,20 @@ export function hasToken() {
 }
 
 // Apify accepts both "user/actor" and "user~actor" in URLs; normalize to `~`.
+// Validate strictly so a malformed config can't escape the intended
+// /acts/<actor>/runs path with extra `/`, `..`, `?`, or `#` characters and
+// send our bearer token to an unintended endpoint on api.apify.com.
+const ACTOR_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*[~/][A-Za-z0-9][A-Za-z0-9_.-]*$/;
+
 function normalizeActorId(actorId) {
-  return actorId.replace('/', '~');
+  if (typeof actorId !== 'string' || !ACTOR_ID_RE.test(actorId)) {
+    throw new Error(
+      `apify: invalid actorId ${JSON.stringify(actorId)}. ` +
+      `Expected "owner/actor" or "owner~actor" with letters, digits, "_", ".", or "-" only.`
+    );
+  }
+  const [owner, name] = actorId.split(/[~/]/, 2);
+  return `${encodeURIComponent(owner)}~${encodeURIComponent(name)}`;
 }
 
 // Apify supports auth via ?token= or Authorization: Bearer. The query-string
@@ -149,7 +161,13 @@ async function waitForRun(runId, token, deadline, timeoutMs) {
     const sleepMs = Math.min(POLL_INTERVAL_MS, deadline - Date.now());
     if (sleepMs > 0) await sleep(sleepMs);
   }
-  await abortRun(runId, token);
+  // Fire-and-forget — abortRun() is best-effort cleanup (it already swallows
+  // its own errors and has a 5s internal timeout), but awaiting it here would
+  // add up to those 5s to the function's total runtime AFTER the user's
+  // timeoutMs budget has already been exhausted. The wall-clock contract of
+  // runActor() is end-to-end within timeoutMs, so we let abortRun complete in
+  // the background and throw immediately.
+  void abortRun(runId, token).catch(() => {});
   const suffix = lastError ? ` (last error: ${lastError.message})` : '';
   throw new Error(`Apify run ${runId} did not finish within ${Math.round(timeoutMs / 1000)}s${suffix}`);
 }
