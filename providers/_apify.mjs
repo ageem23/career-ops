@@ -56,27 +56,53 @@ async function fetchJsonOnce(url, init = {}, timeoutMs = PER_REQUEST_TIMEOUT_MS)
 
 // Cold connects to api.apify.com occasionally exceed Undici's 10s internal
 // connect timeout on this host — retry with backoff before giving up.
-async function fetchJson(url, init = {}, timeoutMs = PER_REQUEST_TIMEOUT_MS, attempts = CONNECT_RETRY_ATTEMPTS) {
+// When `deadline` is provided, each attempt's per-request timeout and the
+// inter-attempt backoff are both capped against the remaining budget so the
+// total time spent here can't blow past the caller's overall ceiling.
+async function fetchJson(
+  url,
+  init = {},
+  timeoutMs = PER_REQUEST_TIMEOUT_MS,
+  attempts = CONNECT_RETRY_ATTEMPTS,
+  deadline = null,
+) {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
+    let thisTimeout = timeoutMs;
+    if (deadline != null) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) throw lastErr || new Error('Apify request budget exhausted');
+      thisTimeout = Math.min(timeoutMs, remainingMs);
+    }
     try {
-      return await fetchJsonOnce(url, init, timeoutMs);
+      return await fetchJsonOnce(url, init, thisTimeout);
     } catch (err) {
       lastErr = err;
       if (err.status >= 400 && err.status < 500) throw err;
-      if (i < attempts - 1) await sleep(500 * (i + 1));
+      if (i < attempts - 1) {
+        const backoff = 500 * (i + 1);
+        const sleepMs = deadline != null ? Math.min(backoff, deadline - Date.now()) : backoff;
+        if (sleepMs > 0) await sleep(sleepMs);
+        else if (deadline != null) throw lastErr;
+      }
     }
   }
   throw lastErr;
 }
 
-async function startRun(actorId, input, token) {
+async function startRun(actorId, input, token, deadline = null) {
   const url = `${APIFY_API_BASE}/acts/${normalizeActorId(actorId)}/runs`;
-  const body = await fetchJson(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(input || {}),
-  });
+  const body = await fetchJson(
+    url,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...authHeaders(token) },
+      body: JSON.stringify(input || {}),
+    },
+    PER_REQUEST_TIMEOUT_MS,
+    CONNECT_RETRY_ATTEMPTS,
+    deadline,
+  );
   const runId = body?.data?.id;
   if (!runId) {
     throw new Error(`Apify did not return a run id: ${JSON.stringify(body).slice(0, 200)}`);
@@ -128,9 +154,15 @@ async function waitForRun(runId, token, deadline, timeoutMs) {
   throw new Error(`Apify run ${runId} did not finish within ${Math.round(timeoutMs / 1000)}s${suffix}`);
 }
 
-async function fetchDatasetItems(runId, token) {
+async function fetchDatasetItems(runId, token, deadline = null) {
   const url = `${APIFY_API_BASE}/actor-runs/${runId}/dataset/items`;
-  const items = await fetchJson(url, { headers: authHeaders(token) }, PER_REQUEST_TIMEOUT_MS * 2);
+  const items = await fetchJson(
+    url,
+    { headers: authHeaders(token) },
+    PER_REQUEST_TIMEOUT_MS * 2,
+    CONNECT_RETRY_ATTEMPTS,
+    deadline,
+  );
   if (!Array.isArray(items)) {
     throw new Error(`Apify run ${runId} returned non-array dataset payload`);
   }
@@ -147,8 +179,12 @@ export async function runActor(actorId, input, { timeoutMs = DEFAULT_RUN_TIMEOUT
     throw new Error(`apify: invalid timeoutMs ${JSON.stringify(timeoutMs)} (must be a positive finite number of milliseconds)`);
   }
 
+  // Single deadline shared across startRun → waitForRun → fetchDatasetItems
+  // so the user-supplied `timeoutMs` is the end-to-end ceiling, not just the
+  // wait-loop ceiling. Each helper caps its internal retry/backoff against
+  // the remaining budget via fetchJson(..., deadline).
   const deadline = Date.now() + timeoutMs;
-  const runId = await startRun(actorId, input, token);
+  const runId = await startRun(actorId, input, token, deadline);
   const run = await waitForRun(runId, token, deadline, timeoutMs);
 
   if (run.status !== 'SUCCEEDED') {
@@ -156,5 +192,5 @@ export async function runActor(actorId, input, { timeoutMs = DEFAULT_RUN_TIMEOUT
     throw new Error(`Apify actor ${actorId} finished with status ${run.status}${reason}`);
   }
 
-  return await fetchDatasetItems(runId, token);
+  return await fetchDatasetItems(runId, token, deadline);
 }
