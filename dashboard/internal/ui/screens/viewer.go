@@ -1,13 +1,16 @@
 package screens
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/santifer/career-ops/dashboard/internal/model"
 	"github.com/santifer/career-ops/dashboard/internal/theme"
 )
 
@@ -15,28 +18,50 @@ import (
 type ViewerClosedMsg struct{}
 
 // ViewerModel implements an integrated file viewer screen.
+//
+// `rawLines` holds the file as read from disk; `lines` holds the word-wrapped
+// version sized to the current terminal width. Long paragraphs in JD files
+// regularly exceed 200 chars and were previously truncated by the terminal —
+// wrapping happens at load and again on every Resize, with scrollOffset
+// clamped so the user doesn't end up below the new visible end.
 type ViewerModel struct {
-	lines        []string
-	title        string
-	scrollOffset int
-	width        int
-	height       int
-	theme        theme.Theme
+	rawLines      []string
+	lines         []string
+	title         string
+	scrollOffset  int
+	width         int
+	height        int
+	theme         theme.Theme
+	app           model.CareerApplication
+	careerOpsPath string
+	hasApp        bool
+	statusPicker  bool
+	statusCursor  int
 }
 
+// wrapMargin is reserved for the body padding (2 cols) plus a small safety
+// gap so wrapped lines never touch the right edge.
+const wrapMargin = 6
+
 // NewViewerModel creates a new file viewer for the given path.
-func NewViewerModel(t theme.Theme, path, title string, width, height int) ViewerModel {
+// If app.ReportPath is non-empty, the viewer enables in-place status changes.
+func NewViewerModel(t theme.Theme, path, title string, width, height int, app model.CareerApplication, careerOpsPath string) ViewerModel {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		content = []byte("Error reading file: " + err.Error())
 	}
 
+	raw := strings.Split(string(content), "\n")
 	return ViewerModel{
-		lines:  strings.Split(string(content), "\n"),
-		title:  title,
-		width:  width,
-		height: height,
-		theme:  t,
+		rawLines:      raw,
+		lines:         wrapAll(raw, width-wrapMargin),
+		title:         title,
+		width:         width,
+		height:        height,
+		theme:         t,
+		app:           app,
+		careerOpsPath: careerOpsPath,
+		hasApp:        app.ReportPath != "" || app.Company != "",
 	}
 }
 
@@ -47,14 +72,33 @@ func (m ViewerModel) Init() tea.Cmd {
 func (m *ViewerModel) Resize(width, height int) {
 	m.width = width
 	m.height = height
+	m.lines = wrapAll(m.rawLines, width-wrapMargin)
+	// After re-wrapping, the visible range may have shrunk — clamp scrollOffset
+	// so we don't render off the end of the wrapped list.
+	maxScroll := len(m.lines) - m.bodyHeight()
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.scrollOffset > maxScroll {
+		m.scrollOffset = maxScroll
+	}
 }
 
 func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.statusPicker {
+			return m.handleStatusPicker(msg)
+		}
 		switch msg.String() {
 		case "q", "esc":
 			return m, func() tea.Msg { return ViewerClosedMsg{} }
+
+		case "c":
+			if m.hasApp {
+				m.statusPicker = true
+				m.statusCursor = 0
+			}
 
 		case "down", "j":
 			maxScroll := len(m.lines) - m.bodyHeight()
@@ -107,6 +151,61 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	return m, nil
 }
 
+func (m ViewerModel) handleStatusPicker(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.statusPicker = false
+		return m, nil
+
+	case "down", "j":
+		m.statusCursor++
+		if m.statusCursor >= len(statusOptions) {
+			m.statusCursor = len(statusOptions) - 1
+		}
+
+	case "up", "k":
+		m.statusCursor--
+		if m.statusCursor < 0 {
+			m.statusCursor = 0
+		}
+
+	case "enter":
+		m.statusPicker = false
+		newStatus := statusOptions[m.statusCursor].label
+		app := m.app
+		path := m.careerOpsPath
+		return m, func() tea.Msg {
+			return PipelineUpdateStatusMsg{
+				CareerOpsPath: path,
+				App:           app,
+				NewStatus:     newStatus,
+			}
+		}
+
+	default:
+		key := strings.ToLower(msg.String())
+		if len(key) == 1 {
+			for i, opt := range statusOptions {
+				if opt.shortcut == key {
+					m.statusCursor = i
+					m.statusPicker = false
+					newStatus := opt.label
+					app := m.app
+					path := m.careerOpsPath
+					return m, func() tea.Msg {
+						return PipelineUpdateStatusMsg{
+							CareerOpsPath: path,
+							App:           app,
+							NewStatus:     newStatus,
+						}
+					}
+				}
+			}
+		}
+	}
+	return m, nil
+}
+
 func (m ViewerModel) bodyHeight() int {
 	h := m.height - 4 // header + footer + padding
 	if h < 3 {
@@ -120,7 +219,40 @@ func (m ViewerModel) View() string {
 	body := m.renderBody()
 	footer := m.renderFooter()
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	view := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	if m.statusPicker {
+		view = m.overlayStatusPicker(view)
+	}
+	return view
+}
+
+func (m ViewerModel) overlayStatusPicker(body string) string {
+	bodyLines := strings.Split(body, "\n")
+
+	pickerWidth := 30
+	padStyle := lipgloss.NewStyle().Padding(0, 2)
+	borderStyle := lipgloss.NewStyle().
+		Foreground(m.theme.Blue).
+		Bold(true)
+
+	var picker []string
+	picker = append(picker, padStyle.Render(borderStyle.Render("Change status:")))
+
+	for i, opt := range statusOptions {
+		style := lipgloss.NewStyle().Foreground(m.theme.Text).Width(pickerWidth)
+		if i == m.statusCursor {
+			style = style.Background(m.theme.Overlay).Bold(true)
+		}
+		prefix := "  "
+		if i == m.statusCursor {
+			prefix = "> "
+		}
+		label := fmt.Sprintf("%s (%s)", opt.label, strings.ToUpper(opt.shortcut))
+		picker = append(picker, padStyle.Render(style.Render(prefix+label)))
+	}
+
+	bodyLines = append(bodyLines, picker...)
+	return strings.Join(bodyLines, "\n")
 }
 
 func (m ViewerModel) renderHeader() string {
@@ -550,9 +682,136 @@ func (m ViewerModel) renderFooter() string {
 	keyStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Text)
 	descStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
 
-	return style.Render(
-		keyStyle.Render("↑↓") + descStyle.Render(" scroll  ") +
-			keyStyle.Render("PgUp/Dn") + descStyle.Render(" page  ") +
-			keyStyle.Render("g/G") + descStyle.Render(" top/end  ") +
-			keyStyle.Render("Esc") + descStyle.Render(" back"))
+	parts := keyStyle.Render("↑↓") + descStyle.Render(" scroll  ") +
+		keyStyle.Render("PgUp/Dn") + descStyle.Render(" page  ") +
+		keyStyle.Render("g/G") + descStyle.Render(" top/end  ")
+	if m.hasApp {
+		parts += keyStyle.Render("c") + descStyle.Render(" change status  ")
+	}
+	parts += keyStyle.Render("Esc") + descStyle.Render(" back")
+	return style.Render(parts)
+}
+
+// ── Word wrapping ───────────────────────────────────────────────────
+//
+// Long paragraphs (e.g. JD body text scraped from LinkedIn) used to render
+// truncated at the terminal edge. We pre-wrap once at load and again on
+// every Resize so scroll math stays in display-line space and the user can
+// always read the full content.
+
+// wrapAll wraps every line in raw to the given width, preserving any
+// markdown prefix (heading, bullet, blockquote) on the first sub-line and
+// indenting continuation lines appropriately. Returns a flat list of
+// display lines suitable for direct rendering.
+func wrapAll(raw []string, width int) []string {
+	if width <= 10 {
+		// Too narrow to wrap usefully — fall back to raw to avoid mangled output.
+		out := make([]string, len(raw))
+		copy(out, raw)
+		return out
+	}
+	out := make([]string, 0, len(raw))
+	for _, line := range raw {
+		out = append(out, wrapLine(line, width)...)
+	}
+	return out
+}
+
+// wrapLine wraps a single source line to width, preserving markdown prefix
+// structure. Tables, horizontal rules, and short-enough lines pass through
+// unchanged.
+func wrapLine(line string, width int) []string {
+	if utf8.RuneCountInString(line) <= width {
+		return []string{line}
+	}
+	trimmed := strings.TrimSpace(line)
+	// Pass-through cases: tables (handled by renderTableBlock), horizontal
+	// rules, and empty lines.
+	if trimmed == "" || strings.HasPrefix(trimmed, "|") || trimmed == "---" || trimmed == "***" {
+		return []string{line}
+	}
+
+	// Determine prefix (kept on first sub-line) and continuation indent
+	// (used on every subsequent sub-line). Headings get no continuation —
+	// the leading marker is part of the headline, not the prose.
+	var prefix, continuation, body string
+	switch {
+	case strings.HasPrefix(trimmed, "### "):
+		prefix = "### "
+		continuation = "    "
+		body = strings.TrimPrefix(trimmed, "### ")
+	case strings.HasPrefix(trimmed, "## "):
+		prefix = "## "
+		continuation = "   "
+		body = strings.TrimPrefix(trimmed, "## ")
+	case strings.HasPrefix(trimmed, "# "):
+		prefix = "# "
+		continuation = "  "
+		body = strings.TrimPrefix(trimmed, "# ")
+	case strings.HasPrefix(trimmed, "> "):
+		prefix = "> "
+		continuation = "> "
+		body = strings.TrimPrefix(trimmed, "> ")
+	case strings.HasPrefix(trimmed, "- "):
+		prefix = "- "
+		continuation = "  "
+		body = strings.TrimPrefix(trimmed, "- ")
+	case strings.HasPrefix(trimmed, "* "):
+		prefix = "* "
+		continuation = "  "
+		body = strings.TrimPrefix(trimmed, "* ")
+	default:
+		body = trimmed
+	}
+
+	bodyWidth := width - utf8.RuneCountInString(prefix)
+	if bodyWidth < 10 {
+		return []string{line}
+	}
+	wrapped := wordWrap(body, bodyWidth)
+	if len(wrapped) <= 1 {
+		return []string{line}
+	}
+
+	result := make([]string, len(wrapped))
+	for i, w := range wrapped {
+		if i == 0 {
+			result[i] = prefix + w
+		} else {
+			result[i] = continuation + w
+		}
+	}
+	return result
+}
+
+// wordWrap performs greedy word-wrap: pack as many whitespace-separated
+// tokens as fit, then start a new line. A single word longer than width is
+// kept on its own line rather than mid-word split (terminal will truncate
+// at the right edge if it's truly that long, but that's rare).
+func wordWrap(text string, width int) []string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return []string{text}
+	}
+	var lines []string
+	var current strings.Builder
+	for _, w := range words {
+		if current.Len() == 0 {
+			current.WriteString(w)
+			continue
+		}
+		runeLen := utf8.RuneCountInString(current.String()) + 1 + utf8.RuneCountInString(w)
+		if runeLen <= width {
+			current.WriteByte(' ')
+			current.WriteString(w)
+		} else {
+			lines = append(lines, current.String())
+			current.Reset()
+			current.WriteString(w)
+		}
+	}
+	if current.Len() > 0 {
+		lines = append(lines, current.String())
+	}
+	return lines
 }
