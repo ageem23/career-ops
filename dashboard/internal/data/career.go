@@ -582,6 +582,72 @@ func replaceStatusInLine(line, oldStatus, newStatus string) string {
 	return strings.Replace(line, oldStatus, newStatus, 1)
 }
 
+// AppendApplicationNote appends a note fragment to the Notes column of the
+// application row identified by reportNumber. Joined to existing notes with
+// "; " (a non-pipe separator so the table parser still sees a single column).
+// No-op if the application is not found.
+func AppendApplicationNote(careerOpsPath, reportNumber, note string) error {
+	if reportNumber == "" || note == "" {
+		return nil
+	}
+	// Pipes inside a markdown table cell fracture the row when split by '|'.
+	// Replace them with the broken-bar U+00A6 so the cell stays single-column.
+	note = strings.ReplaceAll(note, "|", "¦")
+	filePath := filepath.Join(careerOpsPath, "applications.md")
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		filePath = filepath.Join(careerOpsPath, "data", "applications.md")
+		content, err = os.ReadFile(filePath)
+		if err != nil {
+			return err
+		}
+	}
+
+	lines := strings.Split(string(content), "\n")
+	marker := fmt.Sprintf("[%s]", reportNumber)
+	for i, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), "|") || !strings.Contains(line, marker) {
+			continue
+		}
+		// Update last column (Notes). Find last pipe before optional trailing pipe.
+		trimmed := strings.TrimRight(line, " \t")
+		trailingPipe := strings.HasSuffix(trimmed, "|")
+		body := trimmed
+		if trailingPipe {
+			body = strings.TrimSuffix(body, "|")
+			body = strings.TrimRight(body, " \t")
+		}
+		lastPipe := strings.LastIndex(body, "|")
+		if lastPipe < 0 {
+			return nil
+		}
+		notesField := strings.TrimSpace(body[lastPipe+1:])
+		var newNotes string
+		if notesField == "" {
+			newNotes = note
+		} else {
+			newNotes = notesField + "; " + note
+		}
+		rebuilt := body[:lastPipe+1] + " " + newNotes
+		if trailingPipe {
+			rebuilt += " |"
+		}
+		lines[i] = rebuilt
+		return os.WriteFile(filePath, []byte(strings.Join(lines, "\n")), 0644)
+	}
+	return nil
+}
+
+// FindApplicationByNumber returns the application matching tracker number, or false.
+func FindApplicationByNumber(apps []model.CareerApplication, number int) (model.CareerApplication, bool) {
+	for _, a := range apps {
+		if a.Number == number {
+			return a, true
+		}
+	}
+	return model.CareerApplication{}, false
+}
+
 // cleanTableCell removes trailing pipes and whitespace from a table cell value.
 func cleanTableCell(s string) string {
 	s = strings.TrimSpace(s)

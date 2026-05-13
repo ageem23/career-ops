@@ -50,6 +50,9 @@ type PipelineRefreshMsg struct{}
 // PipelineOpenProgressMsg is emitted when the progress screen should open.
 type PipelineOpenProgressMsg struct{}
 
+// PipelineOpenTasksMsg is emitted when the tasks screen should open.
+type PipelineOpenTasksMsg struct{}
+
 type reportSummary struct {
 	archetype string
 	tldr      string
@@ -344,6 +347,9 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 
 	case "p":
 		return m, func() tea.Msg { return PipelineOpenProgressMsg{} }
+
+	case "t":
+		return m, func() tea.Msg { return PipelineOpenTasksMsg{} }
 
 	case "r":
 		return m, func() tea.Msg { return PipelineRefreshMsg{} }
@@ -917,6 +923,7 @@ func (m PipelineModel) renderHelp() string {
 		keyStyle.Render("c") + descStyle.Render(" change  ") +
 		keyStyle.Render("v") + descStyle.Render(" view  ") +
 		keyStyle.Render("p") + descStyle.Render(" progress  ") +
+		keyStyle.Render("t") + descStyle.Render(" tasks  ") +
 		keyStyle.Render("Esc") + descStyle.Render(" quit")
 
 	gap := m.width - lipgloss.Width(keys) - lipgloss.Width(brand) - 2
