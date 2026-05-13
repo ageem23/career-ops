@@ -215,6 +215,22 @@ async function checkSession(page) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const randomDelay = ([min, max]) => Math.floor(Math.random() * (max - min) + min);
 
+// Defensive — if a user supplies a scalar/string for delay_pages or
+// delay_searches and the standalone validator (test-linkedin-config.mjs)
+// was skipped, randomDelay() would throw a destructuring TypeError mid-scan.
+// Fall back to the default tuple instead so bad config degrades safely.
+function normalizeDelayTuple(value, fallback) {
+  if (
+    Array.isArray(value) &&
+    value.length === 2 &&
+    Number.isFinite(value[0]) &&
+    Number.isFinite(value[1]) &&
+    value[0] >= 0 &&
+    value[0] <= value[1]
+  ) return value;
+  return fallback;
+}
+
 function log(msg) { console.log(`[linkedin] ${msg}`); }
 function warn(msg) { console.warn(`[linkedin] ⚠ ${msg}`); }
 
@@ -243,20 +259,26 @@ function unwrapRedirect(href) {
   if (!trimmed) return '';
   try {
     const u = new URL(trimmed);
-    if (!u.hostname.includes('linkedin.com')) return trimmed;
-    if (!u.pathname.includes('/safety/go')) return trimmed;
+    // Validate the OUTER scheme first — a direct `javascript:`, `file:`, or
+    // `data:` URL must never end up in JD frontmatter even when it doesn't
+    // go through the redirect-unwrap path.
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+    if (!u.hostname.includes('linkedin.com')) return u.toString();
+    if (!u.pathname.includes('/safety/go')) return u.toString();
     const nested = u.searchParams.get('url');
-    if (!nested) return trimmed;
+    if (!nested) return u.toString();
     const decoded = decodeURIComponent(nested);
     const decodedUrl = new URL(decoded);
-    // Reject javascript:, file:, data:, and other non-web schemes so they
-    // can't end up in the JD frontmatter or the persisted application URL.
+    // Validate the INNER scheme too — LinkedIn's redirect wrapper is what
+    // attackers would target to smuggle non-web schemes into our pipeline.
     if (decodedUrl.protocol !== 'http:' && decodedUrl.protocol !== 'https:') {
       return '';
     }
-    return decoded;
+    return decodedUrl.toString();
   } catch {
-    return trimmed;
+    // Unparseable URL — drop it rather than return the raw input, which
+    // could be a `javascript:alert(1)` masquerading as text.
+    return '';
   }
 }
 
@@ -401,11 +423,22 @@ async function goToNextPage(page) {
 function saveJd(detail) {
   mkdirSync(JDS_DIR, { recursive: true });
   const slug = slugify(`${detail.company}-${detail.title}`);
-  const filename = `${slug}.md`;
+  // Two different LinkedIn postings can share the same company+title (e.g.
+  // multiple openings of "Engineering Manager" at the same company, or two
+  // teams hiring for the same role). Hash the posting URL to give each one
+  // a distinct file — falls back to the application URL or the slug itself
+  // when no URL is available, so behavior remains deterministic.
+  const unique = createHash('sha1')
+    .update(detail.url || detail.applicationUrl || `${detail.company}-${detail.title}`)
+    .digest('hex')
+    .slice(0, 10);
+  const filename = `${slug}-${unique}.md`;
   const filepath = join(JDS_DIR, filename);
 
-  // Don't overwrite if already exists (multiple keyword searches may surface
-  // the same role; first save wins, scan-history dedups subsequent hits).
+  // Don't overwrite if the same posting was already saved (multiple keyword
+  // searches may surface the same role; first save wins, scan-history dedups
+  // subsequent hits). The per-posting hash ensures distinct postings don't
+  // collide on the slug.
   if (existsSync(filepath)) return `${JDS_DIR}/${filename}`;
 
   const today = new Date().toISOString().slice(0, 10);
@@ -430,7 +463,7 @@ ${detail.jdText}
 
 async function runSearch(page, entry) {
   const max = entry.max_results || 25;
-  const delayPages = entry.delay_pages || DEFAULT_DELAY_PAGES;
+  const delayPages = normalizeDelayTuple(entry.delay_pages, DEFAULT_DELAY_PAGES);
   const url = buildSearchUrl(entry);
 
   log(`Search: ${entry.search}`);
@@ -515,6 +548,13 @@ function waitForEnter(promptText) {
 // re-warming the session before a long unattended run, or for verifying
 // auth without kicking off any scans.
 async function login() {
+  // Fail fast in non-interactive sessions (CI, cron, headless agents). The
+  // login flow requires a human to enter credentials at the browser prompt,
+  // so attempting it without a TTY would just hang on stdin until killed.
+  if (!process.stdin.isTTY) {
+    warn('LinkedIn: --login requires an interactive terminal. Run it locally in a TTY session.');
+    return false;
+  }
   if (loginInProgress) {
     await loginInProgress;
     return true;

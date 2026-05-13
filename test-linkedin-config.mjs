@@ -121,11 +121,30 @@ function validateEntry(entry, idx) {
     }
   }
 
-  // surface unknown top-level fields so typos don't get silently ignored
+  // work_mode (optional) — buildSearchUrl() in providers/linkedin.mjs reads
+  // this as a YAML list of {On-site, Remote, Hybrid} and silently drops any
+  // unrecognized values. A scalar or typo would broaden the search invisibly,
+  // so reject those at preflight rather than later in a confusing scan.
+  if (entry.work_mode != null) {
+    const validModes = new Set(['On-site', 'Remote', 'Hybrid']);
+    if (
+      !Array.isArray(entry.work_mode) ||
+      entry.work_mode.length === 0 ||
+      entry.work_mode.some(mode => typeof mode !== 'string' || !validModes.has(mode))
+    ) {
+      errors.push(`"work_mode" must be a YAML list containing only: On-site, Remote, Hybrid (got ${JSON.stringify(entry.work_mode)})`);
+    }
+  }
+
+  // surface unknown top-level fields so typos don't get silently ignored.
+  // Keep this list in sync with the fields LinkedIn provider actually
+  // reads in providers/linkedin.mjs (location, geo_id, distance, work_mode
+  // were missed here and triggered false "unknown field" warnings).
   const KNOWN = new Set([
     'name', 'provider', 'enabled', 'search',
     'date_posted', 'experience_level', 'max_results',
     'delay_pages', 'delay_searches',
+    'location', 'geo_id', 'distance', 'work_mode',
   ]);
   for (const key of Object.keys(entry)) {
     if (!KNOWN.has(key)) {
@@ -147,6 +166,14 @@ function suggestDatePosted(input) {
 // ── Main ────────────────────────────────────────────────────────────
 
 const config = loadConfig();
+// An empty portals.yml or a scalar/array root would let config?.tracked_companies
+// resolve to undefined and exit 0 with "No entries to validate" — silently
+// passing preflight while the actual scan would fail later. Reject malformed
+// roots upfront so config errors surface at validation time, not scan time.
+if (!config || typeof config !== 'object' || Array.isArray(config)) {
+  console.error(`Error: ${PORTALS_PATH} must contain a top-level YAML mapping/object (got ${Array.isArray(config) ? 'array' : typeof config}).`);
+  process.exit(2);
+}
 const rawEntries = config?.tracked_companies;
 if (rawEntries != null && !Array.isArray(rawEntries)) {
   console.error(`Error: tracked_companies in ${PORTALS_PATH} must be a YAML list (array), got ${typeof rawEntries}.`);
