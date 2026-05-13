@@ -43,6 +43,9 @@ function today() {
 }
 
 function runCadence() {
+  if (!existsSync(CADENCE_SCRIPT)) {
+    throw new Error(`cadence script not found at ${CADENCE_SCRIPT}`);
+  }
   const result = spawnSync('node', [CADENCE_SCRIPT], { encoding: 'utf-8' });
   if (result.status !== 0) {
     throw new Error(`followup-cadence.mjs exited ${result.status}: ${result.stderr}`);

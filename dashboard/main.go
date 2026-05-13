@@ -216,6 +216,11 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleTaskMarkStatus writes a status change for a task and cascades the
 // follow-ups.md / applications.md updates that keep the cadence honest.
+//
+// The cascade (tasks.md → follow-ups.md → applications.md Notes) is best-effort:
+// each step logs to stderr on failure and the rest continue. Partial state is
+// recoverable — the next sync-tasks run reconciles cadence counts against
+// follow-ups.md, and the Notes column is purely informational.
 func (m *appModel) handleTaskMarkStatus(msg screens.TasksMarkStatusMsg) {
 	today := time.Now().Format("2006-01-02")
 	updated, err := data.UpdateTaskStatus(m.careerOpsPath, msg.Task.Number, msg.NewStatus, today)
@@ -301,6 +306,9 @@ func runSyncTasks(careerOpsPath string) {
 // autoCreateInterviewThankYou appends a thank-you task on Interview transition,
 // if one isn't already pending for the same app.
 func autoCreateInterviewThankYou(careerOpsPath string, app model.CareerApplication) {
+	if app.Number <= 0 {
+		return
+	}
 	existing := data.ParseTasks(careerOpsPath)
 	for _, t := range existing {
 		if t.Status == "pending" && t.Type == "interview" && t.AppNumber == app.Number {
