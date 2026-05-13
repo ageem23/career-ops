@@ -44,6 +44,28 @@
 
 6. **Targets alternativos** con justificacion de por que son buenos second choices
 
+7. **Guardar como tareas en el dashboard**: Despues de presentar los mensajes, listar los contactos sugeridos (primario + alternativos) en una tabla numerada:
+
+   ```
+   | # | Nombre | Rol | Empresa | LinkedIn |
+   ```
+
+   Preguntar al candidato:
+   > "¿Agrego estos contactos como tareas en el dashboard? (todos / ninguno / numeros como `1,3`)"
+
+   Si responde "todos" o numeros especificos, por cada contacto seleccionado ejecutar:
+
+   ```bash
+   node add-task.mjs --type contact \
+     --title "LinkedIn: {Nombre} ({Rol})" \
+     --company "{Empresa}" \
+     --notes "{tipo}: {URL de LinkedIn}"
+   ```
+
+   Si el contacto esta asociado a una aplicacion en `data/applications.md`, agregar `--app {numero}`.
+
+   `add-task.mjs` es idempotente: re-ejecutar con el mismo tipo, titulo y App# no duplica la tarea. Reportar al candidato cuantas se agregaron y cuantas eran duplicados.
+
 **Reglas del mensaje:**
 - Maximo 300 caracteres (LinkedIn connection request limit)
 - NO corporate-speak
