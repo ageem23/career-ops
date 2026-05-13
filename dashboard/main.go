@@ -135,6 +135,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			msg.Path, msg.Title,
 			m.pipeline.Width(), m.pipeline.Height(),
 			msg.App, msg.CareerOpsPath,
+			tasksForApp(m.careerOpsPath, msg.App.Number),
 		)
 		m.viewerSource = viewPipeline
 		m.state = viewReport
@@ -206,6 +207,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			fullPath, title,
 			m.tasks.Width(), m.tasks.Height(),
 			app, m.careerOpsPath,
+			tasksForApp(m.careerOpsPath, app.Number),
 		)
 		m.viewerSource = viewTasks
 		m.state = viewReport
@@ -260,10 +262,26 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // follow-ups.md, and the Notes column is purely informational.
 func (m *appModel) handleTaskMarkStatus(msg screens.TasksMarkStatusMsg) {
 	today := time.Now().Format("2006-01-02")
-	updated, err := data.UpdateTaskStatus(m.careerOpsPath, msg.Task.Number, msg.NewStatus, today)
+	// Reopen clears Completed (passing "" tells UpdateTaskStatus to normalize
+	// to "-"). Done/skipped stamp today's date.
+	completed := today
+	if msg.NewStatus == "pending" {
+		completed = ""
+	}
+	updated, err := data.UpdateTaskStatus(m.careerOpsPath, msg.Task.Number, msg.NewStatus, completed)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "WARN: task update failed: %v\n", err)
 		return
+	}
+
+	// Reopen cascade: when a followup task is moved back to pending, also
+	// remove the matching row from follow-ups.md so the cadence count stays
+	// accurate. The previous "Follow-up N sent" note in applications.md is
+	// left in place — purely informational, costly to surgically remove.
+	if msg.NewStatus == "pending" && msg.Task.Status == "done" && updated.Type == "followup" && updated.AppNumber > 0 {
+		if _, err := data.RemoveFollowupHistory(m.careerOpsPath, updated.AppNumber, updated.Title); err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: follow-up history remove failed: %v\n", err)
+		}
 	}
 
 	if msg.NewStatus == "done" && updated.Type == "followup" && updated.AppNumber > 0 {
@@ -293,7 +311,11 @@ func (m *appModel) handleTaskMarkStatus(msg screens.TasksMarkStatusMsg) {
 
 	tasks := data.ParseTasks(m.careerOpsPath)
 	m.tasks = m.tasks.WithReloadedTasks(tasks)
-	verb := map[string]string{"done": "completed", "skipped": "skipped"}[msg.NewStatus]
+	verb := map[string]string{
+		"done":    "completed",
+		"skipped": "skipped",
+		"pending": "reopened",
+	}[msg.NewStatus]
 	if verb == "" {
 		verb = "updated"
 	}
@@ -316,6 +338,23 @@ func (m *appModel) handleTaskAdd(msg screens.TasksAddMsg) {
 	tasks := data.ParseTasks(m.careerOpsPath)
 	m.tasks = m.tasks.WithReloadedTasks(tasks)
 	m.tasks.SetFlash(fmt.Sprintf("Added task #%d.", created.Number))
+}
+
+// tasksForApp returns the subset of tasks whose AppNumber matches the given
+// application number, in their on-disk order. Used to render the tasks panel
+// at the top of the report viewer.
+func tasksForApp(careerOpsPath string, appNumber int) []model.Task {
+	if appNumber <= 0 {
+		return nil
+	}
+	all := data.ParseTasks(careerOpsPath)
+	out := make([]model.Task, 0, 4)
+	for _, t := range all {
+		if t.AppNumber == appNumber {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // runSyncTasks shells out to sync-tasks.mjs. Best-effort: missing node, missing

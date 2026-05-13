@@ -45,13 +45,19 @@ const wrapMargin = 6
 
 // NewViewerModel creates a new file viewer for the given path.
 // If app.ReportPath is non-empty, the viewer enables in-place status changes.
-func NewViewerModel(t theme.Theme, path, title string, width, height int, app model.CareerApplication, careerOpsPath string) ViewerModel {
+// tasks is the list of tasks linked to this application (filtered by App#);
+// the viewer renders them as a markdown table prepended to the report body so
+// the user can review all open work on this application at a glance.
+func NewViewerModel(t theme.Theme, path, title string, width, height int, app model.CareerApplication, careerOpsPath string, tasks []model.Task) ViewerModel {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		content = []byte("Error reading file: " + err.Error())
 	}
 
 	raw := strings.Split(string(content), "\n")
+	if len(tasks) > 0 {
+		raw = append(buildTasksHeader(tasks), raw...)
+	}
 	return ViewerModel{
 		rawLines:      raw,
 		lines:         wrapAll(raw, width-wrapMargin),
@@ -63,6 +69,45 @@ func NewViewerModel(t theme.Theme, path, title string, width, height int, app mo
 		careerOpsPath: careerOpsPath,
 		hasApp:        app.ReportPath != "" || app.Company != "",
 	}
+}
+
+// buildTasksHeader produces the markdown lines for the "Tasks for this
+// application" panel rendered at the top of the report viewer. The existing
+// renderTableBlock turns the table into a properly formatted box.
+func buildTasksHeader(tasks []model.Task) []string {
+	pending, done, skipped := 0, 0, 0
+	for _, t := range tasks {
+		switch t.Status {
+		case "pending":
+			pending++
+		case "done":
+			done++
+		case "skipped":
+			skipped++
+		}
+	}
+	lines := []string{
+		"## Tasks for this application",
+		"",
+		fmt.Sprintf("**Summary:** %d pending · %d done · %d skipped", pending, done, skipped),
+		"",
+		"| # | Status | Type | Title | Due | Completed |",
+		"|---|--------|------|-------|-----|-----------|",
+	}
+	for _, t := range tasks {
+		due := t.Due
+		if due == "" {
+			due = "-"
+		}
+		completed := t.Completed
+		if completed == "" {
+			completed = "-"
+		}
+		lines = append(lines, fmt.Sprintf("| %d | %s | %s | %s | %s | %s |",
+			t.Number, t.Status, t.Type, t.Title, due, completed))
+	}
+	lines = append(lines, "", "---", "")
+	return lines
 }
 
 func (m ViewerModel) Init() tea.Cmd {
