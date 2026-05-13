@@ -53,16 +53,20 @@
    Preguntar al candidato:
    > "¿Agrego estos contactos como tareas en el dashboard? (todos / ninguno / numeros como `1,3`)"
 
-   Si responde "todos" o numeros especificos, por cada contacto seleccionado ejecutar:
+   Si responde "todos" o numeros especificos, **siempre** presentar un bloque copy-paste con un comando `add-task.mjs` por contacto. Esto es **obligatorio** porque la misma instruccion corre en Claude Code (con shell) y en Claude web (sin shell) -- el bloque copy-paste funciona en ambos contextos sin cambios:
 
    ```bash
-   node add-task.mjs --type contact \
-     --title "LinkedIn: {Nombre} ({Rol})" \
-     --company "{Empresa}" \
-     --notes "{tipo}: {URL de LinkedIn}"
+   node add-task.mjs --type contact --title "LinkedIn: Jane Doe (Recruiter)" --company "Acme" --notes "linkedin.com/in/jane-doe"
+   node add-task.mjs --type contact --title "LinkedIn: John Smith (Hiring Manager)" --company "Acme" --notes "linkedin.com/in/john-smith" --app 412
    ```
 
-   Si el contacto esta asociado a una aplicacion en `data/applications.md`, agregar `--app {numero}`.
+   Reglas para el bloque:
+   - Un comando por linea, sin barras invertidas de continuacion (asi se puede pegar entero).
+   - Si el contacto esta asociado a una aplicacion en `data/applications.md`, agregar `--app {numero}`.
+   - `--title` debe usar el patron `LinkedIn: {Nombre} ({Rol})`. `--notes` debe contener la URL de LinkedIn.
+   - Citar comillas dobles externas; escapar comillas internas con `\"`.
+
+   Decir al candidato: "Pega esto en una terminal en el directorio del proyecto." Si el agente tiene acceso a Bash (Claude Code), ofrecer adicionalmente ejecutar el bloque al instante.
 
    `add-task.mjs` es idempotente: re-ejecutar con el mismo tipo, titulo y App# no duplica la tarea. Reportar al candidato cuantas se agregaron y cuantas eran duplicados.
 
