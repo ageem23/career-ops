@@ -66,6 +66,17 @@ function getPath(obj, path) {
   return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
 }
 
+// A valid field_map entry is either a single key (`'positionName'`) or an
+// ordered list of fallback keys (`['positionName', 'title']`). Any other
+// shape (number, object, array containing non-strings) would crash
+// `pickField()` with a confusing `path.split is not a function` mid-scan;
+// reject those at config-load time with a clear error instead.
+function isFieldSpec(spec) {
+  if (typeof spec === 'string') return true;
+  if (Array.isArray(spec) && spec.length > 0 && spec.every(s => typeof s === 'string')) return true;
+  return false;
+}
+
 function pickField(item, spec) {
   const keys = Array.isArray(spec) ? spec : [spec];
   for (const k of keys) {
@@ -123,12 +134,21 @@ function htmlToText(s) {
     .trim();
 }
 
-// Write `jds/{slug}.md` and return its relative path. If the file already
-// exists (same slug from a prior scan), the existing file is preserved and
-// its path is returned — first save wins, scan-history dedups the rest.
+// Write `jds/{slug}-{hash}.md` and return its relative path. The URL-derived
+// hash ensures two distinct postings that share the same company+title (e.g.
+// multiple openings of "Software Engineer" at one large employer) don't
+// collide on a single file. If the same posting was already saved, the
+// existing file is preserved (first save wins, scan-history dedups the rest).
 function saveJd(normalized, descriptionBody, sourceLabel) {
   mkdirSync(JDS_DIR, { recursive: true });
-  const slug = slugify(`${normalized.company}-${normalized.title}`);
+  const baseSlug = slugify(`${normalized.company}-${normalized.title}`);
+  // sha1 over the canonical URL (or applicationUrl / company-title fallback)
+  // gives every distinct posting its own cache file deterministically.
+  const urlHash = createHash('sha1')
+    .update(String(normalized.url || normalized.applicationUrl || `${normalized.company}-${normalized.title}`))
+    .digest('hex')
+    .slice(0, 10);
+  const slug = `${baseSlug}-${urlHash}`;
   const filename = `${slug}.md`;
   const filepath = join(JDS_DIR, filename);
   if (existsSync(filepath)) return `${JDS_DIR}/${filename}`;
@@ -178,8 +198,20 @@ export default {
     if (!entry.actor) {
       throw new Error(`apify: entry ${entry.name} missing 'actor' (e.g. misceres/indeed-scraper)`);
     }
-    if (!entry.field_map || !entry.field_map.title || !entry.field_map.url) {
-      throw new Error(`apify: entry ${entry.name} missing field_map.title and/or field_map.url`);
+    if (
+      !entry.field_map ||
+      !isFieldSpec(entry.field_map.title) ||
+      !isFieldSpec(entry.field_map.url) ||
+      (entry.field_map.company != null && !isFieldSpec(entry.field_map.company)) ||
+      (entry.field_map.location != null && !isFieldSpec(entry.field_map.location)) ||
+      (entry.field_map.description != null && !isFieldSpec(entry.field_map.description))
+    ) {
+      throw new Error(
+        `apify: entry ${entry.name} has invalid field_map. ` +
+        `Each of title, url, company, location, description must be a string ` +
+        `(single key like "positionName") or a non-empty array of strings ` +
+        `(fallback list like ["positionName", "title"]). title and url are required.`
+      );
     }
 
     const opts = {};
