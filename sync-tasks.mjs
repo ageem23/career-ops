@@ -39,7 +39,14 @@ Follow-up tasks generated from cadence rules, contacto suggestions, and manual e
 `;
 
 function today() {
-  return new Date().toISOString().split('T')[0];
+  // Local time to match the Go dashboard (time.Now().Format("2006-01-02")).
+  // toISOString() returns UTC, which would disagree with the dashboard near
+  // midnight for users west of UTC.
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
 }
 
 function runCadence() {

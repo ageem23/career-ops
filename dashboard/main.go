@@ -60,6 +60,9 @@ const (
 	viewTasks
 )
 
+// tasksSyncedMsg signals that an asynchronous runSyncTasks invocation finished.
+type tasksSyncedMsg struct{}
+
 type appModel struct {
 	pipeline        screens.PipelineModel
 	viewer          screens.ViewerModel
@@ -171,7 +174,20 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case screens.TasksRefreshMsg:
-		m.handleTaskRefresh()
+		// Bubble Tea Update must stay non-blocking — sync-tasks shells out to
+		// node and can take seconds. Run it in a tea.Cmd goroutine and
+		// reload when the subprocess returns.
+		path := m.careerOpsPath
+		m.tasks.SetFlash("Syncing…")
+		return m, func() tea.Msg {
+			runSyncTasks(path)
+			return tasksSyncedMsg{}
+		}
+
+	case tasksSyncedMsg:
+		tasks := data.ParseTasks(m.careerOpsPath)
+		m.tasks = m.tasks.WithReloadedTasks(tasks)
+		m.tasks.SetFlash("Tasks synced.")
 		return m, nil
 
 	case screens.PipelineOpenURLMsg:
@@ -279,14 +295,6 @@ func (m *appModel) handleTaskAdd(msg screens.TasksAddMsg) {
 	tasks := data.ParseTasks(m.careerOpsPath)
 	m.tasks = m.tasks.WithReloadedTasks(tasks)
 	m.tasks.SetFlash(fmt.Sprintf("Added task #%d.", created.Number))
-}
-
-// handleTaskRefresh re-runs sync-tasks.mjs and reloads.
-func (m *appModel) handleTaskRefresh() {
-	runSyncTasks(m.careerOpsPath)
-	tasks := data.ParseTasks(m.careerOpsPath)
-	m.tasks = m.tasks.WithReloadedTasks(tasks)
-	m.tasks.SetFlash("Tasks synced.")
 }
 
 // runSyncTasks shells out to sync-tasks.mjs. Best-effort: missing node, missing
