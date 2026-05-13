@@ -154,6 +154,11 @@ async function waitForRun(runId, token, deadline, timeoutMs) {
       if (run && TERMINAL_STATUSES.has(run.status)) return run;
       lastError = undefined;
     } catch (err) {
+      // 4xx from the run-status endpoint (401/403 auth revoked, 404 run not
+      // found) won't ever succeed on retry. Surface the real cause instead
+      // of looping until the deadline and masking it as a generic timeout.
+      // Matches the same policy fetchJson() applies to its retry loop.
+      if (err?.status >= 400 && err.status < 500) throw err;
       lastError = err;
     }
     // Same cap for the sleep — if the budget is almost gone, don't waste it
