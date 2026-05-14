@@ -13,7 +13,7 @@ Two execution modes are supported. The user picks which one is the default in
    and honor whatever the user wrote there. This is the authoritative source.
 3. **`config/profile.yml` → `skill_behavior.contacto.default_mode`** — if
    `_profile.md` is silent, fall back to this machine-readable value.
-4. **No preference set** — default to `inline` (the original workflow below).
+4. **No preference set** — default to `prompt` (web Claude with Research mode does the broad LinkedIn lookups + name verification more reliably than Claude Code's WebSearch for this skill).
 
 ### Mode A — `prompt`
 
