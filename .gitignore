@@ -5,6 +5,8 @@ data/applications.md
 data/pipeline.md
 data/scan-semantic-log.tsv
 data/scan-history.tsv
+data/tasks.md
+data/follow-ups.md
 reports/*.md
 !reports/.gitkeep
 output/*
