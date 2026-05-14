@@ -144,10 +144,16 @@ type PipelineModel struct {
 	statusPicker bool
 	statusCursor int
 	// Add-task prompt sub-state. stage: 0 closed, 1 title, 2 due date.
-	addTaskStage int
-	addTaskTitle string
-	addTaskDue   string
-	addTaskError string
+	// addTaskDueDays carries the user's choice for stage 2:
+	//   -1: no due date  ·  0: today  ·  N: today + N days.
+	// addTaskDueTyped distinguishes "user typed a digit" from "user used
+	// arrow keys" so the next typed digit replaces the value instead of
+	// appending — e.g. after arrowing up to 7, typing "3" gives 3, not 73.
+	addTaskStage    int
+	addTaskTitle    string
+	addTaskDueDays  int
+	addTaskDueTyped bool
+	addTaskError    string
 }
 
 // NewPipelineModel creates a new pipeline screen.
@@ -380,11 +386,13 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 	case "n":
 		// Add a manual task for the selected application. The two-stage
 		// prompt collects title then due date so the task can carry both
-		// without forcing a special syntax.
+		// without forcing a special syntax. Stage 2 starts at "today" so
+		// the most common case is one Enter away.
 		if _, ok := m.CurrentApp(); ok {
 			m.addTaskStage = 1
 			m.addTaskTitle = ""
-			m.addTaskDue = ""
+			m.addTaskDueDays = 0
+			m.addTaskDueTyped = false
 			m.addTaskError = ""
 		}
 
@@ -491,14 +499,28 @@ func (m PipelineModel) handleStatusPicker(msg tea.KeyMsg) (PipelineModel, tea.Cm
 	return m, nil
 }
 
+// addTaskDueMax bounds the days-from-today value at roughly ten years out so
+// a stuck arrow key or a fat-fingered "9999999" can't produce a nonsense
+// date. The 4000-day ceiling is well past anything a reasonable task needs.
+const addTaskDueMax = 4000
+
 // handleAddTaskInput drives the two-stage new-task prompt: stage 1 collects
-// the title, stage 2 collects an optional due date. Esc cancels any time.
+// the title, stage 2 collects a days-from-today offset (with the resolved
+// calendar date shown live). Esc cancels at any stage.
+//
+// Stage 2 controls:
+//   - ↑ / ↓: adjust the offset by one day (↓ from 0 = "no due date").
+//   - digit keys: set the offset directly (first digit replaces, subsequent
+//     digits append, so 1 then 0 makes 10).
+//   - Backspace: pop a digit, or reset to 0 if already single-digit.
+//   - Enter: resolve the offset to YYYY-MM-DD (or "" for no due) and save.
 func (m PipelineModel) handleAddTaskInput(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEscape:
 		m.addTaskStage = 0
 		m.addTaskTitle = ""
-		m.addTaskDue = ""
+		m.addTaskDueDays = 0
+		m.addTaskDueTyped = false
 		m.addTaskError = ""
 		return m, nil
 	case tea.KeyEnter:
@@ -510,16 +532,15 @@ func (m PipelineModel) handleAddTaskInput(msg tea.KeyMsg) (PipelineModel, tea.Cm
 			}
 			m.addTaskTitle = title
 			m.addTaskStage = 2
+			m.addTaskDueDays = 0
+			m.addTaskDueTyped = false
 			m.addTaskError = ""
 			return m, nil
 		}
-		// Stage 2: due date — blank means none.
-		due := strings.TrimSpace(m.addTaskDue)
-		if due != "" {
-			if !validDueDate(due) {
-				m.addTaskError = "due date must be a real YYYY-MM-DD (or blank)"
-				return m, nil
-			}
+		// Stage 2: resolve days offset to a concrete date. -1 means no due.
+		var due string
+		if m.addTaskDueDays >= 0 {
+			due = time.Now().AddDate(0, 0, m.addTaskDueDays).Format("2006-01-02")
 		}
 		app, ok := m.CurrentApp()
 		if !ok {
@@ -529,18 +550,39 @@ func (m PipelineModel) handleAddTaskInput(msg tea.KeyMsg) (PipelineModel, tea.Cm
 		title := m.addTaskTitle
 		m.addTaskStage = 0
 		m.addTaskTitle = ""
-		m.addTaskDue = ""
+		m.addTaskDueDays = 0
+		m.addTaskDueTyped = false
 		m.addTaskError = ""
 		return m, func() tea.Msg {
 			return PipelineAddTaskMsg{App: app, Title: title, Due: due}
 		}
+	case tea.KeyUp:
+		if m.addTaskStage == 2 && m.addTaskDueDays < addTaskDueMax {
+			m.addTaskDueDays++
+			m.addTaskDueTyped = false
+			m.addTaskError = ""
+		}
+		return m, nil
+	case tea.KeyDown:
+		if m.addTaskStage == 2 && m.addTaskDueDays > -1 {
+			m.addTaskDueDays--
+			m.addTaskDueTyped = false
+			m.addTaskError = ""
+		}
+		return m, nil
 	case tea.KeyBackspace:
 		if m.addTaskStage == 1 && len(m.addTaskTitle) > 0 {
 			r := []rune(m.addTaskTitle)
 			m.addTaskTitle = string(r[:len(r)-1])
-		} else if m.addTaskStage == 2 && len(m.addTaskDue) > 0 {
-			r := []rune(m.addTaskDue)
-			m.addTaskDue = string(r[:len(r)-1])
+			return m, nil
+		}
+		if m.addTaskStage == 2 {
+			if m.addTaskDueDays >= 10 {
+				m.addTaskDueDays /= 10
+			} else {
+				m.addTaskDueDays = 0
+				m.addTaskDueTyped = false
+			}
 		}
 		return m, nil
 	case tea.KeyRunes, tea.KeySpace:
@@ -549,29 +591,54 @@ func (m PipelineModel) handleAddTaskInput(msg tea.KeyMsg) (PipelineModel, tea.Cm
 				return m, nil
 			}
 			m.addTaskTitle += string(msg.Runes)
-		} else if m.addTaskStage == 2 {
-			if len([]rune(m.addTaskDue)) >= 20 {
+			return m, nil
+		}
+		if m.addTaskStage == 2 {
+			// Only digits make sense as direct input. Reject the rest with
+			// a transient error so the user sees they need a number.
+			allDigits := true
+			for _, r := range msg.Runes {
+				if r < '0' || r > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if !allDigits {
+				m.addTaskError = "use digits, ↑/↓, or Enter"
 				return m, nil
 			}
-			m.addTaskDue += string(msg.Runes)
+			for _, r := range msg.Runes {
+				d := int(r - '0')
+				if !m.addTaskDueTyped || m.addTaskDueDays < 0 {
+					m.addTaskDueDays = d
+					m.addTaskDueTyped = true
+				} else if m.addTaskDueDays*10+d <= addTaskDueMax {
+					m.addTaskDueDays = m.addTaskDueDays*10 + d
+				}
+			}
+			m.addTaskError = ""
 		}
 		return m, nil
 	}
 	return m, nil
 }
 
-// validDueDate accepts YYYY-MM-DD and rejects impossible calendar dates
-// (e.g. 2026-02-30) by round-tripping through time.Parse. Mirrors the
-// validation in add-task.mjs so the two entry points agree.
-func validDueDate(s string) bool {
-	if len(s) != 10 || s[4] != '-' || s[7] != '-' {
-		return false
+// formatDueDays renders the stage-2 due-date field given the current days
+// offset. The resolved calendar date is shown in parentheses so the user can
+// double-check what the offset actually means.
+func formatDueDays(days int) string {
+	if days < 0 {
+		return "— (no due date)"
 	}
-	t, err := time.Parse("2006-01-02", s)
-	if err != nil {
-		return false
+	target := time.Now().AddDate(0, 0, days).Format("2006-01-02")
+	switch days {
+	case 0:
+		return fmt.Sprintf("today (%s)", target)
+	case 1:
+		return fmt.Sprintf("1 day from today (%s)", target)
+	default:
+		return fmt.Sprintf("%d days from today (%s)", days, target)
 	}
-	return t.Format("2006-01-02") == s
 }
 
 func (m PipelineModel) loadCurrentReport() tea.Cmd {
@@ -1115,9 +1182,10 @@ func (m PipelineModel) overlayAddTaskPrompt(body string) string {
 		prompt = append(prompt, padStyle.Render(dimStyle.Render("Enter: next  Esc: cancel")))
 	} else {
 		prompt = append(prompt, padStyle.Render(labelStyle.Render("Title: ")+valueStyle.Render(m.addTaskTitle)))
-		line := labelStyle.Render("Due (YYYY-MM-DD, blank=none): ") + valueStyle.Render(m.addTaskDue) + cursor
+		dueText := formatDueDays(m.addTaskDueDays)
+		line := labelStyle.Render("Due: ") + valueStyle.Render(dueText) + cursor
 		prompt = append(prompt, padStyle.Render(line))
-		prompt = append(prompt, padStyle.Render(dimStyle.Render("Enter: save  Esc: cancel")))
+		prompt = append(prompt, padStyle.Render(dimStyle.Render("↑/↓: ±1 day · digits: set days · ↓ at 0: no due · Enter: save · Esc: cancel")))
 	}
 	if m.addTaskError != "" {
 		prompt = append(prompt, padStyle.Render(errStyle.Render(m.addTaskError)))
