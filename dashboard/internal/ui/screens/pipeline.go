@@ -1087,28 +1087,27 @@ func (m PipelineModel) renderHelp() string {
 }
 
 func (m PipelineModel) overlayStatusPicker(body string) string {
-	// Compact bordered box. The cursor option uses Reverse video (the
-	// terminal's native invert-colors) instead of Bold + Background +
-	// Width — that combo caused mid-glyph clipping for some option
-	// labels ("Responded" was rendering as "E   DED" in the user's
-	// terminal). Reverse is supported reliably everywhere.
+	// Inline text picker, no bordered box. The lipgloss Border around
+	// content with mixed line styles produced glyph-clipping in the
+	// user's terminal (different letters dropped depending on whether
+	// the cursor option used Bold+bg, Reverse, or just Mauve fg). Render
+	// each line independently with a simple divider so nothing in the
+	// styling pipeline can rewrite glyph cells.
 	bodyLines := strings.Split(body, "\n")
 
 	padStyle := lipgloss.NewStyle().Padding(0, 2)
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Blue)
 	dimStyle := lipgloss.NewStyle().Foreground(m.theme.Text)
-	// Cursor option: just a foreground color change to Mauve plus the "▶ "
-	// prefix. No Background, no Bold, no Reverse, no Width — each of those
-	// has been observed to clash with the terminal/font and clip glyphs.
 	cursorStyle := lipgloss.NewStyle().Foreground(m.theme.Mauve)
+	dividerStyle := lipgloss.NewStyle().Foreground(m.theme.Overlay)
 
 	title := "Change status:"
 	if n := len(m.selected); n > 0 {
 		title = fmt.Sprintf("Change status for %d apps:", n)
 	}
 
-	var content []string
-	content = append(content, titleStyle.Render(title))
+	bodyLines = append(bodyLines, padStyle.Render(dividerStyle.Render(strings.Repeat("─", 32))))
+	bodyLines = append(bodyLines, padStyle.Render(titleStyle.Render(title)))
 	for i, opt := range statusOptions {
 		prefix := "  "
 		style := dimStyle
@@ -1117,18 +1116,10 @@ func (m PipelineModel) overlayStatusPicker(body string) string {
 			style = cursorStyle
 		}
 		label := fmt.Sprintf("%s (%s)", opt.label, strings.ToUpper(opt.shortcut))
-		content = append(content, style.Render(prefix+label))
+		bodyLines = append(bodyLines, padStyle.Render(style.Render(prefix+label)))
 	}
+	bodyLines = append(bodyLines, padStyle.Render(dividerStyle.Render(strings.Repeat("─", 32))))
 
-	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(m.theme.Blue).
-		Padding(0, 1).
-		Render(strings.Join(content, "\n"))
-
-	for _, line := range strings.Split(box, "\n") {
-		bodyLines = append(bodyLines, padStyle.Render(line))
-	}
 	return strings.Join(bodyLines, "\n")
 }
 
