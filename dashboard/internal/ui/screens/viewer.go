@@ -43,6 +43,9 @@ type ViewerModel struct {
 	hasApp        bool
 	statusPicker  bool
 	statusCursor  int
+	// Add-task prompt sub-state — shared helper used by both pipeline and
+	// viewer so the keystroke + flow is identical between the two.
+	addTask addTaskPrompt
 }
 
 // wrapMargin is reserved for the body padding (2 cols) plus a small safety
@@ -141,6 +144,9 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		if m.statusPicker {
 			return m.handleStatusPicker(msg)
 		}
+		if m.addTask.active() {
+			return m.handleAddTaskInput(msg)
+		}
 		switch msg.String() {
 		case "q", "esc":
 			return m, func() tea.Msg { return ViewerClosedMsg{} }
@@ -149,6 +155,15 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			if m.hasApp {
 				m.statusPicker = true
 				m.statusCursor = 0
+			}
+
+		case "n":
+			// Same shortcut as the pipeline view — open the shared
+			// add-task prompt for the application currently displayed
+			// in the viewer. Requires a real App# so the resulting
+			// task can be linked back.
+			if m.app.Number > 0 {
+				m.addTask.open()
 			}
 
 		case "t":
@@ -265,6 +280,33 @@ func (m ViewerModel) handleStatusPicker(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
 	return m, nil
 }
 
+// handleAddTaskInput routes a key into the shared add-task prompt. On submit
+// (Enter at stage 2), resolves the offset and emits PipelineAddTaskMsg —
+// same message the pipeline view uses so main.go has one handler for both
+// entry points.
+func (m ViewerModel) handleAddTaskInput(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
+	if !m.addTask.handleKey(msg) {
+		return m, nil
+	}
+	app := m.app
+	title := m.addTask.Title()
+	due := m.addTask.ResolvedDue()
+	m.addTask.close()
+	return m, func() tea.Msg {
+		return PipelineAddTaskMsg{App: app, Title: title, Due: due}
+	}
+}
+
+// overlayAddTaskPrompt delegates to the shared renderer with the viewer's
+// application as the target label.
+func (m ViewerModel) overlayAddTaskPrompt(body string) string {
+	target := fmt.Sprintf("#%d %s", m.app.Number, m.app.Company)
+	if m.app.Number == 0 {
+		target = m.app.Company
+	}
+	return m.addTask.render(body, m.theme, target)
+}
+
 func (m ViewerModel) bodyHeight() int {
 	h := m.height - 4 // header + footer + padding
 	if h < 3 {
@@ -281,6 +323,9 @@ func (m ViewerModel) View() string {
 	view := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 	if m.statusPicker {
 		view = m.overlayStatusPicker(view)
+	}
+	if m.addTask.active() {
+		view = m.overlayAddTaskPrompt(view)
 	}
 	return view
 }
@@ -741,6 +786,16 @@ func (m ViewerModel) renderFooter() string {
 	keyStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Text)
 	descStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
 
+	// While the add-task prompt is open, hide the navigation hints and
+	// show input-mode hints instead so the user knows what's reachable.
+	if m.addTask.active() {
+		return style.Render(
+			keyStyle.Render("type") + descStyle.Render(" input  ") +
+				keyStyle.Render("↑↓") + descStyle.Render(" ±day  ") +
+				keyStyle.Render("Enter") + descStyle.Render(" next/save  ") +
+				keyStyle.Render("Esc") + descStyle.Render(" cancel"))
+	}
+
 	parts := keyStyle.Render("↑↓") + descStyle.Render(" scroll  ") +
 		keyStyle.Render("PgUp/Dn") + descStyle.Render(" page  ") +
 		keyStyle.Render("g/G") + descStyle.Render(" top/end  ")
@@ -748,7 +803,8 @@ func (m ViewerModel) renderFooter() string {
 		parts += keyStyle.Render("c") + descStyle.Render(" change status  ")
 	}
 	if m.app.Number > 0 {
-		parts += keyStyle.Render("t") + descStyle.Render(" tasks  ")
+		parts += keyStyle.Render("n") + descStyle.Render(" new task  ") +
+			keyStyle.Render("t") + descStyle.Render(" tasks  ")
 	}
 	parts += keyStyle.Render("Esc") + descStyle.Render(" back")
 	return style.Render(parts)
