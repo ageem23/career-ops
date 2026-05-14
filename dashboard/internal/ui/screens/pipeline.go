@@ -504,6 +504,11 @@ func (m PipelineModel) handleStatusPicker(msg tea.KeyMsg) (PipelineModel, tea.Cm
 // date. The 4000-day ceiling is well past anything a reasonable task needs.
 const addTaskDueMax = 4000
 
+// addTaskTitleMaxRunes caps the manual-task title at a length that still fits
+// in the dashboard table column and the markdown row without truncation
+// hurting readability.
+const addTaskTitleMaxRunes = 200
+
 // handleAddTaskInput drives the two-stage new-task prompt: stage 1 collects
 // the title, stage 2 collects a days-from-today offset (with the resolved
 // calendar date shown live). Esc cancels at any stage.
@@ -587,7 +592,7 @@ func (m PipelineModel) handleAddTaskInput(msg tea.KeyMsg) (PipelineModel, tea.Cm
 		return m, nil
 	case tea.KeyRunes, tea.KeySpace:
 		if m.addTaskStage == 1 {
-			if len([]rune(m.addTaskTitle)) >= 200 {
+			if len([]rune(m.addTaskTitle)) >= addTaskTitleMaxRunes {
 				return m, nil
 			}
 			m.addTaskTitle += string(msg.Runes)
@@ -1167,7 +1172,14 @@ func (m PipelineModel) overlayAddTaskPrompt(body string) string {
 	errStyle := lipgloss.NewStyle().Foreground(m.theme.Red)
 	cursor := valueStyle.Render("▌")
 
-	app, _ := m.CurrentApp()
+	// Defensive: if the cursor moved off the only filtered row before the
+	// prompt got rendered, just pass the body through. The 'n' handler
+	// guards against opening the prompt without an app, but state could
+	// shift under a future refactor.
+	app, ok := m.CurrentApp()
+	if !ok {
+		return body
+	}
 	target := fmt.Sprintf("#%d %s", app.Number, app.Company)
 	if app.Number == 0 {
 		target = app.Company
