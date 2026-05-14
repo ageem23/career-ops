@@ -112,15 +112,16 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case screens.PipelineUpdateStatusMsg:
-		err := data.UpdateApplicationStatus(msg.CareerOpsPath, msg.App, msg.NewStatus)
-		if err != nil {
-			// Log the error but still reload data to keep UI consistent
-			fmt.Fprintf(os.Stderr, "WARN: status update failed: %v\n", err)
-		}
-		// Side effects of status transitions:
-		// - Interview: auto-create a thank-you task due in 24h.
-		if data.NormalizeStatus(msg.NewStatus) == "interview" && msg.App.Number > 0 {
-			autoCreateInterviewThankYou(msg.CareerOpsPath, msg.App)
+		applyStatusUpdate(msg.CareerOpsPath, msg.App, msg.NewStatus)
+		m.reloadPipelineData()
+		return m, nil
+
+	case screens.PipelineBulkUpdateStatusMsg:
+		// Same code path per app as the single-row update so the
+		// Interview thank-you cascade fires for each row in the
+		// selection, and errors on individual rows don't abort the rest.
+		for _, app := range msg.Apps {
+			applyStatusUpdate(msg.CareerOpsPath, app, msg.NewStatus)
 		}
 		m.reloadPipelineData()
 		return m, nil
@@ -401,6 +402,24 @@ func runSyncTasks(careerOpsPath string) {
 	cmd.Dir = careerOpsPath
 	if out, err := cmd.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: sync-tasks failed: %v\n%s\n", err, string(out))
+	}
+}
+
+// applyStatusUpdate writes a status change for one application and fires any
+// per-app cascade side effects (currently: auto-create an Interview
+// thank-you task). Used by both the single-row and bulk status handlers so
+// the two paths stay byte-for-byte consistent on behavior.
+func applyStatusUpdate(careerOpsPath string, app model.CareerApplication, newStatus string) {
+	if err := data.UpdateApplicationStatus(careerOpsPath, app, newStatus); err != nil {
+		// Bail out before firing the cascade. The status write is what makes
+		// the transition real; without it, auto-creating an Interview
+		// thank-you task would leave a "send thank-you" task pointing at an
+		// app whose tracker status never actually changed.
+		fmt.Fprintf(os.Stderr, "WARN: status update failed for #%d: %v\n", app.Number, err)
+		return
+	}
+	if data.NormalizeStatus(newStatus) == "interview" && app.Number > 0 {
+		autoCreateInterviewThankYou(careerOpsPath, app)
 	}
 }
 
