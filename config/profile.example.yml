@@ -89,6 +89,6 @@ cv:
 # in your message to force one mode for a single invocation.
 skill_behavior:
   contacto:
-    default_mode: inline   # inline (default) | prompt
+    default_mode: prompt   # prompt (default) | inline
   deep:
     default_mode: prompt   # deep is prompt-generating by design

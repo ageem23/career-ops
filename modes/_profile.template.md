@@ -121,7 +121,7 @@ If you have a live demo/dashboard (check profile.yml), offer access in applicati
 
 | Skill | Default mode | Notes |
 |-------|--------------|-------|
-| `contacto` | `inline` | Set to `prompt` if claude.ai web (Research mode) gives you better LinkedIn lookups + name verification |
+| `contacto` | `prompt` | Emit a copy-paste prompt for claude.ai web (Research mode) — better LinkedIn lookups + name verification than CLI WebSearch. Set to `inline` to run the workflow in your CLI instead |
 | `deep` | `prompt` | `deep` is already prompt-generating by design — leave as `prompt` unless you want the CLI to also do the research run itself |
 
 **Override path per invocation:**
