@@ -1087,39 +1087,44 @@ func (m PipelineModel) renderHelp() string {
 }
 
 func (m PipelineModel) overlayStatusPicker(body string) string {
-	// Render the status picker as a full-width box with a consistent Surface
-	// background. Picker lines used to be short Width(30) strings; with the
-	// new multi-select row backgrounds rendering on the same screen, the
-	// option labels visually competed with the colored rows above. A
-	// full-width menu band fixes the visual seam without changing controls.
+	// Render the status picker as a compact bordered box so it visually
+	// pops as a "floating menu" without forcing a full-width background
+	// band — which interacted poorly with bold text in some terminals
+	// (letters appeared to fade into the bg). The border is the visual
+	// demarcation; the option text stays on the terminal default bg.
 	bodyLines := strings.Split(body, "\n")
 
-	bandStyle := lipgloss.NewStyle().
-		Background(m.theme.Surface).
-		Foreground(m.theme.Text).
-		Width(m.width).
-		PaddingLeft(2)
+	padStyle := lipgloss.NewStyle().Padding(0, 2)
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Blue)
+	optionWidth := 28
 
-	var picker []string
 	title := "Change status:"
 	if n := len(m.selected); n > 0 {
 		title = fmt.Sprintf("Change status for %d apps:", n)
 	}
-	titleStyle := bandStyle.Bold(true).Foreground(m.theme.Blue)
-	picker = append(picker, titleStyle.Render(title))
 
+	var content []string
+	content = append(content, titleStyle.Render(title))
 	for i, opt := range statusOptions {
-		optStyle := bandStyle
+		style := lipgloss.NewStyle().Foreground(m.theme.Text).Width(optionWidth)
 		prefix := "  "
 		if i == m.statusCursor {
-			optStyle = bandStyle.Background(m.theme.Overlay).Bold(true)
+			style = style.Background(m.theme.Overlay).Bold(true)
 			prefix = "> "
 		}
 		label := fmt.Sprintf("%s (%s)", opt.label, strings.ToUpper(opt.shortcut))
-		picker = append(picker, optStyle.Render(prefix+label))
+		content = append(content, style.Render(prefix+label))
 	}
 
-	bodyLines = append(bodyLines, picker...)
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.theme.Blue).
+		Padding(0, 1).
+		Render(strings.Join(content, "\n"))
+
+	for _, line := range strings.Split(box, "\n") {
+		bodyLines = append(bodyLines, padStyle.Render(line))
+	}
 	return strings.Join(bodyLines, "\n")
 }
 
