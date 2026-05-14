@@ -17,6 +17,12 @@ import (
 // ViewerClosedMsg is emitted when the viewer is dismissed.
 type ViewerClosedMsg struct{}
 
+// ViewerOpenTasksMsg is emitted when the user wants to jump from the viewer
+// to the tasks list, focused on the first task for the current application.
+type ViewerOpenTasksMsg struct {
+	AppNumber int
+}
+
 // ViewerModel implements an integrated file viewer screen.
 //
 // `rawLines` holds the file as read from disk; `lines` holds the word-wrapped
@@ -143,6 +149,14 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			if m.hasApp {
 				m.statusPicker = true
 				m.statusCursor = 0
+			}
+
+		case "t":
+			if m.app.Number > 0 {
+				appNum := m.app.Number
+				return m, func() tea.Msg {
+					return ViewerOpenTasksMsg{AppNumber: appNum}
+				}
 			}
 
 		case "down", "j":
@@ -732,6 +746,9 @@ func (m ViewerModel) renderFooter() string {
 		keyStyle.Render("g/G") + descStyle.Render(" top/end  ")
 	if m.hasApp {
 		parts += keyStyle.Render("c") + descStyle.Render(" change status  ")
+	}
+	if m.app.Number > 0 {
+		parts += keyStyle.Render("t") + descStyle.Render(" tasks  ")
 	}
 	parts += keyStyle.Render("Esc") + descStyle.Render(" back")
 	return style.Render(parts)

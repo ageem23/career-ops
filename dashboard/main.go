@@ -145,6 +145,19 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = m.viewerSource
 		return m, nil
 
+	case screens.ViewerOpenTasksMsg:
+		tasks := data.ParseTasks(m.careerOpsPath)
+		w, h := m.pipeline.Width(), m.pipeline.Height()
+		m.tasks = screens.NewTasksModel(m.theme, tasks, w, h)
+		m.tasks.FocusOnApp(msg.AppNumber)
+		if m.tasks.HasCurrent() {
+			m.tasks.SetFlash(fmt.Sprintf("Showing tasks for app #%d.", msg.AppNumber))
+		} else {
+			m.tasks.SetFlash(fmt.Sprintf("No tasks linked to app #%d yet.", msg.AppNumber))
+		}
+		m.state = viewTasks
+		return m, nil
+
 	case screens.PipelineOpenProgressMsg:
 		m.progress = screens.NewProgressModel(
 			theme.NewTheme("catppuccin-mocha"),

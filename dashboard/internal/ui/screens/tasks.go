@@ -134,6 +134,32 @@ func (m *TasksModel) SetFlash(text string) {
 	m.flash = tasksFlash{text: text, until: time.Now().Add(3 * time.Second)}
 }
 
+// FocusOnApp picks the tab and cursor position that surfaces the first task
+// linked to the given application number. Prefers Pending over Completed so
+// the user lands on something actionable. No-op when no task matches.
+func (m *TasksModel) FocusOnApp(appNumber int) {
+	if appNumber <= 0 {
+		return
+	}
+	for _, tab := range []string{tasksTabPending, tasksTabCompleted} {
+		m.activeTab = tab
+		m.applyFilter()
+		for i, t := range m.filtered {
+			if t.AppNumber == appNumber {
+				m.cursor = i
+				m.scrollOffset = 0
+				m.adjustScroll()
+				return
+			}
+		}
+	}
+	// No match — leave the model on the Pending tab at the top.
+	m.activeTab = tasksTabPending
+	m.applyFilter()
+	m.cursor = 0
+	m.scrollOffset = 0
+}
+
 // Update handles input.
 func (m TasksModel) Update(msg tea.Msg) (TasksModel, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -308,6 +334,14 @@ func (m TasksModel) currentTask() (model.Task, bool) {
 		return model.Task{}, false
 	}
 	return m.filtered[m.cursor], true
+}
+
+// HasCurrent reports whether the active tab has any visible task under the
+// cursor. Useful for callers that want to flash a different message when a
+// focus call lands on an empty list (e.g. an app with no linked tasks).
+func (m TasksModel) HasCurrent() bool {
+	_, ok := m.currentTask()
+	return ok
 }
 
 func (m *TasksModel) applyFilter() {
