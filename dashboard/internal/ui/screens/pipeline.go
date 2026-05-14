@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -52,6 +53,14 @@ type PipelineOpenProgressMsg struct{}
 
 // PipelineOpenTasksMsg is emitted when the tasks screen should open.
 type PipelineOpenTasksMsg struct{}
+
+// PipelineAddTaskMsg requests creation of a manual task linked to an
+// application. Due may be empty for no due date.
+type PipelineAddTaskMsg struct {
+	App   model.CareerApplication
+	Title string
+	Due   string // YYYY-MM-DD or "" for none
+}
 
 type reportSummary struct {
 	archetype string
@@ -134,6 +143,11 @@ type PipelineModel struct {
 	// Status picker sub-state
 	statusPicker bool
 	statusCursor int
+	// Add-task prompt sub-state. stage: 0 closed, 1 title, 2 due date.
+	addTaskStage int
+	addTaskTitle string
+	addTaskDue   string
+	addTaskError string
 }
 
 // NewPipelineModel creates a new pipeline screen.
@@ -250,6 +264,9 @@ func (m PipelineModel) Update(msg tea.Msg) (PipelineModel, tea.Cmd) {
 		if m.statusPicker {
 			return m.handleStatusPicker(msg)
 		}
+		if m.addTaskStage > 0 {
+			return m.handleAddTaskInput(msg)
+		}
 		return m.handleKey(msg)
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -360,6 +377,17 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 			m.statusCursor = 0
 		}
 
+	case "n":
+		// Add a manual task for the selected application. The two-stage
+		// prompt collects title then due date so the task can carry both
+		// without forcing a special syntax.
+		if _, ok := m.CurrentApp(); ok {
+			m.addTaskStage = 1
+			m.addTaskTitle = ""
+			m.addTaskDue = ""
+			m.addTaskError = ""
+		}
+
 	case "g":
 		if len(m.filtered) > 0 {
 			m.cursor = 0
@@ -461,6 +489,89 @@ func (m PipelineModel) handleStatusPicker(msg tea.KeyMsg) (PipelineModel, tea.Cm
 		}
 	}
 	return m, nil
+}
+
+// handleAddTaskInput drives the two-stage new-task prompt: stage 1 collects
+// the title, stage 2 collects an optional due date. Esc cancels any time.
+func (m PipelineModel) handleAddTaskInput(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEscape:
+		m.addTaskStage = 0
+		m.addTaskTitle = ""
+		m.addTaskDue = ""
+		m.addTaskError = ""
+		return m, nil
+	case tea.KeyEnter:
+		if m.addTaskStage == 1 {
+			title := strings.TrimSpace(m.addTaskTitle)
+			if title == "" {
+				m.addTaskError = "title cannot be empty"
+				return m, nil
+			}
+			m.addTaskTitle = title
+			m.addTaskStage = 2
+			m.addTaskError = ""
+			return m, nil
+		}
+		// Stage 2: due date — blank means none.
+		due := strings.TrimSpace(m.addTaskDue)
+		if due != "" {
+			if !validDueDate(due) {
+				m.addTaskError = "due date must be a real YYYY-MM-DD (or blank)"
+				return m, nil
+			}
+		}
+		app, ok := m.CurrentApp()
+		if !ok {
+			m.addTaskStage = 0
+			return m, nil
+		}
+		title := m.addTaskTitle
+		m.addTaskStage = 0
+		m.addTaskTitle = ""
+		m.addTaskDue = ""
+		m.addTaskError = ""
+		return m, func() tea.Msg {
+			return PipelineAddTaskMsg{App: app, Title: title, Due: due}
+		}
+	case tea.KeyBackspace:
+		if m.addTaskStage == 1 && len(m.addTaskTitle) > 0 {
+			r := []rune(m.addTaskTitle)
+			m.addTaskTitle = string(r[:len(r)-1])
+		} else if m.addTaskStage == 2 && len(m.addTaskDue) > 0 {
+			r := []rune(m.addTaskDue)
+			m.addTaskDue = string(r[:len(r)-1])
+		}
+		return m, nil
+	case tea.KeyRunes, tea.KeySpace:
+		if m.addTaskStage == 1 {
+			if len([]rune(m.addTaskTitle)) >= 200 {
+				return m, nil
+			}
+			m.addTaskTitle += string(msg.Runes)
+		} else if m.addTaskStage == 2 {
+			if len([]rune(m.addTaskDue)) >= 20 {
+				return m, nil
+			}
+			m.addTaskDue += string(msg.Runes)
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// validDueDate accepts YYYY-MM-DD and rejects impossible calendar dates
+// (e.g. 2026-02-30) by round-tripping through time.Parse. Mirrors the
+// validation in add-task.mjs so the two entry points agree.
+func validDueDate(s string) bool {
+	if len(s) != 10 || s[4] != '-' || s[7] != '-' {
+		return false
+	}
+	t, err := time.Parse("2006-01-02", s)
+	if err != nil {
+		return false
+	}
+	return t.Format("2006-01-02") == s
 }
 
 func (m PipelineModel) loadCurrentReport() tea.Cmd {
@@ -617,6 +728,9 @@ func (m PipelineModel) View() string {
 	// Status picker overlay
 	if m.statusPicker {
 		body = m.overlayStatusPicker(body)
+	}
+	if m.addTaskStage > 0 {
+		body = m.overlayAddTaskPrompt(body)
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left,
@@ -911,6 +1025,12 @@ func (m PipelineModel) renderHelp() string {
 				keyStyle.Render("Enter") + descStyle.Render(" confirm  ") +
 				keyStyle.Render("Esc") + descStyle.Render(" cancel"))
 	}
+	if m.addTaskStage > 0 {
+		return style.Render(
+			keyStyle.Render("type") + descStyle.Render(" input  ") +
+				keyStyle.Render("Enter") + descStyle.Render(" next/save  ") +
+				keyStyle.Render("Esc") + descStyle.Render(" cancel"))
+	}
 
 	brand := lipgloss.NewStyle().Foreground(m.theme.Overlay).Render("career-ops by santifer.io")
 
@@ -921,6 +1041,7 @@ func (m PipelineModel) renderHelp() string {
 		keyStyle.Render("Enter") + descStyle.Render(" report  ") +
 		keyStyle.Render("o") + descStyle.Render(" open URL  ") +
 		keyStyle.Render("c") + descStyle.Render(" change  ") +
+		keyStyle.Render("n") + descStyle.Render(" new task  ") +
 		keyStyle.Render("v") + descStyle.Render(" view  ") +
 		keyStyle.Render("p") + descStyle.Render(" progress  ") +
 		keyStyle.Render("t") + descStyle.Render(" tasks  ") +
@@ -962,6 +1083,47 @@ func (m PipelineModel) overlayStatusPicker(body string) string {
 
 	// Append picker to body
 	bodyLines = append(bodyLines, picker...)
+	return strings.Join(bodyLines, "\n")
+}
+
+// overlayAddTaskPrompt renders the two-stage new-task prompt at the bottom of
+// the body. Stage 1 shows the title field with a cursor; stage 2 fixes the
+// title and shows the due-date field. Esc cancels at any stage.
+func (m PipelineModel) overlayAddTaskPrompt(body string) string {
+	bodyLines := strings.Split(body, "\n")
+
+	padStyle := lipgloss.NewStyle().Padding(0, 2)
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Blue)
+	labelStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Sky)
+	valueStyle := lipgloss.NewStyle().Foreground(m.theme.Text)
+	dimStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
+	errStyle := lipgloss.NewStyle().Foreground(m.theme.Red)
+	cursor := valueStyle.Render("▌")
+
+	app, _ := m.CurrentApp()
+	target := fmt.Sprintf("#%d %s", app.Number, app.Company)
+	if app.Number == 0 {
+		target = app.Company
+	}
+
+	var prompt []string
+	prompt = append(prompt, padStyle.Render(headerStyle.Render("New task — "+target)))
+
+	if m.addTaskStage == 1 {
+		line := labelStyle.Render("Title: ") + valueStyle.Render(m.addTaskTitle) + cursor
+		prompt = append(prompt, padStyle.Render(line))
+		prompt = append(prompt, padStyle.Render(dimStyle.Render("Enter: next  Esc: cancel")))
+	} else {
+		prompt = append(prompt, padStyle.Render(labelStyle.Render("Title: ")+valueStyle.Render(m.addTaskTitle)))
+		line := labelStyle.Render("Due (YYYY-MM-DD, blank=none): ") + valueStyle.Render(m.addTaskDue) + cursor
+		prompt = append(prompt, padStyle.Render(line))
+		prompt = append(prompt, padStyle.Render(dimStyle.Render("Enter: save  Esc: cancel")))
+	}
+	if m.addTaskError != "" {
+		prompt = append(prompt, padStyle.Render(errStyle.Render(m.addTaskError)))
+	}
+
+	bodyLines = append(bodyLines, prompt...)
 	return strings.Join(bodyLines, "\n")
 }
 
