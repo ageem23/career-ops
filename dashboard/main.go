@@ -411,7 +411,12 @@ func runSyncTasks(careerOpsPath string) {
 // the two paths stay byte-for-byte consistent on behavior.
 func applyStatusUpdate(careerOpsPath string, app model.CareerApplication, newStatus string) {
 	if err := data.UpdateApplicationStatus(careerOpsPath, app, newStatus); err != nil {
+		// Bail out before firing the cascade. The status write is what makes
+		// the transition real; without it, auto-creating an Interview
+		// thank-you task would leave a "send thank-you" task pointing at an
+		// app whose tracker status never actually changed.
 		fmt.Fprintf(os.Stderr, "WARN: status update failed for #%d: %v\n", app.Number, err)
+		return
 	}
 	if data.NormalizeStatus(newStatus) == "interview" && app.Number > 0 {
 		autoCreateInterviewThankYou(careerOpsPath, app)

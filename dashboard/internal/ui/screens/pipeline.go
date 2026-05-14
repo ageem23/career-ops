@@ -233,6 +233,28 @@ func (m PipelineModel) WithReloadedData(apps []model.CareerApplication, metrics 
 	reloaded.applyFilterAndSort()
 	reloaded.CopyReportCache(&m)
 
+	// Carry the multi-select across the reload — pressing 'r' shouldn't
+	// silently drop selections — but prune to apps that are still in the
+	// current filter. A selected app whose status changed elsewhere (so
+	// it no longer matches the active tab) should fall out of the set so
+	// the next bulk action doesn't target rows the user can't see.
+	if len(m.selected) > 0 {
+		visible := make(map[int]bool, len(reloaded.filtered))
+		for _, app := range reloaded.filtered {
+			if app.Number > 0 {
+				visible[app.Number] = true
+			}
+		}
+		for n := range m.selected {
+			if visible[n] {
+				if reloaded.selected == nil {
+					reloaded.selected = make(map[int]bool, len(m.selected))
+				}
+				reloaded.selected[n] = true
+			}
+		}
+	}
+
 	for i, app := range reloaded.filtered {
 		if selectedReportPath != "" && app.ReportPath == selectedReportPath {
 			reloaded.cursor = i
