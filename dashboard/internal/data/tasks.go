@@ -273,6 +273,67 @@ func parseRowParts(parts []string) model.Task {
 	}
 }
 
+// RemoveFollowupHistory removes the most recent row in data/follow-ups.md that
+// matches (appNum, notes==title). Used when a follow-up task is reopened from
+// "done" back to "pending" so the cadence script doesn't keep counting a
+// follow-up the user has undone.
+//
+// No-op if the file doesn't exist or no row matches. Returns the date of the
+// removed row (so the caller can also strip the matching "Follow-up N sent
+// {date}" note from applications.md if it wants).
+func RemoveFollowupHistory(careerOpsPath string, appNum int, title string) (string, error) {
+	path := followupsFilePath(careerOpsPath)
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+
+	lines := strings.Split(string(content), "\n")
+	target := -1
+	removedDate := ""
+	for i := len(lines) - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(trimmed, "|") ||
+			strings.HasPrefix(trimmed, "|---") ||
+			strings.HasPrefix(trimmed, "| #") {
+			continue
+		}
+		parts := strings.Split(strings.Trim(trimmed, "|"), "|")
+		if len(parts) < 8 {
+			continue
+		}
+		for j := range parts {
+			parts[j] = strings.TrimSpace(parts[j])
+		}
+		rowApp, err := strconv.Atoi(parts[1])
+		if err != nil || rowApp != appNum {
+			continue
+		}
+		rowNotes := ""
+		if len(parts) >= 8 {
+			rowNotes = parts[7]
+		}
+		if rowNotes != title {
+			continue
+		}
+		target = i
+		removedDate = parts[2]
+		break
+	}
+	if target < 0 {
+		return "", nil
+	}
+
+	lines = append(lines[:target], lines[target+1:]...)
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		return "", err
+	}
+	return removedDate, nil
+}
+
 // AppendFollowupHistory appends a row to data/follow-ups.md so the cadence
 // script counts the follow-up and advances the cycle on next sync. Creates the
 // file with a canonical header if missing.

@@ -62,6 +62,10 @@ type TasksModel struct {
 	inputMode bool
 	inputBuf  string
 
+	// Details overlay state
+	detailsMode bool
+	detailTask  model.Task
+
 	flash tasksFlash
 }
 
@@ -130,12 +134,48 @@ func (m *TasksModel) SetFlash(text string) {
 	m.flash = tasksFlash{text: text, until: time.Now().Add(3 * time.Second)}
 }
 
+// FocusOnApp picks the tab and cursor position that surfaces the first task
+// linked to the given application number. Prefers Pending over Completed so
+// the user lands on something actionable. When no task matches, the model
+// is parked on the Pending tab at the top so callers can flash a "no tasks
+// linked" message without leaving the view in a stale state.
+func (m *TasksModel) FocusOnApp(appNumber int) {
+	if appNumber <= 0 {
+		return
+	}
+	for _, tab := range []string{tasksTabPending, tasksTabCompleted} {
+		m.activeTab = tab
+		m.applyFilter()
+		for i, t := range m.filtered {
+			if t.AppNumber == appNumber {
+				m.cursor = i
+				m.scrollOffset = 0
+				m.adjustScroll()
+				return
+			}
+		}
+	}
+	// No match — leave the model on the Pending tab at the top.
+	m.activeTab = tasksTabPending
+	m.applyFilter()
+	m.cursor = 0
+	m.scrollOffset = 0
+}
+
 // Update handles input.
 func (m TasksModel) Update(msg tea.Msg) (TasksModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if m.inputMode {
 			return m.handleInput(msg)
+		}
+		if m.detailsMode {
+			// Any key dismisses the overlay; Esc/q is the canonical way.
+			switch msg.String() {
+			case "esc", "q", "d", "enter":
+				m.detailsMode = false
+			}
+			return m, nil
 		}
 		return m.handleKey(msg)
 	case tea.WindowSizeMsg:
@@ -236,6 +276,22 @@ func (m TasksModel) handleKey(msg tea.KeyMsg) (TasksModel, tea.Cmd) {
 				return TasksMarkStatusMsg{Task: task, NewStatus: "skipped"}
 			}
 		}
+	case "u":
+		// Reopen a completed/skipped task — only meaningful in the Completed tab.
+		if m.activeTab != tasksTabCompleted {
+			return m, nil
+		}
+		if t, ok := m.currentTask(); ok && (t.Status == "done" || t.Status == "skipped") {
+			task := t
+			return m, func() tea.Msg {
+				return TasksMarkStatusMsg{Task: task, NewStatus: "pending"}
+			}
+		}
+	case "d":
+		if t, ok := m.currentTask(); ok {
+			m.detailsMode = true
+			m.detailTask = t
+		}
 	case "n":
 		m.inputMode = true
 		m.inputBuf = ""
@@ -280,6 +336,14 @@ func (m TasksModel) currentTask() (model.Task, bool) {
 		return model.Task{}, false
 	}
 	return m.filtered[m.cursor], true
+}
+
+// HasCurrent reports whether the active tab has any visible task under the
+// cursor. Useful for callers that want to flash a different message when a
+// focus call lands on an empty list (e.g. an app with no linked tasks).
+func (m TasksModel) HasCurrent() bool {
+	_, ok := m.currentTask()
+	return ok
 }
 
 func (m *TasksModel) applyFilter() {
@@ -381,7 +445,109 @@ func (m TasksModel) View() string {
 	}
 	parts = append(parts, help)
 
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+	view := lipgloss.JoinVertical(lipgloss.Left, parts...)
+	if m.detailsMode {
+		view = m.overlayDetails(view)
+	}
+	return view
+}
+
+// overlayDetails draws an expanded view of the current task with the full
+// title and notes (no truncation). Long follow-up text is the trigger for this.
+func (m TasksModel) overlayDetails(view string) string {
+	t := m.detailTask
+	boxW := m.width - 8
+	if boxW > 96 {
+		boxW = 96
+	}
+	if boxW < 40 {
+		boxW = 40
+	}
+	wrapW := boxW - 2
+
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Blue)
+	labelStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Sky)
+	valueStyle := lipgloss.NewStyle().Foreground(m.theme.Text)
+	dimStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
+
+	header := titleStyle.Render(fmt.Sprintf("Task #%d", t.Number))
+
+	appText := "-"
+	if t.AppNumber > 0 {
+		appText = fmt.Sprintf("#%d %s", t.AppNumber, t.Company)
+	}
+	dueText := t.Due
+	if dueText == "" || dueText == "-" {
+		dueText = "—"
+	}
+	completedText := t.Completed
+	if completedText == "" || completedText == "-" {
+		completedText = "—"
+	}
+
+	meta := []string{
+		labelStyle.Render("Type:     ") + valueStyle.Render(t.Type),
+		labelStyle.Render("Status:   ") + m.statusStyle(t.Status).Render(t.Status),
+		labelStyle.Render("App:      ") + valueStyle.Render(appText),
+		labelStyle.Render("Due:      ") + valueStyle.Render(dueText),
+		labelStyle.Render("Created:  ") + valueStyle.Render(t.Created),
+		labelStyle.Render("Completed:") + valueStyle.Render(" "+completedText),
+	}
+
+	titleBody := wordWrapTaskField(t.Title, wrapW)
+	notesBody := wordWrapTaskField(t.Notes, wrapW)
+
+	var lines []string
+	lines = append(lines, header, "")
+	lines = append(lines, meta...)
+	lines = append(lines, "", labelStyle.Render("Title"))
+	for _, l := range titleBody {
+		lines = append(lines, valueStyle.Render(l))
+	}
+	lines = append(lines, "", labelStyle.Render("Notes"))
+	if len(notesBody) == 0 || (len(notesBody) == 1 && strings.TrimSpace(notesBody[0]) == "") {
+		lines = append(lines, dimStyle.Render("(no notes)"))
+	} else {
+		for _, l := range notesBody {
+			lines = append(lines, valueStyle.Render(l))
+		}
+	}
+	lines = append(lines, "", dimStyle.Render("Esc / d / Enter to dismiss"))
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.theme.Blue).
+		Padding(1, 2).
+		Width(boxW).
+		Render(strings.Join(lines, "\n"))
+
+	// Place the box centered using lipgloss.Place over a blank screen of view size.
+	vw := lipgloss.Width(view)
+	vh := strings.Count(view, "\n") + 1
+	placed := lipgloss.Place(vw, vh, lipgloss.Center, lipgloss.Center, box)
+	return placed
+}
+
+// wordWrapTaskField wraps a free-text task field to width and returns one
+// rendered line per output line. Handles the empty case so callers can detect
+// "no content".
+func wordWrapTaskField(text string, width int) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return []string{""}
+	}
+	if width < 10 {
+		width = 10
+	}
+	var out []string
+	for _, paragraph := range strings.Split(text, "\n") {
+		if strings.TrimSpace(paragraph) == "" {
+			out = append(out, "")
+			continue
+		}
+		out = append(out, wordWrap(paragraph, width)...)
+	}
+	return out
 }
 
 func (m TasksModel) renderHeader() string {
@@ -591,11 +757,19 @@ func (m TasksModel) renderHelp() string {
 		return style.Render(keys + strings.Repeat(" ", gap) + brand)
 	}
 
+	var actionKeys string
+	if m.activeTab == tasksTabCompleted {
+		actionKeys = keyStyle.Render("u") + descStyle.Render(" reopen  ")
+	} else {
+		actionKeys = keyStyle.Render("c") + descStyle.Render(" complete  ") +
+			keyStyle.Render("s") + descStyle.Render(" skip  ")
+	}
+
 	keys := keyStyle.Render("↑↓/jk") + descStyle.Render(" nav  ") +
 		keyStyle.Render("Tab/←→") + descStyle.Render(" tabs  ") +
 		keyStyle.Render("Enter") + descStyle.Render(" report  ") +
-		keyStyle.Render("c") + descStyle.Render(" complete  ") +
-		keyStyle.Render("s") + descStyle.Render(" skip  ") +
+		keyStyle.Render("d") + descStyle.Render(" details  ") +
+		actionKeys +
 		keyStyle.Render("n") + descStyle.Render(" new  ") +
 		keyStyle.Render("r") + descStyle.Render(" sync  ") +
 		keyStyle.Render("Esc") + descStyle.Render(" back")
