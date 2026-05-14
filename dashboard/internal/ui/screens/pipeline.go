@@ -1097,7 +1097,10 @@ func (m PipelineModel) overlayStatusPicker(body string) string {
 	padStyle := lipgloss.NewStyle().Padding(0, 2)
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Blue)
 	dimStyle := lipgloss.NewStyle().Foreground(m.theme.Text)
-	cursorStyle := lipgloss.NewStyle().Foreground(m.theme.Text).Reverse(true)
+	// Cursor option: just a foreground color change to Mauve plus the "▶ "
+	// prefix. No Background, no Bold, no Reverse, no Width — each of those
+	// has been observed to clash with the terminal/font and clip glyphs.
+	cursorStyle := lipgloss.NewStyle().Foreground(m.theme.Mauve)
 
 	title := "Change status:"
 	if n := len(m.selected); n > 0 {
