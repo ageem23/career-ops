@@ -174,6 +174,14 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				}
 			}
 
+		case "o":
+			if m.app.JobURL != "" {
+				url := m.app.JobURL
+				return m, func() tea.Msg {
+					return PipelineOpenURLMsg{URL: url}
+				}
+			}
+
 		case "down", "j":
 			maxScroll := len(m.lines) - m.bodyHeight()
 			if maxScroll < 0 {
@@ -801,6 +809,9 @@ func (m ViewerModel) renderFooter() string {
 		keyStyle.Render("g/G") + descStyle.Render(" top/end  ")
 	if m.hasApp {
 		parts += keyStyle.Render("c") + descStyle.Render(" change status  ")
+	}
+	if m.app.JobURL != "" {
+		parts += keyStyle.Render("o") + descStyle.Render(" open URL  ")
 	}
 	if m.app.Number > 0 {
 		parts += keyStyle.Render("n") + descStyle.Render(" new task  ") +
