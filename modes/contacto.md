@@ -1,8 +1,55 @@
 # Modo: contacto -- LinkedIn Power Move
 
-## Output contract (lee esto antes de empezar)
+## Mode selection (CHECK BEFORE EXECUTING)
 
-Toda invocacion de `contacto` produce, en este orden y sin excepciones:
+Two execution modes are supported. The user picks which one is the default in
+`modes/_profile.md` → `## Skill Behavior Defaults` (or `config/profile.yml` →
+`skill_behavior.contacto.default_mode`). Resolution order:
+
+1. **Per-invocation override** — if the user explicitly says "run inline" /
+   "do it yourself" / "execute" → use `inline`. If they say "give me the
+   prompt" / "as a prompt" / "for claude.ai" → use `prompt`.
+2. **`modes/_profile.md` → "Skill Behavior Defaults"** — read this section
+   and honor whatever the user wrote there. This is the authoritative source.
+3. **`config/profile.yml` → `skill_behavior.contacto.default_mode`** — if
+   `_profile.md` is silent, fall back to this machine-readable value.
+4. **No preference set** — default to `inline` (the original workflow below).
+
+### Mode A — `prompt`
+
+Output a **single copy-paste-ready prompt** the user pastes into a new
+claude.ai web chat (with Research mode enabled) — do NOT execute the LinkedIn
+lookups yourself.
+
+The prompt MUST:
+- Be a single fenced markdown code block so it's one-click-to-copy.
+- Be customized with the specific company + role + Mathieu's relevant context
+  (CTO 24 years at a consultancy, agentic AI rollout, etc. — pull from
+  `cv.md`, `_profile.md`, `proof-points.md`).
+- Embed the **name-verification protocol** below (`Sending to:` lock-in,
+  the explicit verification checklist) so the web Claude follows it.
+- Specify the 3-sentence message structures by contact type
+  (Recruiter / Hiring Manager / Peer / Interviewer) verbatim from the
+  "Frameworks per contact type" section below.
+- End with a clear `**Deliverable:**` line stating what the web Claude
+  should return (verified targets, lock-in lines, custom messages,
+  alternates, sequencing recommendation).
+
+After the code block, output the **table of suggested contacts** (companies
+the user has applied to, mapped from `data/applications.md`) AND the
+**`add-task.mjs` copy-paste block** — these stay even in prompt mode so the
+user can still track follow-up tasks.
+
+### Mode B — `inline`
+
+Execute the original workflow below: WebSearch for targets, verify names,
+draft messages, output the full deliverable per the contract.
+
+---
+
+## Output contract (inline mode — lee esto antes de empezar)
+
+Toda invocacion de `contacto` en modo `inline` produce, en este orden y sin excepciones:
 
 1. Un mensaje de LinkedIn al **target primario** (frases 1-2-3, ≤300 caracteres), **precedido de la linea `Sending to:`** definida en el Paso 3.5 y la Verificación de nombre obligatoria al pie de este archivo.
 2. Una **tabla numerada de contactos sugeridos** (primario + alternativos), con la columna `App#` resuelta desde `data/applications.md`.

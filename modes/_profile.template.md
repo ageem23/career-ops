@@ -100,3 +100,30 @@ If you have a live demo/dashboard (check profile.yml), offer access in applicati
 **In evaluations (scoring):**
 - Remote dimension for hybrid outside your country: score **3.0** (not 1.0)
 - Only score 1.0 if JD says "must be on-site 4-5 days/week, no exceptions"
+
+## Skill Behavior Defaults
+
+<!-- ============================================================
+     OPTIONAL — controls whether `contacto` (and any other skill
+     that supports it) runs INLINE in your CLI or emits a
+     copy-paste PROMPT for claude.ai web (with Research mode).
+
+     Set a row to "prompt" if you find the web Claude consistently
+     gives better results for that skill — common for skills that
+     need broad web search and LinkedIn lookups.
+
+     Per-invocation, you can override by saying "run inline" or
+     "give me the prompt" in your message.
+
+     The matching machine-readable block lives in
+     config/profile.yml -> skill_behavior.
+     ============================================================ -->
+
+| Skill | Default mode | Notes |
+|-------|--------------|-------|
+| `contacto` | `inline` | Set to `prompt` if claude.ai web (Research mode) gives you better LinkedIn lookups + name verification |
+| `deep` | `prompt` | `deep` is already prompt-generating by design — leave as `prompt` unless you want the CLI to also do the research run itself |
+
+**Override path per invocation:**
+- "run inline" / "do it yourself" → forces `inline`
+- "give me the prompt" / "as a prompt" → forces `prompt`
