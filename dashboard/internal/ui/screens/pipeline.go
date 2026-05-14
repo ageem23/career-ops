@@ -964,13 +964,22 @@ func (m PipelineModel) renderAppLine(app model.CareerApplication, selected bool)
 		s := lipgloss.NewStyle().Background(m.theme.Overlay).Width(m.width - 4)
 		return padStyle.Render(s.Render(line))
 	case multi:
-		// Surface (#313244) is just light enough above Base (#1e1e2e) to
-		// read as "marked" without competing with the cursor highlight.
-		s := lipgloss.NewStyle().Background(m.theme.Surface).Width(m.width - 4)
+		// A muted mauve — distinct hue from the Blue tracker number so the
+		// "#" column stays readable. Surface (#313244) is the same hue
+		// family as Blue (#89b4fa) and made the number hard to read on
+		// selected rows even with adequate luminance contrast.
+		s := lipgloss.NewStyle().Background(selectedRowBg).Width(m.width - 4)
 		return padStyle.Render(s.Render(line))
 	}
 	return padStyle.Render(line)
 }
+
+// selectedRowBg is the background applied to rows in the multi-select set.
+// Chosen for hue separation from the Blue accent (the tracker-number color)
+// rather than maximum luminance contrast — both backgrounds satisfy WCAG
+// against the row's foregrounds, but blue-on-blue read as "low contrast" to
+// the eye. Muted mauve in the catppuccin family keeps the theme feel.
+var selectedRowBg = lipgloss.Color("#4a3a5e")
 
 func (m PipelineModel) renderPreview() string {
 	app, ok := m.CurrentApp()
@@ -1078,36 +1087,38 @@ func (m PipelineModel) renderHelp() string {
 }
 
 func (m PipelineModel) overlayStatusPicker(body string) string {
-	// Render status picker inline at bottom of body
+	// Render the status picker as a full-width box with a consistent Surface
+	// background. Picker lines used to be short Width(30) strings; with the
+	// new multi-select row backgrounds rendering on the same screen, the
+	// option labels visually competed with the colored rows above. A
+	// full-width menu band fixes the visual seam without changing controls.
 	bodyLines := strings.Split(body, "\n")
 
-	pickerWidth := 30
-	padStyle := lipgloss.NewStyle().Padding(0, 2)
-	borderStyle := lipgloss.NewStyle().
-		Foreground(m.theme.Blue).
-		Bold(true)
+	bandStyle := lipgloss.NewStyle().
+		Background(m.theme.Surface).
+		Foreground(m.theme.Text).
+		Width(m.width).
+		PaddingLeft(2)
 
 	var picker []string
 	title := "Change status:"
 	if n := len(m.selected); n > 0 {
 		title = fmt.Sprintf("Change status for %d apps:", n)
 	}
-	picker = append(picker, padStyle.Render(borderStyle.Render(title)))
+	titleStyle := bandStyle.Bold(true).Foreground(m.theme.Blue)
+	picker = append(picker, titleStyle.Render(title))
 
 	for i, opt := range statusOptions {
-		style := lipgloss.NewStyle().Foreground(m.theme.Text).Width(pickerWidth)
-		if i == m.statusCursor {
-			style = style.Background(m.theme.Overlay).Bold(true)
-		}
+		optStyle := bandStyle
 		prefix := "  "
 		if i == m.statusCursor {
+			optStyle = bandStyle.Background(m.theme.Overlay).Bold(true)
 			prefix = "> "
 		}
 		label := fmt.Sprintf("%s (%s)", opt.label, strings.ToUpper(opt.shortcut))
-		picker = append(picker, padStyle.Render(style.Render(prefix+label)))
+		picker = append(picker, optStyle.Render(prefix+label))
 	}
 
-	// Append picker to body
 	bodyLines = append(bodyLines, picker...)
 	return strings.Join(bodyLines, "\n")
 }
