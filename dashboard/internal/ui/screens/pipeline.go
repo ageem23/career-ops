@@ -1087,16 +1087,17 @@ func (m PipelineModel) renderHelp() string {
 }
 
 func (m PipelineModel) overlayStatusPicker(body string) string {
-	// Render the status picker as a compact bordered box so it visually
-	// pops as a "floating menu" without forcing a full-width background
-	// band — which interacted poorly with bold text in some terminals
-	// (letters appeared to fade into the bg). The border is the visual
-	// demarcation; the option text stays on the terminal default bg.
+	// Compact bordered box. The cursor option uses Reverse video (the
+	// terminal's native invert-colors) instead of Bold + Background +
+	// Width — that combo caused mid-glyph clipping for some option
+	// labels ("Responded" was rendering as "E   DED" in the user's
+	// terminal). Reverse is supported reliably everywhere.
 	bodyLines := strings.Split(body, "\n")
 
 	padStyle := lipgloss.NewStyle().Padding(0, 2)
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Blue)
-	optionWidth := 28
+	dimStyle := lipgloss.NewStyle().Foreground(m.theme.Text)
+	cursorStyle := lipgloss.NewStyle().Foreground(m.theme.Text).Reverse(true)
 
 	title := "Change status:"
 	if n := len(m.selected); n > 0 {
@@ -1106,11 +1107,11 @@ func (m PipelineModel) overlayStatusPicker(body string) string {
 	var content []string
 	content = append(content, titleStyle.Render(title))
 	for i, opt := range statusOptions {
-		style := lipgloss.NewStyle().Foreground(m.theme.Text).Width(optionWidth)
 		prefix := "  "
+		style := dimStyle
 		if i == m.statusCursor {
-			style = style.Background(m.theme.Overlay).Bold(true)
-			prefix = "> "
+			prefix = "▶ "
+			style = cursorStyle
 		}
 		label := fmt.Sprintf("%s (%s)", opt.label, strings.ToUpper(opt.shortcut))
 		content = append(content, style.Render(prefix+label))
