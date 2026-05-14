@@ -185,8 +185,8 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.handleTaskMarkStatus(msg)
 		return m, nil
 
-	case screens.TasksAddMsg:
-		m.handleTaskAdd(msg)
+	case screens.PipelineAddTaskMsg:
+		m.handlePipelineAddTask(msg)
 		return m, nil
 
 	case screens.TasksRefreshMsg:
@@ -335,22 +335,35 @@ func (m *appModel) handleTaskMarkStatus(msg screens.TasksMarkStatusMsg) {
 	m.tasks.SetFlash(fmt.Sprintf("Task #%d %s.", updated.Number, verb))
 }
 
-// handleTaskAdd creates a new manual task with the given title.
-func (m *appModel) handleTaskAdd(msg screens.TasksAddMsg) {
+// handlePipelineAddTask creates a manual task linked to the application
+// selected in the pipeline view. The task's Company is populated from the
+// app row so the task and the application stay in sync without the user
+// having to type the company name twice.
+func (m *appModel) handlePipelineAddTask(msg screens.PipelineAddTaskMsg) {
 	t := model.Task{
-		Type:    "manual",
-		Title:   msg.Title,
-		Status:  "pending",
-		Created: time.Now().Format("2006-01-02"),
+		Type:      "manual",
+		Title:     msg.Title,
+		Status:    "pending",
+		Created:   time.Now().Format("2006-01-02"),
+		Due:       msg.Due,
+		AppNumber: msg.App.Number,
+		Company:   msg.App.Company,
 	}
 	created, err := data.AppendTask(m.careerOpsPath, t)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "WARN: task add failed: %v\n", err)
 		return
 	}
+	target := msg.App.Company
+	if msg.App.Number > 0 {
+		target = fmt.Sprintf("#%d %s", msg.App.Number, msg.App.Company)
+	}
+	// Reload tasks so a later Esc-then-t to the tasks view shows the new row.
 	tasks := data.ParseTasks(m.careerOpsPath)
 	m.tasks = m.tasks.WithReloadedTasks(tasks)
-	m.tasks.SetFlash(fmt.Sprintf("Added task #%d.", created.Number))
+	flash := fmt.Sprintf("Added task #%d for %s.", created.Number, target)
+	m.tasks.SetFlash(flash)
+	fmt.Fprintln(os.Stderr, flash)
 }
 
 // tasksForApp returns the subset of tasks whose AppNumber matches the given

@@ -53,6 +53,14 @@ type PipelineOpenProgressMsg struct{}
 // PipelineOpenTasksMsg is emitted when the tasks screen should open.
 type PipelineOpenTasksMsg struct{}
 
+// PipelineAddTaskMsg requests creation of a manual task linked to an
+// application. Due may be empty for no due date.
+type PipelineAddTaskMsg struct {
+	App   model.CareerApplication
+	Title string
+	Due   string // YYYY-MM-DD or "" for none
+}
+
 type reportSummary struct {
 	archetype string
 	tldr      string
@@ -134,6 +142,9 @@ type PipelineModel struct {
 	// Status picker sub-state
 	statusPicker bool
 	statusCursor int
+	// Add-task prompt sub-state — shared with the report viewer so the two
+	// entry points behave identically. See add_task_prompt.go.
+	addTask addTaskPrompt
 }
 
 // NewPipelineModel creates a new pipeline screen.
@@ -250,6 +261,9 @@ func (m PipelineModel) Update(msg tea.Msg) (PipelineModel, tea.Cmd) {
 		if m.statusPicker {
 			return m.handleStatusPicker(msg)
 		}
+		if m.addTask.active() {
+			return m.handleAddTaskInput(msg)
+		}
 		return m.handleKey(msg)
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -360,6 +374,15 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 			m.statusCursor = 0
 		}
 
+	case "n":
+		// Add a manual task for the selected application. The two-stage
+		// prompt collects title then due date so the task can carry both
+		// without forcing a special syntax. Stage 2 starts at "today" so
+		// the most common case is one Enter away.
+		if _, ok := m.CurrentApp(); ok {
+			m.addTask.open()
+		}
+
 	case "g":
 		if len(m.filtered) > 0 {
 			m.cursor = 0
@@ -461,6 +484,25 @@ func (m PipelineModel) handleStatusPicker(msg tea.KeyMsg) (PipelineModel, tea.Cm
 		}
 	}
 	return m, nil
+}
+
+// handleAddTaskInput routes a key into the shared add-task prompt. On submit
+// (Enter at stage 2), resolves the offset and emits PipelineAddTaskMsg.
+func (m PipelineModel) handleAddTaskInput(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
+	if !m.addTask.handleKey(msg) {
+		return m, nil
+	}
+	app, ok := m.CurrentApp()
+	if !ok {
+		m.addTask.close()
+		return m, nil
+	}
+	title := m.addTask.Title()
+	due := m.addTask.ResolvedDue()
+	m.addTask.close()
+	return m, func() tea.Msg {
+		return PipelineAddTaskMsg{App: app, Title: title, Due: due}
+	}
 }
 
 func (m PipelineModel) loadCurrentReport() tea.Cmd {
@@ -617,6 +659,9 @@ func (m PipelineModel) View() string {
 	// Status picker overlay
 	if m.statusPicker {
 		body = m.overlayStatusPicker(body)
+	}
+	if m.addTask.active() {
+		body = m.overlayAddTaskPrompt(body)
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left,
@@ -911,6 +956,13 @@ func (m PipelineModel) renderHelp() string {
 				keyStyle.Render("Enter") + descStyle.Render(" confirm  ") +
 				keyStyle.Render("Esc") + descStyle.Render(" cancel"))
 	}
+	if m.addTask.active() {
+		return style.Render(
+			keyStyle.Render("type") + descStyle.Render(" input  ") +
+				keyStyle.Render("↑↓") + descStyle.Render(" ±day  ") +
+				keyStyle.Render("Enter") + descStyle.Render(" next/save  ") +
+				keyStyle.Render("Esc") + descStyle.Render(" cancel"))
+	}
 
 	brand := lipgloss.NewStyle().Foreground(m.theme.Overlay).Render("career-ops by santifer.io")
 
@@ -921,6 +973,7 @@ func (m PipelineModel) renderHelp() string {
 		keyStyle.Render("Enter") + descStyle.Render(" report  ") +
 		keyStyle.Render("o") + descStyle.Render(" open URL  ") +
 		keyStyle.Render("c") + descStyle.Render(" change  ") +
+		keyStyle.Render("n") + descStyle.Render(" new task  ") +
 		keyStyle.Render("v") + descStyle.Render(" view  ") +
 		keyStyle.Render("p") + descStyle.Render(" progress  ") +
 		keyStyle.Render("t") + descStyle.Render(" tasks  ") +
@@ -963,6 +1016,25 @@ func (m PipelineModel) overlayStatusPicker(body string) string {
 	// Append picker to body
 	bodyLines = append(bodyLines, picker...)
 	return strings.Join(bodyLines, "\n")
+}
+
+// overlayAddTaskPrompt renders the shared two-stage new-task prompt at the
+// bottom of the body. The actual layout lives in addTaskPrompt.render; this
+// just resolves the target label from the currently-selected application.
+func (m PipelineModel) overlayAddTaskPrompt(body string) string {
+	// Defensive: if the cursor moved off the only filtered row before the
+	// prompt got rendered, just pass the body through. The 'n' handler
+	// guards against opening the prompt without an app, but state could
+	// shift under a future refactor.
+	app, ok := m.CurrentApp()
+	if !ok {
+		return body
+	}
+	target := fmt.Sprintf("#%d %s", app.Number, app.Company)
+	if app.Number == 0 {
+		target = app.Company
+	}
+	return m.addTask.render(body, m.theme, target)
 }
 
 // -- Helpers --
