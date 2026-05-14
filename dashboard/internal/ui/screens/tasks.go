@@ -469,7 +469,6 @@ func (m TasksModel) overlayDetails(view string) string {
 	labelStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Sky)
 	valueStyle := lipgloss.NewStyle().Foreground(m.theme.Text)
 	dimStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
-	borderStyle := lipgloss.NewStyle().Foreground(m.theme.Overlay)
 
 	header := titleStyle.Render(fmt.Sprintf("Task #%d", t.Number))
 
@@ -526,7 +525,6 @@ func (m TasksModel) overlayDetails(view string) string {
 	vw := lipgloss.Width(view)
 	vh := strings.Count(view, "\n") + 1
 	placed := lipgloss.Place(vw, vh, lipgloss.Center, lipgloss.Center, box)
-	_ = borderStyle
 	return placed
 }
 
