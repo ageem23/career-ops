@@ -136,7 +136,9 @@ func (m *TasksModel) SetFlash(text string) {
 
 // FocusOnApp picks the tab and cursor position that surfaces the first task
 // linked to the given application number. Prefers Pending over Completed so
-// the user lands on something actionable. No-op when no task matches.
+// the user lands on something actionable. When no task matches, the model
+// is parked on the Pending tab at the top so callers can flash a "no tasks
+// linked" message without leaving the view in a stale state.
 func (m *TasksModel) FocusOnApp(appNumber int) {
 	if appNumber <= 0 {
 		return
