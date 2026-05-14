@@ -22,11 +22,6 @@ type TasksMarkStatusMsg struct {
 	NewStatus string // "done" | "skipped"
 }
 
-// TasksAddMsg requests creation of a new manual task.
-type TasksAddMsg struct {
-	Title string
-}
-
 // TasksRefreshMsg requests a full tasks reload (e.g. re-run sync-tasks.mjs).
 type TasksRefreshMsg struct{}
 
@@ -57,10 +52,6 @@ type TasksModel struct {
 	activeTab     string
 	width, height int
 	theme         theme.Theme
-
-	// Input prompt for new manual task
-	inputMode bool
-	inputBuf  string
 
 	// Details overlay state
 	detailsMode bool
@@ -166,9 +157,6 @@ func (m *TasksModel) FocusOnApp(appNumber int) {
 func (m TasksModel) Update(msg tea.Msg) (TasksModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if m.inputMode {
-			return m.handleInput(msg)
-		}
 		if m.detailsMode {
 			// Any key dismisses the overlay; Esc/q is the canonical way.
 			switch msg.String() {
@@ -292,41 +280,8 @@ func (m TasksModel) handleKey(msg tea.KeyMsg) (TasksModel, tea.Cmd) {
 			m.detailsMode = true
 			m.detailTask = t
 		}
-	case "n":
-		m.inputMode = true
-		m.inputBuf = ""
 	case "r":
 		return m, func() tea.Msg { return TasksRefreshMsg{} }
-	}
-	return m, nil
-}
-
-func (m TasksModel) handleInput(msg tea.KeyMsg) (TasksModel, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyEscape:
-		m.inputMode = false
-		m.inputBuf = ""
-		return m, nil
-	case tea.KeyEnter:
-		title := strings.TrimSpace(m.inputBuf)
-		m.inputMode = false
-		m.inputBuf = ""
-		if title == "" {
-			return m, nil
-		}
-		return m, func() tea.Msg { return TasksAddMsg{Title: title} }
-	case tea.KeyBackspace:
-		if len(m.inputBuf) > 0 {
-			r := []rune(m.inputBuf)
-			m.inputBuf = string(r[:len(r)-1])
-		}
-		return m, nil
-	case tea.KeyRunes, tea.KeySpace:
-		if len([]rune(m.inputBuf)) >= 200 {
-			return m, nil
-		}
-		m.inputBuf += string(msg.Runes)
-		return m, nil
 	}
 	return m, nil
 }
@@ -412,22 +367,18 @@ func (m TasksModel) View() string {
 	tabs := m.renderTabs()
 	body := m.renderBody()
 	help := m.renderHelp()
-	prompt := m.renderPrompt()
 	flash := m.renderFlash()
 
 	extraLines := 0
-	if prompt != "" {
-		extraLines = strings.Count(prompt, "\n") + 1
-	}
 	if flash != "" {
-		extraLines += strings.Count(flash, "\n") + 1
+		extraLines = strings.Count(flash, "\n") + 1
 	}
 
 	bodyLines := strings.Split(body, "\n")
 	if m.scrollOffset > 0 && m.scrollOffset < len(bodyLines) {
 		bodyLines = bodyLines[m.scrollOffset:]
 	}
-	avail := m.height - 5 - extraLines // header + tabs(2) + help, minus prompt/flash
+	avail := m.height - 5 - extraLines // header + tabs(2) + help, minus flash
 	if avail < 3 {
 		avail = 3
 	}
@@ -437,9 +388,6 @@ func (m TasksModel) View() string {
 	body = strings.Join(bodyLines, "\n")
 
 	parts := []string{header, tabs, body}
-	if prompt != "" {
-		parts = append(parts, prompt)
-	}
 	if flash != "" {
 		parts = append(parts, flash)
 	}
@@ -713,18 +661,6 @@ func (m TasksModel) statusStyle(status string) lipgloss.Style {
 	}
 }
 
-func (m TasksModel) renderPrompt() string {
-	if !m.inputMode {
-		return ""
-	}
-	pad := lipgloss.NewStyle().Padding(0, 2)
-	label := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Blue).Render("New task title: ")
-	buf := lipgloss.NewStyle().Foreground(m.theme.Text).Render(m.inputBuf)
-	cursor := lipgloss.NewStyle().Foreground(m.theme.Text).Render("▌")
-	hint := lipgloss.NewStyle().Foreground(m.theme.Subtext).Render("   (Enter to add, Esc to cancel)")
-	return pad.Render(label + buf + cursor + hint)
-}
-
 func (m TasksModel) renderFlash() string {
 	if m.flash.text == "" || time.Now().After(m.flash.until) {
 		return ""
@@ -745,17 +681,6 @@ func (m TasksModel) renderHelp() string {
 	descStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
 
 	brand := lipgloss.NewStyle().Foreground(m.theme.Overlay).Render("career-ops by santifer.io")
-
-	if m.inputMode {
-		keys := keyStyle.Render("type") + descStyle.Render(" title  ") +
-			keyStyle.Render("Enter") + descStyle.Render(" save  ") +
-			keyStyle.Render("Esc") + descStyle.Render(" cancel")
-		gap := m.width - lipgloss.Width(keys) - lipgloss.Width(brand) - 2
-		if gap < 1 {
-			gap = 1
-		}
-		return style.Render(keys + strings.Repeat(" ", gap) + brand)
-	}
 
 	var actionKeys string
 	if m.activeTab == tasksTabCompleted {
