@@ -216,19 +216,20 @@ Donde `{company-slug}` es el nombre de empresa en lowercase, sin espacios, con g
 (15-20 keywords del JD para ATS)
 ```
 
-### Paso 4 — Generar PDF (solo si score ≥ 4.0)
+### Paso 4 — Generar PDF (configurable; default-disabled)
 
-**Gate:** This step ONLY runs when the score from Paso 2 is **≥ 4.0/5**. For everything below that threshold, skip this entire step — the user can generate a tailored PDF on demand later via `/career-ops pdf {company-slug}` using the report from Paso 3 as input.
+**Gate:** Read `config/profile.yml` → `auto_pdf_score_threshold`. If the key is absent, default to **`5.1`** (effectively disabled — the max possible score is 5.0). This step ONLY runs when the score from Paso 2 is **≥ the resolved threshold**. For everything below it, skip this entire step — the user can generate a tailored PDF on demand later via `/career-ops pdf {company-slug}` using the report from Paso 3 as input.
 
-**Rationale:** in practice the user only applies to roles scoring 4.0+. Pre-generating PDFs for the long tail of 2.x/3.x scores burns ~30–60s of wall time per worker (Playwright launch + HTML render) and produces files that never get used. Saving the generation for after the score is known avoids both costs.
+**Rationale:** Generating a tailored PDF costs ~30–60s per offer (Playwright launch + HTML render) and produces files the user rarely uses — most roles score 2.x/3.x and never reach application. Default to "no auto-PDF" and let the user opt in by setting `auto_pdf_score_threshold` to a real value (e.g. `4.0`) when they decide that tier is worth pre-generating. Both Path A (`/career-ops pipeline`) and Path B (this batch worker) read the same config key for consistency.
 
-**If score < 4.0:**
+**If score < threshold (or threshold default-disabled):**
 - Skip steps 1–14 below.
+- In the report header use: `**PDF:** not generated — run /career-ops pdf {company-slug} to create on demand`.
 - In Paso 5 (tracker line) use `pdf_emoji` = `❌`.
 - In Paso 6 (output JSON) set `"pdf": null`.
 - Done — move to Paso 5.
 
-**If score ≥ 4.0**, generate the tailored PDF:
+**If score ≥ threshold**, generate the tailored PDF:
 
 1. Lee `cv.md` + `i18n.ts`
 2. Extrae 15-20 keywords del JD

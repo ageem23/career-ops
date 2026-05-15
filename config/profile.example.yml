@@ -92,3 +92,21 @@ skill_behavior:
     default_mode: prompt   # prompt (default) | inline
   deep:
     default_mode: prompt   # deep is prompt-generating by design
+
+# Auto-PDF threshold during evaluation (used by `/career-ops pipeline` and
+# `bash batch/batch-runner.sh`).
+#
+# Generating a tailored CV PDF costs ~30-60s per offer (Playwright launch +
+# HTML render) and most offers in a scan score 2.x/3.x and never become an
+# actual application — so the PDF goes unused. To avoid that waste, the
+# evaluation pipeline only auto-generates a PDF when the offer's score is
+# >= this threshold.
+#
+# Default (key absent OR commented out): 5.1 — effectively disabled, since
+# the maximum possible score is 5.0. Reports are always written; PDFs are
+# only generated when you opt-in.
+#
+# Set this to a real number (e.g. 4.0) to opt in to auto-PDF for offers at
+# or above that score. Whatever doesn't make the cut can still be produced
+# on demand later via `/career-ops pdf {company-slug}`.
+# auto_pdf_score_threshold: 4.0
