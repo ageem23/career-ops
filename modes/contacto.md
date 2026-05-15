@@ -1,53 +1,105 @@
 # Modo: contacto -- LinkedIn Power Move
 
-## Mode selection (CHECK BEFORE EXECUTING)
+## 🚦 STOP — RESOLVE ACTIVE MODE FIRST (before reading anything else)
 
-Two execution modes are supported. The user picks which one is the default in
-`modes/_profile.md` → `## Skill Behavior Defaults` (or `config/profile.yml` →
-`skill_behavior.contacto.default_mode`). Resolution order:
+This skill has **two execution modes**. You MUST decide which one is active **before** reading any other section of this file. Both modes are mutually exclusive — running both is a bug.
 
-1. **Per-invocation override** — if the user explicitly says "run inline" /
-   "do it yourself" / "execute" → use `inline`. If they say "give me the
-   prompt" / "as a prompt" / "for claude.ai" → use `prompt`.
-2. **`modes/_profile.md` → "Skill Behavior Defaults"** — read this section
-   and honor whatever the user wrote there. This is the authoritative source.
-3. **`config/profile.yml` → `skill_behavior.contacto.default_mode`** — if
-   `_profile.md` is silent, fall back to this machine-readable value.
-4. **No preference set** — default to `prompt` (web Claude with Research mode does the broad LinkedIn lookups + name verification more reliably than Claude Code's WebSearch for this skill).
+**Resolution procedure (do this now):**
 
-### Mode A — `prompt`
+1. **Per-invocation override beats everything.** Scan the user's current message + the immediately preceding turn:
+   - "run inline" / "do it yourself" / "execute" / "search LinkedIn" → mode = `inline`
+   - "give me the prompt" / "as a prompt" / "for claude.ai" / "research prompt" → mode = `prompt`
+2. **Read `modes/_profile.md`.** Look for `## Skill Behavior Defaults`. If a row for `contacto` exists, use its value.
+3. **Fallback to `config/profile.yml`** → `skill_behavior.contacto.default_mode`.
+4. **No preference anywhere** → default to **`prompt`** (web Claude with Research mode handles the LinkedIn lookups + name verification more reliably than Claude Code's WebSearch).
 
-Output a **single copy-paste-ready prompt** the user pastes into a new
-claude.ai web chat (with Research mode enabled) — do NOT execute the LinkedIn
-lookups yourself.
+**ROUTING — pick exactly one:**
 
-The prompt MUST:
-- Be a single fenced markdown code block so it's one-click-to-copy.
-- Be customized with the specific company + role + Mathieu's relevant context
-  (CTO 24 years at a consultancy, agentic AI rollout, etc. — pull from
-  `cv.md`, `_profile.md`, `proof-points.md`).
-- Embed the **name-verification protocol** below (`Sending to:` lock-in,
-  the explicit verification checklist) so the web Claude follows it.
-- Specify the 3-sentence message structures by contact type
-  (Recruiter / Hiring Manager / Peer / Interviewer) verbatim from the
-  "Frameworks per contact type" section below.
-- End with a clear `**Deliverable:**` line stating what the web Claude
-  should return (verified targets, lock-in lines, custom messages,
-  alternates, sequencing recommendation).
+| Resolved mode | What to do |
+|---------------|------------|
+| `prompt` | Go to **"## MODE A — Prompt output"** below. **DO NOT** read or execute MODE B. Stop at the end of Mode A. |
+| `inline` | Skip MODE A entirely. Execute **"## MODE B — Inline workflow"**. |
 
-After the code block, output the **table of suggested contacts** (companies
-the user has applied to, mapped from `data/applications.md`) AND the
-**`add-task.mjs` copy-paste block** — these stay even in prompt mode so the
-user can still track follow-up tasks.
-
-### Mode B — `inline`
-
-Execute the original workflow below: WebSearch for targets, verify names,
-draft messages, output the full deliverable per the contract.
+If you find yourself drafting a `Sending to:` line, opening WebSearch tabs, or composing a LinkedIn message body — and you have NOT confirmed mode = `inline` — you are in the wrong mode. Stop, re-read this section, and resolve.
 
 ---
 
-## Output contract (inline mode — lee esto antes de empezar)
+## MODE A — Prompt output (when resolved mode = `prompt`)
+
+Your job is to emit a **single copy-paste-ready research prompt** that the user pastes into a new claude.ai web chat with **Research mode** enabled. You do NOT perform LinkedIn lookups, name verification, or message drafting yourself in this mode — the web Claude does all of that with better tooling.
+
+**Output structure (in this exact order):**
+
+1. A short one-line intro: `Paste this into claude.ai with Research mode enabled:`
+2. **One single fenced markdown code block** containing the full research prompt (template below). The entire prompt MUST be inside one code block so it's one-click-to-copy.
+3. After the code block: the contacts table + `add-task.mjs` copy-paste block (per **Paso 5** and **Paso 6** in MODE B below — those still emit in prompt mode so the user can track follow-ups even without doing the lookups themselves).
+
+**Prompt template — customize the placeholders before emitting:**
+
+````markdown
+## Contacto Research: {Company} — {Role}
+
+**My profile (for message tailoring):**
+- {1-line summary from cv.md headline + key proof points from _profile.md narrative}
+- LinkedIn: {linkedin url from config/profile.yml}
+
+**Target role:** {Role} at {Company}{ — comp/location notes if known}. Job URL: {URL if provided}.
+
+---
+
+### 1. Identify Targets (find 4–6 real people, in priority order)
+
+**Priority 1 — Hiring Manager** for this role. {Likely titles, where to look — engineering blog, "People at {Company}" filtered by senior eng, podcast/talk appearances.}
+**Priority 2 — Engineering Managers / Directors** in the relevant org. {Where to cross-reference: company eng blog authors, GitHub org, conference talks.}
+**Priority 3 — Technical recruiter** assigned to roles at this level/company. {LinkedIn "Talent Acquisition" + this company.}
+**Priority 4 — One or two peer ICs** on the relevant team. {Staff/Principal/Senior eng on the same org.}
+
+For each target, return: verified full name (copy-paste from LinkedIn), LinkedIn URL, current title, one-sentence reason they're the right target, and one unique hook from their public footprint (recent talk, blog post, GitHub repo, podcast, post, tenure milestone).
+
+### 2. Name Verification Protocol (MANDATORY before drafting)
+
+Past incident: a contact message went out with the right LinkedIn URL but the wrong first name. To make that impossible, for each target you'll draft to:
+1. Quote the full name verbatim from their LinkedIn profile (do not retype from memory).
+2. State the exact salutation form you'll use (first name, preferred/known-as name in parentheses if any, or honorific + last name).
+3. Flag any failure modes: nickname in parentheses, compound first names, accented characters, two same-company employees with similar names.
+4. State the lock-in line: `Recipient: {Full Name} (salutation: "{First Name}") — {LinkedIn URL}`
+
+If you can't confidently verify, mark "name unverified — DO NOT SEND" and skip drafting for that target.
+
+### 3. Draft a 3-Sentence Connection Message (per target, ≤ 300 characters)
+
+Each message MUST start with the verification metadata line (NOT counted against 300 limit, NOT sent in the actual message):
+
+> **Sending to:** {Full Name} ({LinkedIn URL}) — addressed as "{salutation in message}"
+
+Then the message body, using these per-contact-type structures:
+
+**Hiring Manager:** Hook (specific challenge their team faces) → Proof (one quantifiable accomplishment) → CTA ("Would love to hear how your team is approaching {challenge}").
+**Recruiter:** Fit (role + experience + location match) → Screening pre-empt (answer their obvious questions) → CTA ("Happy to share my CV if it aligns").
+**Peer:** Genuine interest (reference to their specific public work) → Parallel (something I'm doing in the same space, NOT a job pitch) → CTA ("Would love to hear your take on {their topic}"). **Hard rule:** NEVER ask for a referral or hint at hiring.
+**Interviewer:** Research (reference their work/trajectory) → Light connection (my adjacent experience) → CTA ("Looking forward to our conversation on {date}").
+
+No corporate-speak. No "I'm passionate about." ≤ 300 chars hard limit.
+
+### 4. Alternative Targets
+For each primary, one alternate at the same level with a one-sentence reason — a defensible second choice if the primary doesn't respond within a week.
+
+---
+
+**Deliverable:** Up to 6 verified targets, lock-in lines per target, custom 3-sentence messages per target, alternates, and a 1-sentence sequencing recommendation (who to message first, who to wait on).
+````
+
+After the code block, emit the contacts table and the `add-task.mjs` block per **Paso 5** and **Paso 6** in MODE B.
+
+**END OF MODE A. Do not proceed into MODE B.**
+
+---
+
+## MODE B — Inline workflow (when resolved mode = `inline`)
+
+⚠️ Only execute everything below if you resolved mode = `inline` in the routing step above.
+
+### Output contract (lee esto antes de empezar)
 
 Toda invocacion de `contacto` en modo `inline` produce, en este orden y sin excepciones:
 
