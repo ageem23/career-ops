@@ -184,7 +184,7 @@ Donde `{company-slug}` es el nombre de empresa en lowercase, sin espacios, con g
 **Score:** {X/5}
 **Legitimacy:** {High Confidence | Proceed with Caution | Suspicious}
 **URL:** {URL de la oferta original}
-**PDF:** career-ops/output/cv-candidate-{company-slug}-{{DATE}}.pdf
+**PDF:** {career-ops/output/cv-candidate-{company-slug}-{{DATE}}.pdf if score ≥ 4.0, else `not generated — run /career-ops pdf {company-slug} to create on demand`}
 **Batch ID:** {{ID}}
 
 ---
@@ -216,7 +216,19 @@ Donde `{company-slug}` es el nombre de empresa en lowercase, sin espacios, con g
 (15-20 keywords del JD para ATS)
 ```
 
-### Paso 4 — Generar PDF
+### Paso 4 — Generar PDF (solo si score ≥ 4.0)
+
+**Gate:** This step ONLY runs when the score from Paso 2 is **≥ 4.0/5**. For everything below that threshold, skip this entire step — the user can generate a tailored PDF on demand later via `/career-ops pdf {company-slug}` using the report from Paso 3 as input.
+
+**Rationale:** in practice the user only applies to roles scoring 4.0+. Pre-generating PDFs for the long tail of 2.x/3.x scores burns ~30–60s of wall time per worker (Playwright launch + HTML render) and produces files that never get used. Saving the generation for after the score is known avoids both costs.
+
+**If score < 4.0:**
+- Skip steps 1–14 below.
+- In Paso 5 (tracker line) use `pdf_emoji` = `❌`.
+- In Paso 6 (output JSON) set `"pdf": null`.
+- Done — move to Paso 5.
+
+**If score ≥ 4.0**, generate the tailored PDF:
 
 1. Lee `cv.md` + `i18n.ts`
 2. Extrae 15-20 keywords del JD
@@ -238,6 +250,7 @@ node generate-pdf.mjs \
   --format={letter|a4}
 ```
 14. Reporta: ruta PDF, nº páginas, % cobertura keywords
+15. In Paso 5 use `pdf_emoji` = `✅`; in Paso 6 set `"pdf"` to the output path.
 
 **Reglas ATS:**
 - Single-column (sin sidebars)
