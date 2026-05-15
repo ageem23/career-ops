@@ -72,3 +72,23 @@ cv:
   # Find it in your Canva design URL: https://www.canva.com/design/DAxxxxxxx/...
   # The ID starts with "D" and is 11 characters long.
   # canva_resume_design_id: "DAxxxxxxxxx"
+
+# Optional per-skill behavior overrides.
+#
+# Some skills (notably `contacto`) need broad web search + LinkedIn lookups
+# that the web Claude (with Research mode) does much better than Claude Code's
+# WebSearch. For those skills, set `default_mode: prompt` and the skill will
+# emit a single copy-paste prompt that you paste into a new claude.ai chat
+# with Research enabled — instead of trying to execute the workflow inline.
+#
+# The full description (with override path) lives in modes/_profile.md ->
+# "Skill Behavior Defaults". This block exists so the same preference is also
+# machine-readable for future tooling.
+#
+# Per-invocation override: tell the agent "run inline" or "give me the prompt"
+# in your message to force one mode for a single invocation.
+skill_behavior:
+  contacto:
+    default_mode: prompt   # prompt (default) | inline
+  deep:
+    default_mode: prompt   # deep is prompt-generating by design
