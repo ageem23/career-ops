@@ -9,8 +9,10 @@ Procesa URLs de ofertas acumuladas en `data/pipeline.md`. El usuario agrega URLs
    a. Calcular siguiente `REPORT_NUM` secuencial (leer `reports/`, tomar el número más alto + 1)
    b. **Extraer JD** usando Playwright (browser_navigate + browser_snapshot) → WebFetch → WebSearch
    c. Si la URL no es accesible → marcar como `- [!]` con nota y continuar
-   d. **Ejecutar auto-pipeline completo**: Evaluación A-F → Report .md → PDF (si score >= 3.0) → Tracker
+   d. **Ejecutar auto-pipeline completo**: Evaluación A-F → Report .md → PDF (si score >= 4.0) → Tracker
    e. **Mover de "Pendientes" a "Procesadas"**: `- [x] #NNN | URL | Empresa | Rol | Score/5 | PDF ✅/❌`
+
+   **Sobre el PDF gate (score >= 4.0):** En la práctica el usuario solo aplica a roles que puntúan 4.0+. Generar un PDF tailored para puntuaciones 2.x/3.x suma ~30–60s por entrada (Playwright launch + HTML render) y produce archivos que casi nunca se usan. Para 3.0–3.9 escribir el report y dejar el PDF como `not generated — run /career-ops pdf {company-slug} to create on demand`. Para 4.0+ generar el PDF como siempre. Este gate coincide con el de `batch/batch-prompt.md` (Path B) para que ambos modos se comporten igual.
 3. **Si hay 3+ URLs pendientes**, lanzar agentes en paralelo (Agent tool con `run_in_background`) para maximizar velocidad.
 4. **Al terminar**, mostrar tabla resumen:
 
