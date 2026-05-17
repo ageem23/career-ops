@@ -20,6 +20,14 @@
 #   4. Adjust search_queries for your preferred job boards
 #   5. Set enabled: false on companies you don't care about
 
+# -- Auto mid-filter --
+# When a scan adds this many or more new offers to the pipeline, scan.mjs
+# automatically runs mid-filter.mjs (Haiku-powered JD-snippet scoring) to cull
+# obvious mid-tier rejects before the full Sonnet batch.
+#   Set to 0 to disable. Override per-run with `node scan.mjs --no-auto-filter`.
+#   Requires ANTHROPIC_API_KEY or the claude CLI (mid-filter.mjs's requirement).
+auto_mid_filter_threshold: 20
+
 # -- Location filter (optional) --
 # Filter scanned jobs by location. Applied AFTER title filter, BEFORE dedup.
 # If this entire block is absent, all locations pass (current default behavior).
