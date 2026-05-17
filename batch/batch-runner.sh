@@ -23,7 +23,12 @@ APPLICATIONS_FILE="$PROJECT_DIR/data/applications.md"
 LOCK_FILE="$BATCH_DIR/batch-runner.pid"
 STATE_LOCK_DIR="$BATCH_DIR/.batch-state.lock"
 STATE_LOCK_PID_FILE="$STATE_LOCK_DIR/pid"
-STATE_LOCK_TIMEOUT_SECONDS=30
+STATE_LOCK_TIMEOUT_SECONDS=60
+# How often (in seconds of wall time) the parallel-mode wait loop runs the
+# orphan sweep to recover state rows where a worker finished but update_state
+# silently failed (e.g. lock-acquire timeout). 0 disables the periodic sweep;
+# the end-of-batch sweep still runs.
+ORPHAN_SWEEP_INTERVAL_SECONDS=30
 MAIN_PID="${BASHPID:-$$}"
 
 # Defaults
@@ -294,6 +299,30 @@ update_state() {
   run_with_state_lock update_state_unlocked "$@"
 }
 
+# Atomic compare-and-set: only patch a row to "completed" if its current
+# status is still "processing". Used by sweep_orphans to avoid racing
+# worker updates that legitimately marked the row "skipped" / "failed" /
+# "completed" between the sweep's snapshot of processing IDs and the
+# patch step. Returns 0 if the row was patched, 1 if it was no longer
+# processing (caller should skip silently).
+# Caller must hold STATE_LOCK_DIR while this runs.
+update_state_if_processing_unlocked() {
+  local id="$1" url="$2" started="$3" completed="$4" report_num="$5" score="$6" retries="$7"
+  if [[ ! -f "$STATE_FILE" ]]; then
+    return 1
+  fi
+  local current
+  current=$(awk -F'\t' -v id="$id" '$1==id {print $3; exit}' "$STATE_FILE")
+  if [[ "$current" != "processing" ]]; then
+    return 1
+  fi
+  update_state_unlocked "$id" "$url" "completed" "$started" "$completed" "$report_num" "$score" "-" "$retries"
+}
+
+update_state_if_processing() {
+  run_with_state_lock update_state_if_processing_unlocked "$@"
+}
+
 reserve_report_num_unlocked() {
   local id="$1" url="$2" started="$3" retries="$4"
 
@@ -395,6 +424,89 @@ process_offer() {
     error_msg=$(tail -5 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c1-200 || echo "Unknown error (exit code $exit_code)")
     update_state "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries"
     echo "    ❌ Failed (attempt $retries, exit code $exit_code)"
+  fi
+}
+
+# Recover orphan rows in batch-state.tsv where status=processing but the
+# worker's log JSON shows it actually completed. This happens when
+# acquire_state_lock returns non-zero (mkdir race on burst completions,
+# stale lock timeout) and the update_state call inside process_offer fails
+# silently — the caller doesn't check the return code and the row stays
+# "processing" forever. Without this sweep, the user has to patch state
+# manually and the slot is wasted until they do.
+#
+# Called periodically during the parallel wait loop AND once at end-of-batch
+# (before merge_tracker) so anything still slipping through gets caught.
+sweep_orphans() {
+  local phase="${1:-sweep}"
+  local patched=0
+  local processing_ids
+  processing_ids=$(awk -F'\t' 'NR>1 && $3=="processing" {print $1}' "$STATE_FILE" 2>/dev/null)
+  [[ -z "$processing_ids" ]] && return 0
+
+  # Workers that completed within the last (lock_timeout + buffer) seconds might
+  # still be queuing for the state lock — patching their state now would race
+  # with their own update_state call and inflate the recovered count with
+  # non-orphans. Past this window the worker has either succeeded (state row
+  # already updated, we'd skip it) or given up (timed out / crashed), so any
+  # row still in `processing` is a genuine orphan worth recovering.
+  #
+  # The freshness gate is bypassed for the "end-of-batch" phase: at that point
+  # every worker has been reaped (main() waited on every spawned pid), so there
+  # is no remaining lock-queue race to avoid. Leaving the gate active here
+  # would leave just-completed orphans behind for a future invocation.
+  local orphan_min_age=$((STATE_LOCK_TIMEOUT_SECONDS + 30))
+  local now_epoch
+  now_epoch=$(date +%s)
+
+  for id in $processing_ids; do
+    # Find the most recent log for this id (logs are named {report_num}-{id}.log).
+    # ls fails with a non-zero exit when the glob matches nothing; under
+    # `set -euo pipefail` that would kill the script, so swallow with `|| log=""`
+    # and let the empty-string check below handle it.
+    local log
+    log=$(ls -t "$LOGS_DIR"/*-"${id}".log 2>/dev/null | head -1) || log=""
+    [[ -z "$log" ]] && continue
+    # Only recover if the worker JSON shows completion. Empty / partial logs
+    # (silent worker death) stay as "processing" so the human can decide
+    # whether to mark them failed and retry.
+    grep -q '"status": "completed"' "$log" || continue
+
+    # Freshness check: skip rows where the worker MAY still be holding/queuing
+    # for the state lock. Skipped entirely at end-of-batch (all workers reaped).
+    if [[ "$phase" != "end-of-batch" ]]; then
+      local log_epoch
+      log_epoch=$(date -r "$log" +%s 2>/dev/null || echo 0)
+      local log_age=$((now_epoch - log_epoch))
+      if (( log_age < orphan_min_age )); then
+        continue
+      fi
+    fi
+
+    local recovered_score recovered_report recovered_ts
+    recovered_score=$(grep '"score":' "$log" | head -1 | sed -E 's/.*"score": ([0-9.]+).*/\1/')
+    recovered_report=$(grep '"report_num":' "$log" | head -1 | sed -E 's/.*"report_num": "?([0-9]+)"?.*/\1/')
+    recovered_ts=$(date -u -r "$log" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Preserve started_at + url + retries from the existing row
+    local existing
+    existing=$(awk -F'\t' -v id="$id" '$1==id {print; exit}' "$STATE_FILE")
+    local existing_url existing_started existing_retries
+    IFS=$'\t' read -r _ existing_url _ existing_started _ _ _ _ existing_retries <<<"$existing"
+
+    # Compare-and-set: only write if the row is still "processing" under
+    # the lock. Between this loop's snapshot and now, a worker may have
+    # legitimately patched it to "skipped" / "failed" / "completed";
+    # blindly writing "completed" would clobber that. update_state_if_processing
+    # returns 1 if the row changed underneath us; treat that as a quiet skip.
+    if update_state_if_processing "$id" "$existing_url" "$existing_started" "$recovered_ts" "$recovered_report" "$recovered_score" "${existing_retries:-0}"; then
+      echo "    🔧 [${phase}] recovered orphan #${id} (score: ${recovered_score}, report: ${recovered_report})"
+      patched=$((patched + 1))
+    fi
+  done
+
+  if (( patched > 0 )); then
+    echo "    [${phase}] recovered ${patched} orphan(s) total"
   fi
 }
 
@@ -560,6 +672,7 @@ main() {
     local running=0
     local -a pids=()
     local -a pid_ids=()
+    local last_sweep=$SECONDS
 
     for i in "${!pending_ids[@]}"; do
       # Wait if we're at parallel limit
@@ -576,6 +689,17 @@ main() {
         # Compact arrays
         pids=("${pids[@]}")
         pid_ids=("${pid_ids[@]}")
+
+        # Periodic orphan sweep — recovers slots where a worker finished
+        # but its state row didn't update (lock race). Without this, the
+        # main loop counts those slots as "in flight" forever and effective
+        # parallelism drops over time. Runs from the orchestrator thread,
+        # not from workers, so no extra lock contention.
+        if (( ORPHAN_SWEEP_INTERVAL_SECONDS > 0 && SECONDS - last_sweep >= ORPHAN_SWEEP_INTERVAL_SECONDS )); then
+          sweep_orphans "mid-run"
+          last_sweep=$SECONDS
+        fi
+
         sleep 1
       done
 
@@ -591,6 +715,11 @@ main() {
       wait "$pid" 2>/dev/null || true
     done
   fi
+
+  # Final orphan sweep — catch anything that slipped past the periodic check.
+  # Runs in both sequential and parallel modes for consistency. Cheap when
+  # there's nothing to recover.
+  sweep_orphans "end-of-batch"
 
   # Merge tracker additions
   merge_tracker
