@@ -32,8 +32,14 @@ export function normalizeCompany(name) {
 export function normalizeRole(role) {
   return role.toLowerCase()
     .replace(/[()]/g, ' ')
+    // Replace runs of unsupported punctuation with a single space (was
+    // dropped entirely, which collapsed "VP,Engineering" → "vpengineering"
+    // and produced bogus single-token roles that slipped past dedup).
+    .replace(/[^a-z0-9 /]+/g, ' ')
+    // Canonicalize slash separators so "AI/ML Engineer" and
+    // "AI / ML Engineer" produce identical output.
+    .replace(/\s*\/\s*/g, '/')
     .replace(/\s+/g, ' ')
-    .replace(/[^a-z0-9 /]/g, '')
     .trim();
 }
 
