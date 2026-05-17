@@ -22,6 +22,7 @@
  */
 
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'fs';
+import { spawn } from 'child_process';
 import { pathToFileURL, fileURLToPath } from 'url';
 import path from 'path';
 import yaml from 'js-yaml';
@@ -293,6 +294,7 @@ async function main() {
   const args = process.argv.slice(2);
   const dryRun = args.includes('--dry-run');
   const noSuggest = args.includes('--no-suggest');
+  const noAutoFilter = args.includes('--no-auto-filter');
   const companyFlag = args.indexOf('--company');
   const filterCompany = companyFlag !== -1 ? args[companyFlag + 1]?.toLowerCase() : null;
   const loginFlag = args.indexOf('--login');
@@ -628,6 +630,38 @@ async function main() {
       // Don't let a suggestion-render failure break the scan summary.
       console.error(`⚠ filter suggestions skipped: ${err.message}`);
     }
+  }
+  // Auto mid-filter: when a scan adds a lot of offers, the full Sonnet batch
+  // gets expensive fast. Run mid-filter.mjs first to cull obvious mid-tier
+  // rejects with Haiku. Threshold lives in portals.yml so the user can tune it.
+  const autoThresholdRaw = config.auto_mid_filter_threshold;
+  let autoThreshold = 20;
+  if (autoThresholdRaw !== undefined) {
+    if (Number.isFinite(autoThresholdRaw) && autoThresholdRaw >= 0) {
+      autoThreshold = autoThresholdRaw;
+    } else {
+      console.error(`⚠ portals.yml: auto_mid_filter_threshold must be a non-negative number (got ${JSON.stringify(autoThresholdRaw)}). Falling back to default ${autoThreshold}.`);
+    }
+  }
+  if (!dryRun && !noAutoFilter && autoThreshold > 0 && newOffers.length >= autoThreshold) {
+    console.log(`\n${'━'.repeat(45)}`);
+    console.log(`Auto mid-filter: ${newOffers.length} new offers ≥ threshold ${autoThreshold}`);
+    console.log(`Running mid-filter.mjs to cull mid-tier rejects (Haiku)...`);
+    console.log(`${'━'.repeat(45)}`);
+    const midPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'mid-filter.mjs');
+    await new Promise(resolve => {
+      const child = spawn(process.execPath, [midPath], { stdio: 'inherit' });
+      child.on('exit', code => {
+        if (code !== 0) {
+          console.error(`\n⚠ mid-filter.mjs exited with code ${code}. Configure ANTHROPIC_API_KEY or the claude CLI, then run \`node mid-filter.mjs\` manually.`);
+        }
+        resolve();
+      });
+      child.on('error', err => {
+        console.error(`\n⚠ couldn't launch mid-filter.mjs: ${err.message}`);
+        resolve();
+      });
+    });
   }
 
   console.log(`\n→ Run /career-ops pipeline to evaluate new offers.`);
