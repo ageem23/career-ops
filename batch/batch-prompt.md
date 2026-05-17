@@ -184,7 +184,7 @@ Donde `{company-slug}` es el nombre de empresa en lowercase, sin espacios, con g
 **Score:** {X/5}
 **Legitimacy:** {High Confidence | Proceed with Caution | Suspicious}
 **URL:** {URL de la oferta original}
-**PDF:** {career-ops/output/cv-candidate-{company-slug}-{{DATE}}.pdf if score ≥ 4.0, else `not generated — run /career-ops pdf {company-slug} to create on demand`}
+**PDF:** {career-ops/output/cv-candidate-{company-slug}-{{DATE}}.pdf if score ≥ the resolved `auto_pdf_score_threshold` from Paso 4, else `not generated — run /career-ops pdf {company-slug} to create on demand`}
 **Batch ID:** {{ID}}
 
 ---
