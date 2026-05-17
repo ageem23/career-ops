@@ -20,6 +20,7 @@ import { spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import yaml from 'js-yaml';
+import { normalizeCompany, roleTokens, roleMatchTokens } from './dedup-utils.mjs';
 const parseYaml = yaml.load;
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -193,20 +194,84 @@ function loadSeenUrls() {
   return seen;
 }
 
+// Build the seen-company-role index used to dedup candidates against
+// already-known entries BEFORE they hit evaluation.
+//
+// Returns a Map<normalizedCompany, Array<{ role, tokens, exactKey }>>:
+//   - normalizedCompany: dedup-utils.normalizeCompany output, used as the
+//     bucket key so we only fuzzy-compare roles within the same company.
+//   - role: original role string (kept for diagnostic logging).
+//   - tokens: pre-computed roleTokens(role) so the hot path in tryAccept
+//     doesn't re-tokenize every seen entry on every candidate.
+//   - exactKey: `${company.toLowerCase()}::${role.toLowerCase()}` — used
+//     in --strict-dedup mode to bypass the fuzzy match and reproduce the
+//     pre-PR behavior (debug aid for false positives).
+//
+// Sources read (closes Gap 1 — formerly only applications.md):
+//   1. applications.md table rows
+//   2. pipeline.md ## Pendientes and ## Procesadas entries
 function loadSeenCompanyRoles() {
-  const seen = new Set();
+  const byCompany = new Map();
+
+  // applications.md: markdown table `| # | Date | Company | Role | ...`
   if (existsSync(APPLICATIONS_PATH)) {
     const text = readFileSync(APPLICATIONS_PATH, 'utf-8');
-    // Parse markdown table rows: | # | Date | Company | Role | ...
     for (const match of text.matchAll(/\|[^|]+\|[^|]+\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|/g)) {
-      const company = match[1].trim().toLowerCase();
-      const role = match[2].trim().toLowerCase();
-      if (company && role && company !== 'company') {
-        seen.add(`${company}::${role}`);
+      const company = match[1].trim();
+      const role = match[2].trim();
+      if (company && role && company.toLowerCase() !== 'company') {
+        addSeenCompanyRole(byCompany, company, role);
       }
     }
   }
-  return seen;
+
+  // pipeline.md: two formats share a regex via an optional `#NUM |` prefix.
+  //   - Pendientes: `- [ ] URL | Company | Role [| Location...]`
+  //   - Procesadas: `- [x] #NUM | URL | Company | Role | ...`
+  if (existsSync(PIPELINE_PATH)) {
+    const text = readFileSync(PIPELINE_PATH, 'utf-8');
+    const pattern = /^- \[[ x!]\]\s+(?:#\d+\s*\|\s*)?\S+\s*\|\s*([^|\n]+?)\s*\|\s*([^|\n]+?)(?:\s*\|.*)?$/gm;
+    for (const match of text.matchAll(pattern)) {
+      addSeenCompanyRole(byCompany, match[1].trim(), match[2].trim());
+    }
+  }
+
+  return byCompany;
+}
+
+function addSeenCompanyRole(byCompany, company, role) {
+  if (!company || !role) return;
+  const norm = normalizeCompany(company);
+  if (!norm) return;
+  const tokens = roleTokens(role);
+  // Skip entries whose role tokenizes to nothing (e.g. role was just a
+  // seniority word like "Manager") — they'd false-positive against
+  // everything else in the same company.
+  if (tokens.length === 0) return;
+  const exactKey = `${company.toLowerCase()}::${role.toLowerCase()}`;
+  if (!byCompany.has(norm)) byCompany.set(norm, []);
+  byCompany.get(norm).push({ role, tokens, exactKey });
+}
+
+// Returns the matching seen-entry (for diagnostics) or null. Honors
+// --strict-dedup (exact substring match against the pre-PR key format).
+function findCompanyRoleDup(byCompany, company, role, { strict }) {
+  if (!company || !role) return null;
+  if (strict) {
+    const key = `${company.toLowerCase()}::${role.toLowerCase()}`;
+    for (const entries of byCompany.values()) {
+      const hit = entries.find(e => e.exactKey === key);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  const norm = normalizeCompany(company);
+  if (!norm) return null;
+  const candidates = byCompany.get(norm);
+  if (!candidates) return null;
+  const tokens = roleTokens(role);
+  if (tokens.length === 0) return null;
+  return candidates.find(e => roleMatchTokens(e.tokens, tokens)) || null;
 }
 
 // ── Pipeline writer ─────────────────────────────────────────────────
@@ -281,6 +346,10 @@ async function main() {
   const args = process.argv.slice(2);
   const dryRun = args.includes('--dry-run');
   const noAutoFilter = args.includes('--no-auto-filter');
+  // Opt-out of fuzzy company+role dedup (falls back to exact substring
+  // match — the pre-PR behavior). Use this to confirm the fuzzy logic is
+  // the cause if you suspect a false positive.
+  const strictDedup = args.includes('--strict-dedup');
   const companyFlag = args.indexOf('--company');
   const filterCompany = companyFlag !== -1 ? args[companyFlag + 1]?.toLowerCase() : null;
 
@@ -340,14 +409,13 @@ async function main() {
           totalDupes++;
           continue;
         }
-        const key = `${job.company.toLowerCase()}::${job.title.toLowerCase()}`;
-        if (seenCompanyRoles.has(key)) {
+        if (findCompanyRoleDup(seenCompanyRoles, job.company, job.title, { strict: strictDedup })) {
           totalDupes++;
           continue;
         }
-        // Mark as seen to avoid intra-scan dupes
+        // Mark as seen to avoid intra-scan dupes across providers.
         seenUrls.add(job.url);
-        seenCompanyRoles.add(key);
+        addSeenCompanyRole(seenCompanyRoles, job.company, job.title);
         newOffers.push({ ...job, source: `${type}-api` });
       }
     } catch (err) {
