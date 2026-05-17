@@ -80,6 +80,18 @@ export function roleMatchTokens(a, b) {
   return overlap >= 2 && (overlap / smaller) >= 0.6;
 }
 
+// Public API: are two role strings duplicates? Layered as:
+//   1. Exact-normalized match — if normalizeRole(a) === normalizeRole(b),
+//      they're duplicates, period. Cheap, and catches the short-title
+//      cases the fuzzy path can't reach: roles that reduce to <2 content
+//      tokens after stopword stripping (e.g. "VP Engineering" → ["vp"]
+//      after length-filter + ["engineering" stopword'd] = [], or
+//      "CTIO AI Engineering Manager" → ["ctio"]). The fuzzy path
+//      requires overlap ≥ 2, so identical short roles slip through it.
+//   2. Tokenized fuzzy match (≥2 overlapping content words, ≥60% ratio)
+//      for everything else — handles paraphrases, suffix variations, and
+//      reformatted titles across boards.
 export function roleMatch(a, b) {
+  if (normalizeRole(a) === normalizeRole(b)) return true;
   return roleMatchTokens(roleTokens(a), roleTokens(b));
 }
