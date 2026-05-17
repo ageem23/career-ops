@@ -32,8 +32,14 @@ export function normalizeCompany(name) {
 export function normalizeRole(role) {
   return role.toLowerCase()
     .replace(/[()]/g, ' ')
+    // Replace runs of unsupported punctuation with a single space (was
+    // dropped entirely, which collapsed "VP,Engineering" → "vpengineering"
+    // and produced bogus single-token roles that slipped past dedup).
+    .replace(/[^a-z0-9 /]+/g, ' ')
+    // Canonicalize slash separators so "AI/ML Engineer" and
+    // "AI / ML Engineer" produce identical output.
+    .replace(/\s*\/\s*/g, '/')
     .replace(/\s+/g, ' ')
-    .replace(/[^a-z0-9 /]/g, '')
     .trim();
 }
 
@@ -80,6 +86,18 @@ export function roleMatchTokens(a, b) {
   return overlap >= 2 && (overlap / smaller) >= 0.6;
 }
 
+// Public API: are two role strings duplicates? Layered as:
+//   1. Exact-normalized match — if normalizeRole(a) === normalizeRole(b),
+//      they're duplicates, period. Cheap, and catches the short-title
+//      cases the fuzzy path can't reach: roles that reduce to <2 content
+//      tokens after stopword stripping (e.g. "VP Engineering" → ["vp"]
+//      after length-filter + ["engineering" stopword'd] = [], or
+//      "CTIO AI Engineering Manager" → ["ctio"]). The fuzzy path
+//      requires overlap ≥ 2, so identical short roles slip through it.
+//   2. Tokenized fuzzy match (≥2 overlapping content words, ≥60% ratio)
+//      for everything else — handles paraphrases, suffix variations, and
+//      reformatted titles across boards.
 export function roleMatch(a, b) {
+  if (normalizeRole(a) === normalizeRole(b)) return true;
   return roleMatchTokens(roleTokens(a), roleTokens(b));
 }

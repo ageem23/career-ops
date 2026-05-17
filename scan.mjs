@@ -37,7 +37,7 @@ try {
 
 import { makeHttpCtx } from './providers/_http.mjs';
 import { makeBrowserCtx, closeBrowser } from './providers/_browser.mjs';
-import { normalizeCompany, roleTokens, roleMatchTokens } from './dedup-utils.mjs';
+import { normalizeCompany, normalizeRole, roleTokens, roleMatchTokens } from './dedup-utils.mjs';
 
 const parseYaml = yaml.load;
 
@@ -236,15 +236,14 @@ function addSeenCompanyRole(byCompany, company, role) {
   if (!company || !role) return;
   const norm = normalizeCompany(company);
   if (!norm) return;
-  // Entries whose role tokenizes to nothing (e.g. role was just a
-  // seniority word like "Manager") are still stored so --strict-dedup
-  // can find them by exactKey. Fuzzy mode is unaffected because
-  // findCompanyRoleDup short-circuits when the candidate's own tokens
-  // are empty, and roleMatchTokens returns false against any empty side.
+  // Store every entry (even zero-token ones) so --strict-dedup can find
+  // them by exactKey AND so the fuzzy path's zero-token-on-both-sides
+  // fallback (compare normRole) has something to match against.
   const tokens = roleTokens(role);
+  const normRole = normalizeRole(role);
   const exactKey = `${company.toLowerCase()}::${role.toLowerCase()}`;
   if (!byCompany.has(norm)) byCompany.set(norm, []);
-  byCompany.get(norm).push({ role, tokens, exactKey });
+  byCompany.get(norm).push({ role, tokens, normRole, exactKey });
 }
 
 // Returns the matching seen-entry (for diagnostics) or null. Honors
@@ -263,6 +262,14 @@ function findCompanyRoleDup(byCompany, company, role, { strict }) {
   if (!norm) return null;
   const candidates = byCompany.get(norm);
   if (!candidates) return null;
+  // First try exact normalized-role match — catches identical short
+  // titles (e.g. "VP Engineering" vs "VP Engineering", or
+  // "CTIO AI Engineering Manager" vs same) that fuzzy can't reach
+  // because they reduce to <2 content tokens after stopword stripping.
+  // Mirrors the layered logic in dedup-utils.roleMatch.
+  const normRole = normalizeRole(role);
+  const exactNormHit = candidates.find(e => e.normRole === normRole);
+  if (exactNormHit) return exactNormHit;
   const tokens = roleTokens(role);
   if (tokens.length === 0) return null;
   return candidates.find(e => roleMatchTokens(e.tokens, tokens)) || null;
