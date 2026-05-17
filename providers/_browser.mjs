@@ -8,7 +8,7 @@
 //
 // The browser is launched on first fetch and closed at process exit.
 
-import { fetchJson as httpFetchJson } from './_http.mjs';
+import { fetchJson as httpFetchJson, assertSafeHttpUrl } from './_http.mjs';
 
 const DEFAULT_NAVIGATE_TIMEOUT_MS = 30_000;
 let browserPromise = null;
@@ -48,6 +48,9 @@ async function withPage(fn) {
 }
 
 export async function fetchText(url, { timeoutMs = DEFAULT_NAVIGATE_TIMEOUT_MS, waitUntil = 'domcontentloaded' } = {}) {
+  // Same SSRF guard as the HTTP transport — reject loopback/private hosts
+  // and non-http(s) schemes before page.goto() can probe internal networks.
+  assertSafeHttpUrl(url);
   return await withPage(async page => {
     await page.goto(url, { timeout: timeoutMs, waitUntil });
     return await page.content();

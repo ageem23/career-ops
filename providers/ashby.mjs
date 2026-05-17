@@ -20,7 +20,9 @@ export default {
     const apiUrl = resolveApiUrl(entry);
     if (!apiUrl) throw new Error(`ashby: cannot derive API URL for ${entry.name}`);
     const json = await ctx.fetchJson(apiUrl);
-    const jobs = json.jobs || [];
+    // Guard against malformed upstream payloads — a truthy non-array
+    // `json.jobs` (e.g. an object on an error page) would crash `.map()`.
+    const jobs = Array.isArray(json?.jobs) ? json.jobs : [];
     return jobs.map(j => ({
       title: j.title || '',
       url: j.jobUrl || '',

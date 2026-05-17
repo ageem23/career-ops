@@ -20,9 +20,68 @@
 #   4. Adjust search_queries for your preferred job boards
 #   5. Set enabled: false on companies you don't care about
 
+# -- Auto mid-filter --
+# When a scan adds this many or more new offers to the pipeline, scan.mjs
+# automatically runs mid-filter.mjs (Haiku-powered JD-snippet scoring) to cull
+# obvious mid-tier rejects before the full Sonnet batch.
+#   Set to 0 to disable. Override per-run with `node scan.mjs --no-auto-filter`.
+#   Requires ANTHROPIC_API_KEY or the claude CLI (mid-filter.mjs's requirement).
+auto_mid_filter_threshold: 20
+
+# -- Location filter (optional) --
+# Filter scanned jobs by location. Applied AFTER title filter, BEFORE dedup.
+# If this entire block is absent, all locations pass (current default behavior).
+#
+# Semantics:
+#   - Empty location string on a job → pass (don't penalize missing data)
+#   - Any `block` keyword present → reject (takes precedence over allow)
+#   - `allow` empty → pass (already cleared block)
+#   - `allow` non-empty → must match at least one keyword
+# All matches are case-insensitive substring.
+#
+# Example below targets US-based remote + a couple of US metros, blocking
+# common foreign hubs. Customize to your geography.
+
+# location_filter:
+#   allow:
+#     - "Remote"
+#     - "United States"
+#     - "USA"
+#     - "Atlanta"
+#     - "New York"
+#   block:
+#     - "India"
+#     - "Bengaluru"
+#     - "United Kingdom"
+#     - "London"
+#     - "Germany"
+#     - "France"
+#     - "Singapore"
+#     - "Japan"
+#     - "Brazil"
+#     - "Australia"
+
 # -- Title filter --
-# The scanner uses these keywords to decide if a title is relevant.
-# At least 1 positive must match AND 0 negatives must match (case-insensitive).
+#
+# Three-stage match per scanned title:
+#   1. NEGATIVE — literal substring (case-insensitive). Hard reject.
+#   2. POSITIVE — literal substring. Definite accept.
+#   3. NEUTRAL  — neither hit; sent to the optional semantic phase.
+#
+# The semantic phase runs once at the end of each scan if a backend is
+# available. Backend resolution (checked in this exact order — first match wins):
+#   1. CAREER_OPS_SEMANTIC_BACKEND=api|cli (explicit override; takes precedence
+#      over all other signals)
+#   2. ANTHROPIC_API_KEY set                → Anthropic API (faster, separate billing)
+#   3. `claude` CLI in PATH                 → Claude Code (subscription billing, +2-5s/scan)
+#   4. None of the above                    → neutrals are rejected
+# Both backends use the positive list + archetypes (below) to classify
+# each neutral title as a semantic match or not.
+#
+# Archetypes are richer canonical descriptions that help the LLM catch
+# variants the literal positive list misses (e.g. "Sr. Director - Engineering"
+# matching "Director of Engineering", "Head of Platform" matching
+# "VP of Engineering"). They are NOT used for the literal-substring stage.
 
 title_filter:
   positive:
@@ -99,6 +158,15 @@ title_filter:
     - "Lead"
     - "Head"
     - "Director"
+  # Archetype descriptions for the semantic phase live in
+  # config/profile.yml (target_roles.archetypes[].semantic_description).
+  # That single source feeds both the title-filter LLM (this section) and
+  # Block B "North Star alignment" scoring at evaluation time. See the
+  # canonical example in config/profile.example.yml.
+  #
+  # Legacy fallback: if profile.yml has no archetypes block, you may still
+  # add a `title_filter.archetypes:` list of free-text sentences here and
+  # scan.mjs will use it. Prefer profile.yml for new setups.
 
 # -- Search queries --
 # Each query triggers a WebSearch. Use site: to filter by portal.
@@ -284,6 +352,39 @@ search_queries:
 # For Greenhouse companies, add api: field for faster structured JSON access.
 
 tracked_companies:
+
+  # -- LinkedIn (authenticated keyword search) --
+  #
+  # Each entry below runs ONE keyword search against LinkedIn's logged-in
+  # job board. On the first interactive run of `node scan.mjs`, a visible
+  # browser opens for login; press Enter once you're signed in and the scan
+  # continues. The session is saved at ~/.career-ops-auth/linkedin/profile/
+  # and reused headlessly on subsequent runs.
+  #
+  # For unattended runs (cron, /loop, /schedule), warm the session first:
+  #   node scan.mjs --login linkedin
+  # — otherwise the run will fail fast with a hint, since it can't prompt.
+  #
+  # Each accepted listing's full JD is written to `jds/<company>-<role>.md`
+  # and added to pipeline.md as `local:jds/...` (since LinkedIn URLs aren't
+  # reachable later without re-authenticating).
+  #
+  # Uncomment and customize the entries below to enable LinkedIn scanning:
+  #
+  # - name: "LinkedIn — Engineering Manager AI"
+  #   provider: linkedin
+  #   enabled: true
+  #   search: "Engineering Manager AI"
+  #   date_posted: "Week"            # "24" | "Week" | "Month" | omit
+  #   experience_level: ["Director"] # optional array
+  #   max_results: 25
+  #
+  # - name: "LinkedIn — VP of Engineering Healthcare"
+  #   provider: linkedin
+  #   enabled: true
+  #   search: "VP of Engineering Healthcare"
+  #   date_posted: "Month"
+  #   max_results: 25
 
   # -- AI Labs & LLM providers --
 
@@ -523,6 +624,12 @@ tracked_companies:
     notes: "Celonis parent company. Automation platform."
     enabled: true
 
+  - name: Boomi
+    careers_url: https://job-boards.greenhouse.io/boomilp
+    api: https://boards-api.greenhouse.io/v1/boards/boomilp/jobs
+    notes: "Integration and automation platform."
+    enabled: true
+
   # -- Ashby-based (Playwright direct) --
 
   - name: Cohere
@@ -555,6 +662,48 @@ tracked_companies:
   - name: Palantir
     careers_url: https://jobs.lever.co/palantir
     notes: "FDE roles. Mostly US/London."
+    enabled: true
+
+  # -- Canada / Vancouver tech & AI --
+
+  - name: Later
+    careers_url: https://job-boards.greenhouse.io/later
+    api: https://boards-api.greenhouse.io/v1/boards/later/jobs
+    notes: "Vancouver/Toronto. Social media and creator platform."
+    enabled: true
+
+  - name: Safari AI
+    careers_url: https://job-boards.greenhouse.io/safariai
+    api: https://boards-api.greenhouse.io/v1/boards/safariai/jobs
+    notes: "Miami HQ / Vancouver engineering. Computer vision AI for operations in the physical economy."
+    enabled: true
+
+  - name: Hootsuite
+    careers_url: https://job-boards.greenhouse.io/hootsuite
+    api: https://boards-api.greenhouse.io/v1/boards/hootsuite/jobs
+    notes: "Vancouver. Social media management platform."
+    enabled: true
+
+  - name: Klue
+    careers_url: https://jobs.ashbyhq.com/klue
+    notes: "Vancouver. Competitive intelligence SaaS."
+    enabled: true
+
+  - name: Glacis AI
+    careers_url: https://jobs.ashbyhq.com/glacis-ai
+    notes: "Ho Chi Minh City. AI agents for supply chain and logistics workflows."
+    enabled: true
+
+  - name: Sanctuary AI
+    careers_url: https://jobs.lever.co/sanctuary
+    notes: "Vancouver. Humanoid robotics and embodied AI."
+    enabled: true
+
+  - name: Semios
+    careers_url: https://apply.workable.com/semios/
+    scan_method: websearch
+    scan_query: 'site:apply.workable.com/semios'
+    notes: "Vancouver. Agtech and crop intelligence platform."
     enabled: true
 
   # -- European tech (EMEA-friendly) --

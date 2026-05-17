@@ -9,8 +9,14 @@ Procesa URLs de ofertas acumuladas en `data/pipeline.md`. El usuario agrega URLs
    a. Calcular siguiente `REPORT_NUM` secuencial (leer `reports/`, tomar el número más alto + 1)
    b. **Extraer JD** usando Playwright (browser_navigate + browser_snapshot) → WebFetch → WebSearch
    c. Si la URL no es accesible → marcar como `- [!]` con nota y continuar
-   d. **Ejecutar auto-pipeline completo**: Evaluación A-F → Report .md → PDF (si score >= 3.0) → Tracker
+   d. **Ejecutar auto-pipeline completo**: Evaluación A-F → Report .md → PDF (si score ≥ `auto_pdf_score_threshold`) → Tracker
    e. **Mover de "Pendientes" a "Procesadas"**: `- [x] #NNN | URL | Empresa | Rol | Score/5 | PDF ✅/❌`
+
+   **Sobre el PDF gate (configurable, default-disabled):** Leer `config/profile.yml` → `auto_pdf_score_threshold`. Si la clave no existe, default `5.1` (efectivamente deshabilitado — el max score posible es 5.0). Si el score de la evaluación es menor que el threshold, omitir la generación de PDF: escribir el report normalmente, mostrar en el header `**PDF:** not generated — run /career-ops pdf {company-slug} to create on demand`, y marcar PDF ❌ en el tracker. Si el score es ≥ threshold, generar el PDF como siempre.
+
+   **Por qué default-disabled:** Generar un PDF tailored cuesta ~30–60s por entrada (Playwright launch + HTML render) y produce archivos que casi nunca se usan — la mayoría de roles puntúan en 2.x/3.x y nunca llegan a aplicación. Mejor escribir el report (barato, útil para triaje) y dejar el PDF como acción on-demand vía `/career-ops pdf {slug}` cuando el usuario decide aplicar.
+
+   **Cómo activar auto-PDF:** Editar `config/profile.yml` y añadir `auto_pdf_score_threshold: 4.0` (o el valor preferido). Ambos modos (Path A `/career-ops pipeline` y Path B `batch/batch-runner.sh`) leen la misma clave para que el comportamiento sea consistente.
 3. **Si hay 3+ URLs pendientes**, lanzar agentes en paralelo (Agent tool con `run_in_background`) para maximizar velocidad.
 4. **Al terminar**, mostrar tabla resumen:
 

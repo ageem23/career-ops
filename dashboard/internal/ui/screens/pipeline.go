@@ -19,9 +19,11 @@ type PipelineClosedMsg struct{}
 
 // PipelineOpenReportMsg is emitted when a report should be opened in FileViewer.
 type PipelineOpenReportMsg struct {
-	Path   string
-	Title  string
-	JobURL string
+	Path          string
+	Title         string
+	JobURL        string
+	App           model.CareerApplication
+	CareerOpsPath string
 }
 
 // PipelineOpenURLMsg is emitted when a job URL should be opened in browser.
@@ -48,6 +50,26 @@ type PipelineRefreshMsg struct{}
 // PipelineOpenProgressMsg is emitted when the progress screen should open.
 type PipelineOpenProgressMsg struct{}
 
+// PipelineOpenTasksMsg is emitted when the tasks screen should open.
+type PipelineOpenTasksMsg struct{}
+
+// PipelineBulkUpdateStatusMsg requests the same status change applied to
+// multiple applications in one go. Main reuses the single-row code path
+// per app so the Interview thank-you cascade fires for each one.
+type PipelineBulkUpdateStatusMsg struct {
+	CareerOpsPath string
+	Apps          []model.CareerApplication
+	NewStatus     string
+}
+
+// PipelineAddTaskMsg requests creation of a manual task linked to an
+// application. Due may be empty for no due date.
+type PipelineAddTaskMsg struct {
+	App   model.CareerApplication
+	Title string
+	Due   string // YYYY-MM-DD or "" for none
+}
+
 type reportSummary struct {
 	archetype string
 	tldr      string
@@ -70,6 +92,8 @@ const (
 	filterApplied   = "applied"
 	filterInterview = "interview"
 	filterSkip      = "skip"
+	filterRejected  = "rejected"
+	filterDiscarded = "discarded"
 	filterTop       = "top"
 )
 
@@ -85,11 +109,27 @@ var pipelineTabs = []pipelineTab{
 	{filterInterview, "INTERVIEW"},
 	{filterTop, "TOP ≥4"},
 	{filterSkip, "SKIP"},
+	{filterRejected, "REJECTED"},
+	{filterDiscarded, "DISCARDED"},
 }
 
 var sortCycle = []string{sortScore, sortDate, sortCompany, sortStatus}
 
-var statusOptions = []string{"Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP"}
+type statusOption struct {
+	label    string
+	shortcut string // key that selects this option in the picker
+}
+
+var statusOptions = []statusOption{
+	{"Evaluated", "e"},
+	{"Applied", "a"},
+	{"Responded", "r"},
+	{"Interview", "i"},
+	{"Offer", "o"},
+	{"Rejected", "x"}, // x not r — r is taken by Responded
+	{"Discarded", "d"},
+	{"SKIP", "s"},
+}
 
 // statusGroupOrder defines display order for grouped view.
 var statusGroupOrder = []string{"interview", "offer", "responded", "applied", "evaluated", "skip", "rejected", "discarded"}
@@ -111,6 +151,15 @@ type PipelineModel struct {
 	// Status picker sub-state
 	statusPicker bool
 	statusCursor int
+	// Add-task prompt sub-state — shared with the report viewer so the two
+	// entry points behave identically. See add_task_prompt.go.
+	addTask addTaskPrompt
+	// selected is the set of tracker numbers in the current multi-select.
+	// When non-empty, the status picker applies to all selected rows
+	// instead of the cursor row. Cleared after a bulk apply or when the
+	// active tab changes (so selections always reflect rows visible in the
+	// current filter — the ALL tab is the cross-status starting point).
+	selected map[int]bool
 }
 
 // NewPipelineModel creates a new pipeline screen.
@@ -184,6 +233,28 @@ func (m PipelineModel) WithReloadedData(apps []model.CareerApplication, metrics 
 	reloaded.applyFilterAndSort()
 	reloaded.CopyReportCache(&m)
 
+	// Carry the multi-select across the reload — pressing 'r' shouldn't
+	// silently drop selections — but prune to apps that are still in the
+	// current filter. A selected app whose status changed elsewhere (so
+	// it no longer matches the active tab) should fall out of the set so
+	// the next bulk action doesn't target rows the user can't see.
+	if len(m.selected) > 0 {
+		visible := make(map[int]bool, len(reloaded.filtered))
+		for _, app := range reloaded.filtered {
+			if app.Number > 0 {
+				visible[app.Number] = true
+			}
+		}
+		for n := range m.selected {
+			if visible[n] {
+				if reloaded.selected == nil {
+					reloaded.selected = make(map[int]bool, len(m.selected))
+				}
+				reloaded.selected[n] = true
+			}
+		}
+	}
+
 	for i, app := range reloaded.filtered {
 		if selectedReportPath != "" && app.ReportPath == selectedReportPath {
 			reloaded.cursor = i
@@ -226,6 +297,9 @@ func (m PipelineModel) Update(msg tea.Msg) (PipelineModel, tea.Cmd) {
 	case tea.KeyMsg:
 		if m.statusPicker {
 			return m.handleStatusPicker(msg)
+		}
+		if m.addTask.active() {
+			return m.handleAddTaskInput(msg)
 		}
 		return m.handleKey(msg)
 	case tea.WindowSizeMsg:
@@ -281,6 +355,10 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 		m.applyFilterAndSort()
 		m.cursor = 0
 		m.scrollOffset = 0
+		// Selection set is scoped to the active filter — clearing on tab
+		// change keeps the visible selection honest. Use the ALL tab to
+		// build a cross-status selection.
+		m.selected = nil
 
 	case "left", "h":
 		m.activeTab--
@@ -290,6 +368,7 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 		m.applyFilterAndSort()
 		m.cursor = 0
 		m.scrollOffset = 0
+		m.selected = nil
 
 	case "v":
 		if m.viewMode == "grouped" {
@@ -303,8 +382,15 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 			fullPath := filepath.Join(m.careerOpsPath, app.ReportPath)
 			title := fmt.Sprintf("%s — %s", app.Company, app.Role)
 			jobURL := app.JobURL
+			careerPath := m.careerOpsPath
 			return m, func() tea.Msg {
-				return PipelineOpenReportMsg{Path: fullPath, Title: title, JobURL: jobURL}
+				return PipelineOpenReportMsg{
+					Path:          fullPath,
+					Title:         title,
+					JobURL:        jobURL,
+					App:           app,
+					CareerOpsPath: careerPath,
+				}
 			}
 		}
 
@@ -318,6 +404,9 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 	case "p":
 		return m, func() tea.Msg { return PipelineOpenProgressMsg{} }
 
+	case "t":
+		return m, func() tea.Msg { return PipelineOpenTasksMsg{} }
+
 	case "r":
 		return m, func() tea.Msg { return PipelineRefreshMsg{} }
 
@@ -325,6 +414,37 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 		if len(m.filtered) > 0 {
 			m.statusPicker = true
 			m.statusCursor = 0
+		}
+
+	case " ":
+		// Toggle the current row's membership in the selection set. When
+		// non-empty, the status picker applies to all selected rows.
+		if app, ok := m.CurrentApp(); ok && app.Number > 0 {
+			if m.selected == nil {
+				m.selected = make(map[int]bool)
+			}
+			if m.selected[app.Number] {
+				delete(m.selected, app.Number)
+				if len(m.selected) == 0 {
+					m.selected = nil
+				}
+			} else {
+				m.selected[app.Number] = true
+			}
+		}
+
+	case "X":
+		// Clear the entire selection set. Capital X to keep lowercase x
+		// (Rejected) free inside the status picker.
+		m.selected = nil
+
+	case "n":
+		// Add a manual task for the selected application. The two-stage
+		// prompt collects title then due date so the task can carry both
+		// without forcing a special syntax. Stage 2 starts at "today" so
+		// the most common case is one Enter away.
+		if _, ok := m.CurrentApp(); ok {
+			m.addTask.open()
 		}
 
 	case "g":
@@ -393,18 +513,75 @@ func (m PipelineModel) handleStatusPicker(msg tea.KeyMsg) (PipelineModel, tea.Cm
 
 	case "enter":
 		m.statusPicker = false
-		if app, ok := m.CurrentApp(); ok {
-			newStatus := statusOptions[m.statusCursor]
-			return m, func() tea.Msg {
-				return PipelineUpdateStatusMsg{
-					CareerOpsPath: m.careerOpsPath,
-					App:           app,
-					NewStatus:     newStatus,
+		newStatus := statusOptions[m.statusCursor].label
+		return m.dispatchStatusChange(newStatus)
+
+	default:
+		// Letter shortcut — apply the matching status directly.
+		key := strings.ToLower(msg.String())
+		if len(key) == 1 {
+			for i, opt := range statusOptions {
+				if opt.shortcut == key {
+					m.statusCursor = i
+					m.statusPicker = false
+					return m.dispatchStatusChange(opt.label)
 				}
 			}
 		}
 	}
 	return m, nil
+}
+
+// dispatchStatusChange emits either a bulk or single status-update message
+// depending on whether the multi-select is active. The selection set is
+// cleared here so the rows can't be re-applied on a subsequent picker open.
+func (m PipelineModel) dispatchStatusChange(newStatus string) (PipelineModel, tea.Cmd) {
+	if len(m.selected) > 0 {
+		targets := make([]model.CareerApplication, 0, len(m.selected))
+		for _, app := range m.apps {
+			if m.selected[app.Number] {
+				targets = append(targets, app)
+			}
+		}
+		path := m.careerOpsPath
+		m.selected = nil
+		return m, func() tea.Msg {
+			return PipelineBulkUpdateStatusMsg{
+				CareerOpsPath: path,
+				Apps:          targets,
+				NewStatus:     newStatus,
+			}
+		}
+	}
+	if app, ok := m.CurrentApp(); ok {
+		return m, func() tea.Msg {
+			return PipelineUpdateStatusMsg{
+				CareerOpsPath: m.careerOpsPath,
+				App:           app,
+				NewStatus:     newStatus,
+			}
+		}
+	}
+	return m, nil
+}
+
+// handleAddTaskInput routes a key into the shared add-task prompt. On submit
+// (Enter at stage 2), resolves the offset and emits PipelineAddTaskMsg.
+func (m PipelineModel) handleAddTaskInput(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
+	if !m.addTask.handleKey(msg) {
+		return m, nil
+	}
+	app, ok := m.CurrentApp()
+	if !ok {
+		m.addTask.close()
+		return m, nil
+	}
+	title := m.addTask.Title()
+	due := m.addTask.ResolvedDue()
+	m.addTask.close()
+	return m, func() tea.Msg {
+		return PipelineAddTaskMsg{App: app, Title: title, Due: due}
+	}
 }
 
 func (m PipelineModel) loadCurrentReport() tea.Cmd {
@@ -562,6 +739,9 @@ func (m PipelineModel) View() string {
 	if m.statusPicker {
 		body = m.overlayStatusPicker(body)
 	}
+	if m.addTask.active() {
+		body = m.overlayAddTaskPrompt(body)
+	}
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		header,
@@ -666,6 +846,13 @@ func (m PipelineModel) renderMetrics() string {
 		parts = append(parts, s.Render(fmt.Sprintf("%s:%d", statusLabel(status), count)))
 	}
 
+	// Surface the active multi-select count so the user has unambiguous
+	// confirmation of "the next 'c' will hit N rows, not just the cursor".
+	if n := len(m.selected); n > 0 {
+		selStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Mauve)
+		parts = append(parts, selStyle.Render(fmt.Sprintf("[%d selected]", n)))
+	}
+
 	return style.Render(strings.Join(parts, "  "))
 }
 
@@ -723,16 +910,24 @@ func (m PipelineModel) renderAppLine(app model.CareerApplication, selected bool)
 	padStyle := lipgloss.NewStyle().Padding(0, 2)
 
 	// Column widths
+	numW := 5   // "#123 "
 	scoreW := 5 // "4.5  "
 	dateW := 10
 	companyW := 16
 	statusW := 12
 	compW := 14
 	// Role gets remaining space
-	roleW := m.width - scoreW - dateW - companyW - statusW - compW - 12
+	roleW := m.width - numW - scoreW - dateW - companyW - statusW - compW - 13
 	if roleW < 15 {
 		roleW = 15
 	}
+
+	// Tracker number (fixed width)
+	numText := "#—"
+	if app.Number > 0 {
+		numText = fmt.Sprintf("#%d", app.Number)
+	}
+	numStyle := lipgloss.NewStyle().Foreground(m.theme.Blue).Bold(true).Width(numW)
 
 	// Score with color
 	scoreStyle := m.scoreStyle(app.Score)
@@ -767,7 +962,8 @@ func (m PipelineModel) renderAppLine(app model.CareerApplication, selected bool)
 		compText = compStyle.Render(comp)
 	}
 
-	line := fmt.Sprintf(" %s %s %s %s %s %s",
+	line := fmt.Sprintf(" %s %s %s %s %s %s %s",
+		numStyle.Render(truncateRunes(numText, numW)),
 		score,
 		dateStyle.Render(truncateRunes(dateText, dateW)),
 		companyStyle.Render(company),
@@ -776,14 +972,36 @@ func (m PipelineModel) renderAppLine(app model.CareerApplication, selected bool)
 		compText,
 	)
 
-	if selected {
-		selStyle := lipgloss.NewStyle().
-			Background(m.theme.Overlay).
-			Width(m.width - 4)
-		return padStyle.Render(selStyle.Render(line))
+	// Two independent highlights:
+	//   - cursor: the row the user is navigating (always Overlay bg).
+	//   - multi: the row is in the selection set for a bulk action.
+	// When both fire on the same row, the cursor color wins on background
+	// but Bold signals that this row is also part of the selection.
+	multi := m.selected[app.Number]
+	switch {
+	case selected && multi:
+		s := lipgloss.NewStyle().Background(m.theme.Overlay).Bold(true).Width(m.width - 4)
+		return padStyle.Render(s.Render(line))
+	case selected:
+		s := lipgloss.NewStyle().Background(m.theme.Overlay).Width(m.width - 4)
+		return padStyle.Render(s.Render(line))
+	case multi:
+		// A muted mauve — distinct hue from the Blue tracker number so the
+		// "#" column stays readable. Surface (#313244) is the same hue
+		// family as Blue (#89b4fa) and made the number hard to read on
+		// selected rows even with adequate luminance contrast.
+		s := lipgloss.NewStyle().Background(selectedRowBg).Width(m.width - 4)
+		return padStyle.Render(s.Render(line))
 	}
 	return padStyle.Render(line)
 }
+
+// selectedRowBg is the background applied to rows in the multi-select set.
+// Chosen for hue separation from the Blue accent (the tracker-number color)
+// rather than maximum luminance contrast — both backgrounds satisfy WCAG
+// against the row's foregrounds, but blue-on-blue read as "low contrast" to
+// the eye. Muted mauve in the catppuccin family keeps the theme feel.
+var selectedRowBg = lipgloss.Color("#4a3a5e")
 
 func (m PipelineModel) renderPreview() string {
 	app, ok := m.CurrentApp()
@@ -846,8 +1064,29 @@ func (m PipelineModel) renderHelp() string {
 				keyStyle.Render("Enter") + descStyle.Render(" confirm  ") +
 				keyStyle.Render("Esc") + descStyle.Render(" cancel"))
 	}
+	if m.addTask.active() {
+		return style.Render(
+			keyStyle.Render("type") + descStyle.Render(" input  ") +
+				keyStyle.Render("↑↓") + descStyle.Render(" ±day  ") +
+				keyStyle.Render("Enter") + descStyle.Render(" next/save  ") +
+				keyStyle.Render("Esc") + descStyle.Render(" cancel"))
+	}
 
 	brand := lipgloss.NewStyle().Foreground(m.theme.Overlay).Render("career-ops by santifer.io")
+
+	// When the multi-select is active, swap the right-hand cluster to
+	// emphasise the bulk path (and the clear shortcut) so the user can
+	// see how to confirm or abandon the selection.
+	var actionKeys string
+	if len(m.selected) > 0 {
+		actionKeys = keyStyle.Render("Space") + descStyle.Render(" toggle  ") +
+			keyStyle.Render("c") + descStyle.Render(" bulk change  ") +
+			keyStyle.Render("X") + descStyle.Render(" clear sel  ")
+	} else {
+		actionKeys = keyStyle.Render("c") + descStyle.Render(" change  ") +
+			keyStyle.Render("Space") + descStyle.Render(" select  ") +
+			keyStyle.Render("n") + descStyle.Render(" new task  ")
+	}
 
 	keys := keyStyle.Render("↑↓/jk") + descStyle.Render(" nav  ") +
 		keyStyle.Render("←→/hl") + descStyle.Render(" tabs  ") +
@@ -855,9 +1094,10 @@ func (m PipelineModel) renderHelp() string {
 		keyStyle.Render("r") + descStyle.Render(" refresh  ") +
 		keyStyle.Render("Enter") + descStyle.Render(" report  ") +
 		keyStyle.Render("o") + descStyle.Render(" open URL  ") +
-		keyStyle.Render("c") + descStyle.Render(" change  ") +
+		actionKeys +
 		keyStyle.Render("v") + descStyle.Render(" view  ") +
 		keyStyle.Render("p") + descStyle.Render(" progress  ") +
+		keyStyle.Render("t") + descStyle.Render(" tasks  ") +
 		keyStyle.Render("Esc") + descStyle.Render(" quit")
 
 	gap := m.width - lipgloss.Width(keys) - lipgloss.Width(brand) - 2
@@ -869,33 +1109,59 @@ func (m PipelineModel) renderHelp() string {
 }
 
 func (m PipelineModel) overlayStatusPicker(body string) string {
-	// Render status picker inline at bottom of body
+	// Inline text picker, no bordered box. The lipgloss Border around
+	// content with mixed line styles produced glyph-clipping in the
+	// user's terminal (different letters dropped depending on whether
+	// the cursor option used Bold+bg, Reverse, or just Mauve fg). Render
+	// each line independently with a simple divider so nothing in the
+	// styling pipeline can rewrite glyph cells.
 	bodyLines := strings.Split(body, "\n")
 
-	pickerWidth := 30
 	padStyle := lipgloss.NewStyle().Padding(0, 2)
-	borderStyle := lipgloss.NewStyle().
-		Foreground(m.theme.Blue).
-		Bold(true)
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Blue)
+	dimStyle := lipgloss.NewStyle().Foreground(m.theme.Text)
+	cursorStyle := lipgloss.NewStyle().Foreground(m.theme.Mauve)
+	dividerStyle := lipgloss.NewStyle().Foreground(m.theme.Overlay)
 
-	var picker []string
-	picker = append(picker, padStyle.Render(borderStyle.Render("Change status:")))
-
-	for i, opt := range statusOptions {
-		style := lipgloss.NewStyle().Foreground(m.theme.Text).Width(pickerWidth)
-		if i == m.statusCursor {
-			style = style.Background(m.theme.Overlay).Bold(true)
-		}
-		prefix := "  "
-		if i == m.statusCursor {
-			prefix = "> "
-		}
-		picker = append(picker, padStyle.Render(style.Render(prefix+opt)))
+	title := "Change status:"
+	if n := len(m.selected); n > 0 {
+		title = fmt.Sprintf("Change status for %d apps:", n)
 	}
 
-	// Append picker to body
-	bodyLines = append(bodyLines, picker...)
+	bodyLines = append(bodyLines, padStyle.Render(dividerStyle.Render(strings.Repeat("─", 32))))
+	bodyLines = append(bodyLines, padStyle.Render(titleStyle.Render(title)))
+	for i, opt := range statusOptions {
+		prefix := "  "
+		style := dimStyle
+		if i == m.statusCursor {
+			prefix = "▶ "
+			style = cursorStyle
+		}
+		label := fmt.Sprintf("%s (%s)", opt.label, strings.ToUpper(opt.shortcut))
+		bodyLines = append(bodyLines, padStyle.Render(style.Render(prefix+label)))
+	}
+	bodyLines = append(bodyLines, padStyle.Render(dividerStyle.Render(strings.Repeat("─", 32))))
+
 	return strings.Join(bodyLines, "\n")
+}
+
+// overlayAddTaskPrompt renders the shared two-stage new-task prompt at the
+// bottom of the body. The actual layout lives in addTaskPrompt.render; this
+// just resolves the target label from the currently-selected application.
+func (m PipelineModel) overlayAddTaskPrompt(body string) string {
+	// Defensive: if the cursor moved off the only filtered row before the
+	// prompt got rendered, just pass the body through. The 'n' handler
+	// guards against opening the prompt without an app, but state could
+	// shift under a future refactor.
+	app, ok := m.CurrentApp()
+	if !ok {
+		return body
+	}
+	target := fmt.Sprintf("#%d %s", app.Number, app.Company)
+	if app.Number == 0 {
+		target = app.Company
+	}
+	return m.addTask.render(body, m.theme, target)
 }
 
 // -- Helpers --

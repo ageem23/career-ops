@@ -1,43 +1,122 @@
 package screens
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/santifer/career-ops/dashboard/internal/model"
 	"github.com/santifer/career-ops/dashboard/internal/theme"
 )
 
 // ViewerClosedMsg is emitted when the viewer is dismissed.
 type ViewerClosedMsg struct{}
 
-// ViewerModel implements an integrated file viewer screen.
-type ViewerModel struct {
-	lines        []string
-	title        string
-	scrollOffset int
-	width        int
-	height       int
-	theme        theme.Theme
+// ViewerOpenTasksMsg is emitted when the user wants to jump from the viewer
+// to the tasks list, focused on the first task for the current application.
+type ViewerOpenTasksMsg struct {
+	AppNumber int
 }
 
+// ViewerModel implements an integrated file viewer screen.
+//
+// `rawLines` holds the file as read from disk; `lines` holds the word-wrapped
+// version sized to the current terminal width. Long paragraphs in JD files
+// regularly exceed 200 chars and were previously truncated by the terminal —
+// wrapping happens at load and again on every Resize, with scrollOffset
+// clamped so the user doesn't end up below the new visible end.
+type ViewerModel struct {
+	rawLines      []string
+	lines         []string
+	title         string
+	scrollOffset  int
+	width         int
+	height        int
+	theme         theme.Theme
+	app           model.CareerApplication
+	careerOpsPath string
+	hasApp        bool
+	statusPicker  bool
+	statusCursor  int
+	// Add-task prompt sub-state — shared helper used by both pipeline and
+	// viewer so the keystroke + flow is identical between the two.
+	addTask addTaskPrompt
+}
+
+// wrapMargin is reserved for the body padding (2 cols) plus a small safety
+// gap so wrapped lines never touch the right edge.
+const wrapMargin = 6
+
 // NewViewerModel creates a new file viewer for the given path.
-func NewViewerModel(t theme.Theme, path, title string, width, height int) ViewerModel {
+// If app.ReportPath is non-empty, the viewer enables in-place status changes.
+// tasks is the list of tasks linked to this application (filtered by App#);
+// the viewer renders them as a markdown table prepended to the report body so
+// the user can review all open work on this application at a glance.
+func NewViewerModel(t theme.Theme, path, title string, width, height int, app model.CareerApplication, careerOpsPath string, tasks []model.Task) ViewerModel {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		content = []byte("Error reading file: " + err.Error())
 	}
 
-	return ViewerModel{
-		lines:  strings.Split(string(content), "\n"),
-		title:  title,
-		width:  width,
-		height: height,
-		theme:  t,
+	raw := strings.Split(string(content), "\n")
+	if len(tasks) > 0 {
+		raw = append(buildTasksHeader(tasks), raw...)
 	}
+	return ViewerModel{
+		rawLines:      raw,
+		lines:         wrapAll(raw, width-wrapMargin),
+		title:         title,
+		width:         width,
+		height:        height,
+		theme:         t,
+		app:           app,
+		careerOpsPath: careerOpsPath,
+		hasApp:        app.ReportPath != "" || app.Company != "",
+	}
+}
+
+// buildTasksHeader produces the markdown lines for the "Tasks for this
+// application" panel rendered at the top of the report viewer. The existing
+// renderTableBlock turns the table into a properly formatted box.
+func buildTasksHeader(tasks []model.Task) []string {
+	pending, done, skipped := 0, 0, 0
+	for _, t := range tasks {
+		switch t.Status {
+		case "pending":
+			pending++
+		case "done":
+			done++
+		case "skipped":
+			skipped++
+		}
+	}
+	lines := []string{
+		"## Tasks for this application",
+		"",
+		fmt.Sprintf("**Summary:** %d pending · %d done · %d skipped", pending, done, skipped),
+		"",
+		"| # | Status | Type | Title | Due | Completed |",
+		"|---|--------|------|-------|-----|-----------|",
+	}
+	for _, t := range tasks {
+		due := t.Due
+		if due == "" {
+			due = "-"
+		}
+		completed := t.Completed
+		if completed == "" {
+			completed = "-"
+		}
+		lines = append(lines, fmt.Sprintf("| %d | %s | %s | %s | %s | %s |",
+			t.Number, t.Status, t.Type, t.Title, due, completed))
+	}
+	lines = append(lines, "", "---", "")
+	return lines
 }
 
 func (m ViewerModel) Init() tea.Cmd {
@@ -47,14 +126,61 @@ func (m ViewerModel) Init() tea.Cmd {
 func (m *ViewerModel) Resize(width, height int) {
 	m.width = width
 	m.height = height
+	m.lines = wrapAll(m.rawLines, width-wrapMargin)
+	// After re-wrapping, the visible range may have shrunk — clamp scrollOffset
+	// so we don't render off the end of the wrapped list.
+	maxScroll := len(m.lines) - m.bodyHeight()
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.scrollOffset > maxScroll {
+		m.scrollOffset = maxScroll
+	}
 }
 
 func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.statusPicker {
+			return m.handleStatusPicker(msg)
+		}
+		if m.addTask.active() {
+			return m.handleAddTaskInput(msg)
+		}
 		switch msg.String() {
 		case "q", "esc":
 			return m, func() tea.Msg { return ViewerClosedMsg{} }
+
+		case "c":
+			if m.hasApp {
+				m.statusPicker = true
+				m.statusCursor = 0
+			}
+
+		case "n":
+			// Same shortcut as the pipeline view — open the shared
+			// add-task prompt for the application currently displayed
+			// in the viewer. Requires a real App# so the resulting
+			// task can be linked back.
+			if m.app.Number > 0 {
+				m.addTask.open()
+			}
+
+		case "t":
+			if m.app.Number > 0 {
+				appNum := m.app.Number
+				return m, func() tea.Msg {
+					return ViewerOpenTasksMsg{AppNumber: appNum}
+				}
+			}
+
+		case "o":
+			if m.app.JobURL != "" {
+				url := m.app.JobURL
+				return m, func() tea.Msg {
+					return PipelineOpenURLMsg{URL: url}
+				}
+			}
 
 		case "down", "j":
 			maxScroll := len(m.lines) - m.bodyHeight()
@@ -107,6 +233,88 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	return m, nil
 }
 
+func (m ViewerModel) handleStatusPicker(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.statusPicker = false
+		return m, nil
+
+	case "down", "j":
+		m.statusCursor++
+		if m.statusCursor >= len(statusOptions) {
+			m.statusCursor = len(statusOptions) - 1
+		}
+
+	case "up", "k":
+		m.statusCursor--
+		if m.statusCursor < 0 {
+			m.statusCursor = 0
+		}
+
+	case "enter":
+		m.statusPicker = false
+		newStatus := statusOptions[m.statusCursor].label
+		app := m.app
+		path := m.careerOpsPath
+		return m, func() tea.Msg {
+			return PipelineUpdateStatusMsg{
+				CareerOpsPath: path,
+				App:           app,
+				NewStatus:     newStatus,
+			}
+		}
+
+	default:
+		key := strings.ToLower(msg.String())
+		if len(key) == 1 {
+			for i, opt := range statusOptions {
+				if opt.shortcut == key {
+					m.statusCursor = i
+					m.statusPicker = false
+					newStatus := opt.label
+					app := m.app
+					path := m.careerOpsPath
+					return m, func() tea.Msg {
+						return PipelineUpdateStatusMsg{
+							CareerOpsPath: path,
+							App:           app,
+							NewStatus:     newStatus,
+						}
+					}
+				}
+			}
+		}
+	}
+	return m, nil
+}
+
+// handleAddTaskInput routes a key into the shared add-task prompt. On submit
+// (Enter at stage 2), resolves the offset and emits PipelineAddTaskMsg —
+// same message the pipeline view uses so main.go has one handler for both
+// entry points.
+func (m ViewerModel) handleAddTaskInput(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
+	if !m.addTask.handleKey(msg) {
+		return m, nil
+	}
+	app := m.app
+	title := m.addTask.Title()
+	due := m.addTask.ResolvedDue()
+	m.addTask.close()
+	return m, func() tea.Msg {
+		return PipelineAddTaskMsg{App: app, Title: title, Due: due}
+	}
+}
+
+// overlayAddTaskPrompt delegates to the shared renderer with the viewer's
+// application as the target label.
+func (m ViewerModel) overlayAddTaskPrompt(body string) string {
+	target := fmt.Sprintf("#%d %s", m.app.Number, m.app.Company)
+	if m.app.Number == 0 {
+		target = m.app.Company
+	}
+	return m.addTask.render(body, m.theme, target)
+}
+
 func (m ViewerModel) bodyHeight() int {
 	h := m.height - 4 // header + footer + padding
 	if h < 3 {
@@ -120,7 +328,43 @@ func (m ViewerModel) View() string {
 	body := m.renderBody()
 	footer := m.renderFooter()
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	view := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	if m.statusPicker {
+		view = m.overlayStatusPicker(view)
+	}
+	if m.addTask.active() {
+		view = m.overlayAddTaskPrompt(view)
+	}
+	return view
+}
+
+func (m ViewerModel) overlayStatusPicker(body string) string {
+	bodyLines := strings.Split(body, "\n")
+
+	pickerWidth := 30
+	padStyle := lipgloss.NewStyle().Padding(0, 2)
+	borderStyle := lipgloss.NewStyle().
+		Foreground(m.theme.Blue).
+		Bold(true)
+
+	var picker []string
+	picker = append(picker, padStyle.Render(borderStyle.Render("Change status:")))
+
+	for i, opt := range statusOptions {
+		style := lipgloss.NewStyle().Foreground(m.theme.Text).Width(pickerWidth)
+		if i == m.statusCursor {
+			style = style.Background(m.theme.Overlay).Bold(true)
+		}
+		prefix := "  "
+		if i == m.statusCursor {
+			prefix = "> "
+		}
+		label := fmt.Sprintf("%s (%s)", opt.label, strings.ToUpper(opt.shortcut))
+		picker = append(picker, padStyle.Render(style.Render(prefix+label)))
+	}
+
+	bodyLines = append(bodyLines, picker...)
+	return strings.Join(bodyLines, "\n")
 }
 
 func (m ViewerModel) renderHeader() string {
@@ -550,9 +794,153 @@ func (m ViewerModel) renderFooter() string {
 	keyStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Text)
 	descStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
 
-	return style.Render(
-		keyStyle.Render("↑↓") + descStyle.Render(" scroll  ") +
-			keyStyle.Render("PgUp/Dn") + descStyle.Render(" page  ") +
-			keyStyle.Render("g/G") + descStyle.Render(" top/end  ") +
-			keyStyle.Render("Esc") + descStyle.Render(" back"))
+	// While the add-task prompt is open, hide the navigation hints and
+	// show input-mode hints instead so the user knows what's reachable.
+	if m.addTask.active() {
+		return style.Render(
+			keyStyle.Render("type") + descStyle.Render(" input  ") +
+				keyStyle.Render("↑↓") + descStyle.Render(" ±day  ") +
+				keyStyle.Render("Enter") + descStyle.Render(" next/save  ") +
+				keyStyle.Render("Esc") + descStyle.Render(" cancel"))
+	}
+
+	parts := keyStyle.Render("↑↓") + descStyle.Render(" scroll  ") +
+		keyStyle.Render("PgUp/Dn") + descStyle.Render(" page  ") +
+		keyStyle.Render("g/G") + descStyle.Render(" top/end  ")
+	if m.hasApp {
+		parts += keyStyle.Render("c") + descStyle.Render(" change status  ")
+	}
+	if m.app.JobURL != "" {
+		parts += keyStyle.Render("o") + descStyle.Render(" open URL  ")
+	}
+	if m.app.Number > 0 {
+		parts += keyStyle.Render("n") + descStyle.Render(" new task  ") +
+			keyStyle.Render("t") + descStyle.Render(" tasks  ")
+	}
+	parts += keyStyle.Render("Esc") + descStyle.Render(" back")
+	return style.Render(parts)
+}
+
+// ── Word wrapping ───────────────────────────────────────────────────
+//
+// Long paragraphs (e.g. JD body text scraped from LinkedIn) used to render
+// truncated at the terminal edge. We pre-wrap once at load and again on
+// every Resize so scroll math stays in display-line space and the user can
+// always read the full content.
+
+// wrapAll wraps every line in raw to the given width, preserving any
+// markdown prefix (heading, bullet, blockquote) on the first sub-line and
+// indenting continuation lines appropriately. Returns a flat list of
+// display lines suitable for direct rendering.
+func wrapAll(raw []string, width int) []string {
+	if width <= 10 {
+		// Too narrow to wrap usefully — fall back to raw to avoid mangled output.
+		out := make([]string, len(raw))
+		copy(out, raw)
+		return out
+	}
+	out := make([]string, 0, len(raw))
+	for _, line := range raw {
+		out = append(out, wrapLine(line, width)...)
+	}
+	return out
+}
+
+// wrapLine wraps a single source line to width, preserving markdown prefix
+// structure. Tables, horizontal rules, and short-enough lines pass through
+// unchanged.
+func wrapLine(line string, width int) []string {
+	if utf8.RuneCountInString(line) <= width {
+		return []string{line}
+	}
+	trimmed := strings.TrimSpace(line)
+	// Pass-through cases: tables (handled by renderTableBlock), horizontal
+	// rules, and empty lines.
+	if trimmed == "" || strings.HasPrefix(trimmed, "|") || trimmed == "---" || trimmed == "***" {
+		return []string{line}
+	}
+
+	// Determine prefix (kept on first sub-line) and continuation indent
+	// (used on every subsequent sub-line). Headings get no continuation —
+	// the leading marker is part of the headline, not the prose.
+	var prefix, continuation, body string
+	switch {
+	case strings.HasPrefix(trimmed, "### "):
+		prefix = "### "
+		continuation = "    "
+		body = strings.TrimPrefix(trimmed, "### ")
+	case strings.HasPrefix(trimmed, "## "):
+		prefix = "## "
+		continuation = "   "
+		body = strings.TrimPrefix(trimmed, "## ")
+	case strings.HasPrefix(trimmed, "# "):
+		prefix = "# "
+		continuation = "  "
+		body = strings.TrimPrefix(trimmed, "# ")
+	case strings.HasPrefix(trimmed, "> "):
+		prefix = "> "
+		continuation = "> "
+		body = strings.TrimPrefix(trimmed, "> ")
+	case strings.HasPrefix(trimmed, "- "):
+		prefix = "- "
+		continuation = "  "
+		body = strings.TrimPrefix(trimmed, "- ")
+	case strings.HasPrefix(trimmed, "* "):
+		prefix = "* "
+		continuation = "  "
+		body = strings.TrimPrefix(trimmed, "* ")
+	default:
+		body = trimmed
+	}
+
+	bodyWidth := width - utf8.RuneCountInString(prefix)
+	if bodyWidth < 10 {
+		return []string{line}
+	}
+	wrapped := wordWrap(body, bodyWidth)
+	if len(wrapped) <= 1 {
+		return []string{line}
+	}
+
+	result := make([]string, len(wrapped))
+	for i, w := range wrapped {
+		if i == 0 {
+			result[i] = prefix + w
+		} else {
+			result[i] = continuation + w
+		}
+	}
+	return result
+}
+
+// wordWrap performs greedy word-wrap: pack as many whitespace-separated
+// tokens as fit, then start a new line. A single word longer than width is
+// kept on its own line rather than mid-word split (terminal will truncate
+// at the right edge if it's truly that long, but that's rare).
+func wordWrap(text string, width int) []string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return []string{text}
+	}
+	var lines []string
+	var current strings.Builder
+	for _, w := range words {
+		if current.Len() == 0 {
+			current.WriteString(w)
+			continue
+		}
+		runeLen := utf8.RuneCountInString(current.String()) + 1 + utf8.RuneCountInString(w)
+		if runeLen <= width {
+			current.WriteByte(' ')
+			current.WriteString(w)
+		} else {
+			lines = append(lines, current.String())
+			current.Reset()
+			current.WriteString(w)
+		}
+	}
+	if current.Len() > 0 {
+		lines = append(lines, current.String())
+	}
+	return lines
 }

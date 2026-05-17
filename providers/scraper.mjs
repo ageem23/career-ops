@@ -11,19 +11,32 @@
 //       careers_url: "https://example.com/jobs?q=foo"
 //       provider: scraper
 //       url_must_include: "/careers/"
-//       list_item_pattern: '"jobTitle":"([^"]+)","jobUrl":"([^"]+)"'   # group 1=title, 2=url
+//       list_item_pattern: '"jobTitle":"([^"]+)","jobUrl":"([^"]+)"'   # default: g1=title, g2=url
 //
 // Use single-quoted YAML strings for `list_item_pattern` so backslashes are
 // preserved literally. The string is compiled with `new RegExp(s, 'g')` —
 // the `g` flag is added automatically. To disable URL filtering, set
 // `url_must_include: ""`.
 //
-// Company name isn't available at the list-page level — the source site only
-// exposes it on the detail page. Scan time uses a unique-per-job placeholder
-// (`Scraper #{id}`) so dedup works correctly; the real company name is
-// filled in by the pipeline mode when extracting the full JD.
+// Capture-group mapping (optional): when the source-page markup puts the
+// company name next to the title/URL, widen the regex to capture all three
+// and tell the scraper which group is which:
+//
+//       list_item_pattern: '<span>([^<]+)</span>...href="(/job/[^"]+)"...>([^<]+)</a>'
+//       title_group: 3        # default 1
+//       url_group: 2          # default 2
+//       company_group: 1      # default 0 (= unused, fall back to "Scraper #{id}")
+//
+// When the list page doesn't expose the company (no `company_group`), the
+// entry falls back to `Scraper #{id}` and the real name gets filled in
+// later by the pipeline mode when it extracts the full JD.
+//
+// Relative URLs (e.g. `/job/...`) are absolutized against `careers_url` so
+// the resulting pipeline entry is fetchable later.
 
 const MAX_PAGES = 20;
+import { assertSafeHttpUrl } from './_http.mjs';
+
 // Defensive cap for `list_item_pattern` execution. Patterns are compiled from
 // portals.yml — a runaway regex on a large page can spin for a long time. Stop
 // well above any realistic single-page result count.
@@ -70,7 +83,59 @@ function compilePattern(pattern, entryName) {
   }
 }
 
-function extractJobsFromHtml(html, pattern, urlMustInclude, entryName) {
+function absolutizeUrl(url, baseUrl) {
+  if (/^https?:\/\//i.test(url)) return url;
+  // Resolve against the full baseUrl (including its path) so path-relative
+  // hrefs like "job/123" or "../job/123" inherit the correct directory.
+  // The URL constructor also handles protocol-relative URLs ("//foo.com/...")
+  // by inheriting the base scheme, so no special-case branch is needed.
+  try {
+    return new URL(url, baseUrl).toString();
+  } catch {
+    return url;
+  }
+}
+
+// Parse a scraped URL into a same-origin-and-public guard. Returns the parsed
+// URL on success, or null if the URL should be dropped. Cases dropped:
+//   - unparseable / non-string input
+//   - non-http(s) scheme (javascript:, data:, file:)
+//   - private/loopback host (delegates to _http.mjs's central SSRF list)
+//   - different origin than the careers_url it was scraped from
+//     (defends against the scrape page injecting off-domain links)
+function validateScrapedUrl(url, baseOrigin) {
+  let parsed;
+  try { parsed = new URL(url); } catch { return null; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  try { assertSafeHttpUrl(parsed.toString()); } catch { return null; }
+  if (baseOrigin && parsed.origin !== baseOrigin) return null;
+  return parsed;
+}
+
+// Validate a capture-group config value at fetch time. `undefined`/`null`
+// falls back to the default; any other invalid shape (non-integer, negative,
+// or string that doesn't parse) throws a clear configuration error so the
+// user sees the problem at startup instead of an empty result set.
+function requireGroupIndex(value, fallback, field, entryName, { allowZero = false } = {}) {
+  if (value == null) return fallback;
+  const idx = Number(value);
+  const min = allowZero ? 0 : 1;
+  if (!Number.isInteger(idx) || idx < min) {
+    throw new Error(
+      `scraper: entry ${entryName} has invalid ${field}=${JSON.stringify(value)} ` +
+      `(must be an integer ≥${min})`,
+    );
+  }
+  return idx;
+}
+
+function extractJobsFromHtml(html, pattern, urlMustInclude, entryName, opts = {}) {
+  const titleGroup = opts.titleGroup || 1;
+  const urlGroup = opts.urlGroup || 2;
+  const companyGroup = opts.companyGroup || 0; // 0 = unused
+  const baseUrl = opts.baseUrl || '';
+  const baseOrigin = opts.baseOrigin || '';
+
   const jobs = [];
   const seen = new Set();
   pattern.lastIndex = 0;
@@ -81,16 +146,30 @@ function extractJobsFromHtml(html, pattern, urlMustInclude, entryName) {
       console.error(`⚠️  scraper: ${entryName} hit MAX_MATCHES_PER_PAGE (${MAX_MATCHES_PER_PAGE}) — truncating; check list_item_pattern for runaway matching`);
       break;
     }
-    const title = decodeText(m[1]);
-    const url = decodeText(m[2]);
-    if (urlMustInclude && !url.includes(urlMustInclude)) continue;
+    const title = decodeText(m[titleGroup] || '');
+    let url = decodeText(m[urlGroup] || '');
+    if (!title || !url) continue;
+    if (baseUrl) url = absolutizeUrl(url, baseUrl);
+    // Validate scheme + private-host + same-origin BEFORE accepting the URL.
+    // Without this, a hostile search-results page could inject off-domain
+    // or javascript:/data: hrefs that downstream tools blindly fetch.
+    const parsed = validateScrapedUrl(url, baseOrigin);
+    if (!parsed) continue;
+    // url_must_include matches against the pathname (not the full URL string)
+    // so a query-string bait like `?next=/job/` can't masquerade as a job link.
+    if (urlMustInclude && !parsed.pathname.includes(urlMustInclude)) continue;
     if (seen.has(url)) continue;
     seen.add(url);
     const id = extractIdFromUrl(url);
+    let company = `Scraper #${id}`;
+    if (companyGroup && m[companyGroup]) {
+      const c = decodeText(m[companyGroup]).trim();
+      if (c) company = c;
+    }
     jobs.push({
       title,
       url,
-      company: `Scraper #${id}`,
+      company,
       location: '',
     });
   }
@@ -113,6 +192,52 @@ function buildPageUrl(baseUrl, page, pageParam) {
   return `${baseUrl}${sep}${pageParam}=${page}`;
 }
 
+// List pages on busy sites (notably builtin.com) sometimes take 10–20s to
+// respond, blowing past the default 10s fetch timeout. Use a longer timeout
+// and one retry on transient failures — much cheaper than losing a whole
+// entry, while NOT amplifying load on sites that are returning permanent
+// errors (4xx, invalid URL, expired Apify rentals, etc.).
+const LIST_FETCH_TIMEOUT_MS = 30_000;
+const LIST_FETCH_RETRY_DELAY_MS = 1_500;
+
+// Heuristic: only retry errors that plausibly resolve on a second attempt.
+// _http.mjs marks HTTP error responses with err.status; everything else is
+// either an abort (per-request timeout fired), an undici cause-coded
+// connection failure, or a generic "fetch failed" wrapping a network error.
+function isTransientFetchError(err) {
+  if (!err) return false;
+  if (err.name === 'AbortError') return true;
+  if (typeof err.status === 'number') {
+    return err.status >= 500 && err.status < 600; // retry 5xx, not 4xx
+  }
+  const causeCode = err.cause?.code;
+  const transientCauses = new Set([
+    'UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_SOCKET',
+    'ECONNRESET',
+    'ECONNREFUSED',
+    'ETIMEDOUT',
+    'EAI_AGAIN',
+  ]);
+  if (causeCode && transientCauses.has(causeCode)) return true;
+  if (err.code && transientCauses.has(err.code)) return true;
+  // Bare "fetch failed" without status or recognized cause is treated as
+  // transient because undici uses it for transport-level failures (DNS,
+  // TLS reset, partial body) that often clear on retry.
+  if (typeof err.message === 'string' && err.message.includes('fetch failed')) return true;
+  return false;
+}
+
+async function fetchWithRetry(ctx, url) {
+  try {
+    return await ctx.fetchText(url, { timeoutMs: LIST_FETCH_TIMEOUT_MS });
+  } catch (err) {
+    if (!isTransientFetchError(err)) throw err;
+    await new Promise(r => setTimeout(r, LIST_FETCH_RETRY_DELAY_MS));
+    return await ctx.fetchText(url, { timeoutMs: LIST_FETCH_TIMEOUT_MS });
+  }
+}
+
 export default {
   id: 'scraper',
 
@@ -122,6 +247,16 @@ export default {
   async fetch(entry, ctx) {
     const baseUrl = entry.careers_url;
     if (!baseUrl) throw new Error(`scraper: entry ${entry.name} missing careers_url`);
+    // Validate careers_url upfront — same SSRF rules as the rest of the
+    // pipeline (no loopback, no RFC1918, no non-http(s) schemes). Throws a
+    // clear config error if the URL is internal or malformed.
+    let baseParsed;
+    try {
+      assertSafeHttpUrl(baseUrl);
+      baseParsed = new URL(baseUrl);
+    } catch (err) {
+      throw new Error(`scraper: entry ${entry.name} has invalid careers_url: ${err.message}`);
+    }
 
     if (entry.list_item_pattern == null || entry.list_item_pattern === '') {
       throw new Error(`scraper: entry ${entry.name} missing list_item_pattern`);
@@ -132,6 +267,14 @@ export default {
     const pattern = compilePattern(entry.list_item_pattern, entry.name);
     const urlMustInclude = entry.url_must_include;
     const pageParam = entry.page_param || 'page';
+    const extractOpts = {
+      titleGroup: requireGroupIndex(entry.title_group, 1, 'title_group', entry.name),
+      urlGroup: requireGroupIndex(entry.url_group, 2, 'url_group', entry.name),
+      // company_group is optional — 0 means "unused, fall back to Scraper #id"
+      companyGroup: requireGroupIndex(entry.company_group, 0, 'company_group', entry.name, { allowZero: true }),
+      baseUrl,
+      baseOrigin: baseParsed.origin,
+    };
 
     const all = [];
     const seenUrls = new Set();
@@ -140,12 +283,12 @@ export default {
       const pageUrl = buildPageUrl(baseUrl, page, pageParam);
       let html;
       try {
-        html = await ctx.fetchText(pageUrl);
+        html = await fetchWithRetry(ctx, pageUrl);
       } catch (err) {
         if (page === 1) throw err;
         break;
       }
-      const pageJobs = extractJobsFromHtml(html, pattern, urlMustInclude, entry.name);
+      const pageJobs = extractJobsFromHtml(html, pattern, urlMustInclude, entry.name, extractOpts);
       if (pageJobs.length === 0) break;
 
       let novel = 0;
