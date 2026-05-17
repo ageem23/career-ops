@@ -12,6 +12,7 @@
 import { readFileSync, writeFileSync, copyFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { normalizeCompany, roleMatch } from './dedup-utils.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 // Support both layouts: data/applications.md (boilerplate) and applications.md (original)
@@ -48,52 +49,6 @@ const STATUS_RANK = {
   'entrevista': 5,
   'oferta': 6,
 };
-
-function normalizeCompany(name) {
-  return name.toLowerCase()
-    .replace(/[()]/g, '')
-    .replace(/\s+/g, ' ')
-    .replace(/[^a-z0-9 ]/g, '')
-    .trim();
-}
-
-function normalizeRole(role) {
-  return role.toLowerCase()
-    .replace(/[()]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .replace(/[^a-z0-9 /]/g, '')
-    .trim();
-}
-
-const ROLE_STOPWORDS = new Set([
-  'senior', 'junior', 'lead', 'staff', 'principal', 'head', 'chief',
-  'manager', 'director', 'associate', 'intern', 'contractor',
-  'remote', 'hybrid', 'onsite',
-  'engineer', 'engineering',
-]);
-
-const LOCATION_STOPWORDS = new Set([
-  'tokyo', 'japan', 'london', 'berlin', 'paris', 'singapore',
-  'york', 'francisco', 'angeles', 'seattle', 'austin', 'boston',
-  'chicago', 'denver', 'toronto', 'amsterdam', 'dublin', 'sydney',
-  'remote', 'global', 'emea', 'apac', 'latam',
-]);
-
-function roleMatch(a, b) {
-  const filterStopwords = (words) =>
-    words.filter(w => !ROLE_STOPWORDS.has(w) && !LOCATION_STOPWORDS.has(w));
-
-  const wordsA = filterStopwords(normalizeRole(a).split(/\s+/).filter(w => w.length > 2));
-  const wordsB = filterStopwords(normalizeRole(b).split(/\s+/).filter(w => w.length > 2));
-
-  if (wordsA.length === 0 || wordsB.length === 0) return false;
-
-  const overlap = wordsA.filter(w => wordsB.some(wb => wb === w));
-  const smaller = Math.min(wordsA.length, wordsB.length);
-  const ratio = overlap.length / smaller;
-
-  return overlap.length >= 2 && ratio >= 0.6;
-}
 
 function parseScore(s) {
   const m = s.replace(/\*\*/g, '').match(/([\d.]+)/);
