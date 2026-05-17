@@ -65,12 +65,18 @@ export function roleTokens(role) {
 
 // Pre-tokenized comparison — used on scan's hot path so we don't
 // re-tokenize every previously-seen entry for every candidate job.
+//
+// Both sides are reduced to a Set before counting so a token repeated
+// on one side (e.g. "Platform Architect, Platform Team" → ["platform",
+// "architect", "platform", "team"]) doesn't double-count toward overlap
+// and inflate the ratio above threshold.
 export function roleMatchTokens(a, b) {
   if (a.length === 0 || b.length === 0) return false;
+  const setA = new Set(a);
   const setB = new Set(b);
   let overlap = 0;
-  for (const w of a) if (setB.has(w)) overlap++;
-  const smaller = Math.min(a.length, b.length);
+  for (const w of setA) if (setB.has(w)) overlap++;
+  const smaller = Math.min(setA.size, setB.size);
   return overlap >= 2 && (overlap / smaller) >= 0.6;
 }
 

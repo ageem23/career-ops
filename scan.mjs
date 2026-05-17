@@ -243,11 +243,12 @@ function addSeenCompanyRole(byCompany, company, role) {
   if (!company || !role) return;
   const norm = normalizeCompany(company);
   if (!norm) return;
+  // Entries whose role tokenizes to nothing (e.g. role was just a
+  // seniority word like "Manager") are still stored so --strict-dedup
+  // can find them by exactKey. Fuzzy mode is unaffected because
+  // findCompanyRoleDup short-circuits when the candidate's own tokens
+  // are empty, and roleMatchTokens returns false against any empty side.
   const tokens = roleTokens(role);
-  // Skip entries whose role tokenizes to nothing (e.g. role was just a
-  // seniority word like "Manager") — they'd false-positive against
-  // everything else in the same company.
-  if (tokens.length === 0) return;
   const exactKey = `${company.toLowerCase()}::${role.toLowerCase()}`;
   if (!byCompany.has(norm)) byCompany.set(norm, []);
   byCompany.get(norm).push({ role, tokens, exactKey });
