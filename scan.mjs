@@ -397,7 +397,14 @@ async function main() {
   // gets expensive fast. Run mid-filter.mjs first to cull obvious mid-tier
   // rejects with Haiku. Threshold lives in portals.yml so the user can tune it.
   const autoThresholdRaw = config.auto_mid_filter_threshold;
-  const autoThreshold = Number.isFinite(autoThresholdRaw) ? autoThresholdRaw : 20;
+  let autoThreshold = 20;
+  if (autoThresholdRaw !== undefined) {
+    if (Number.isFinite(autoThresholdRaw) && autoThresholdRaw >= 0) {
+      autoThreshold = autoThresholdRaw;
+    } else {
+      console.error(`⚠ portals.yml: auto_mid_filter_threshold must be a non-negative number (got ${JSON.stringify(autoThresholdRaw)}). Falling back to default ${autoThreshold}.`);
+    }
+  }
   if (!dryRun && !noAutoFilter && autoThreshold > 0 && newOffers.length >= autoThreshold) {
     console.log(`\n${'━'.repeat(45)}`);
     console.log(`Auto mid-filter: ${newOffers.length} new offers ≥ threshold ${autoThreshold}`);
