@@ -358,6 +358,11 @@ async function clickCard(page, index) {
 }
 
 async function extractDetailFromPanel(page) {
+  // Wait for the right-pane to populate before reading. LinkedIn sometimes
+  // renders the panel shell before the company name DOM mounts (sponsored
+  // placements especially), which produced empty-company entries in scans.
+  await page.waitForSelector(SELECTORS.panelCompany, { state: 'visible', timeout: 5000 }).catch(() => {});
+
   // Expand description if collapsed (best-effort; some panels render fully
   // expanded already, in which case the button isn't present).
   await page.evaluate(sel => {
@@ -496,6 +501,10 @@ async function runSearch(page, entry) {
       const detail = await extractDetailFromPanel(page);
       if (!detail.title) {
         warn(`  ✗ No title on card ${i}`);
+        continue;
+      }
+      if (!detail.company) {
+        warn(`  ✗ No company on card ${i}: ${detail.title}`);
         continue;
       }
       detail.applicationUrl = unwrapRedirect(detail.applicationUrl);
