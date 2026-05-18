@@ -1,3 +1,6 @@
+// @ts-check
+/** @typedef {import('./_types.js').Provider} Provider */
+
 // Lever provider — hits the public postings endpoint.
 // Auto-detects from careers_url pattern `https://jobs.lever.co/<slug>`.
 
@@ -8,6 +11,7 @@ function resolveApiUrl(entry) {
   return `https://api.lever.co/v0/postings/${match[1]}`;
 }
 
+/** @type {Provider} */
 export default {
   id: 'lever',
 

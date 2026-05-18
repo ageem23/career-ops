@@ -44,7 +44,7 @@ export function assertSafeHttpUrl(rawUrl) {
   }
 }
 
-async function fetchWithTimeout(url, { timeoutMs = DEFAULT_TIMEOUT_MS, headers = {}, method = 'GET', body = null } = {}) {
+async function fetchWithTimeout(url, { timeoutMs = DEFAULT_TIMEOUT_MS, headers = {}, method = 'GET', body = null, redirect = 'follow' } = {}) {
   assertSafeHttpUrl(url);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -53,14 +53,15 @@ async function fetchWithTimeout(url, { timeoutMs = DEFAULT_TIMEOUT_MS, headers =
       method,
       headers: { 'user-agent': DEFAULT_USER_AGENT, ...headers },
       body,
+      redirect,
       signal: controller.signal,
     });
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      const snippet = body.replace(/\s+/g, ' ').trim().slice(0, 300);
+      const responseText = await res.text().catch(() => '');
+      const snippet = responseText.replace(/\s+/g, ' ').trim().slice(0, 300);
       const err = new Error(snippet ? `HTTP ${res.status}: ${snippet}` : `HTTP ${res.status}`);
       err.status = res.status;
-      err.body = body;
+      err.body = responseText;
       throw err;
     }
     return res;
