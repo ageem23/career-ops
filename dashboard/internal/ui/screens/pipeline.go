@@ -1263,7 +1263,7 @@ func (m PipelineModel) renderHelp() string {
 		keyStyle.Render("v") + descStyle.Render(" view  ") +
 		keyStyle.Render("p") + descStyle.Render(" progress  ") +
 		keyStyle.Render("t") + descStyle.Render(" tasks  ") +
-		keyStyle.Render("Esc") + descStyle.Render(" quit")
+		keyStyle.Render("q") + descStyle.Render(" quit")
 
 	gap := m.width - lipgloss.Width(keys) - lipgloss.Width(brand) - 2
 	if gap < 1 {
