@@ -1,4 +1,4 @@
-# Modo: contacto -- LinkedIn Power Move
+# Mode: contacto -- LinkedIn Power Move
 
 ## 🚦 STOP — RESOLVE ACTIVE MODE FIRST (before reading anything else)
 
@@ -32,7 +32,7 @@ Your job is to emit a **single copy-paste-ready research prompt** that the user 
 
 1. A short one-line intro: `Paste this into claude.ai with Research mode enabled:`
 2. **One single fenced markdown code block** containing the full research prompt (template below). The entire prompt MUST be inside one code block so it's one-click-to-copy.
-3. After the code block: the contacts table + `add-task.mjs` copy-paste block (per **Paso 5** and **Paso 6** in MODE B below — those still emit in prompt mode so the user can track follow-ups even without doing the lookups themselves).
+3. After the code block: the contacts table + `add-task.mjs` copy-paste block (per **Step 5** and **Step 6** in MODE B below — those still emit in prompt mode so the user can track follow-ups even without doing the lookups themselves).
 
 **Prompt template — customize the placeholders before emitting:**
 
@@ -89,7 +89,7 @@ For each primary, one alternate at the same level with a one-sentence reason —
 **Deliverable:** Up to 6 verified targets, lock-in lines per target, custom 3-sentence messages per target, alternates, and a 1-sentence sequencing recommendation (who to message first, who to wait on).
 ````
 
-After the code block, emit the contacts table and the `add-task.mjs` block per **Paso 5** and **Paso 6** in MODE B.
+After the code block, emit the contacts table and the `add-task.mjs` block per **Step 5** and **Step 6** in MODE B.
 
 **END OF MODE A. Do not proceed into MODE B.**
 
@@ -99,110 +99,110 @@ After the code block, emit the contacts table and the `add-task.mjs` block per *
 
 ⚠️ Only execute everything below if you resolved mode = `inline` in the routing step above.
 
-### Output contract (lee esto antes de empezar)
+### Output contract (read this before starting)
 
-Toda invocacion de `contacto` en modo `inline` produce, en este orden y sin excepciones:
+Every `contacto` invocation in `inline` mode produces, in this order and without exceptions:
 
-1. Un mensaje de LinkedIn al **target primario** (frases 1-2-3, ≤300 caracteres).
-2. Una **tabla numerada de contactos sugeridos** (primario + alternativos), con la columna `App#` resuelta desde `data/applications.md`.
-3. Un **bloque `add-task.mjs` copy-paste** -- siempre, sea cual sea el entorno (Claude Code, Claude web, otro CLI). El bloque va siempre; no es opcional.
+1. A LinkedIn message for the **primary target** (sentences 1-2-3, ≤300 characters).
+2. A **numbered table of suggested contacts** (primary + alternates), with the `App#` column resolved from `data/applications.md`.
+3. An **`add-task.mjs` copy-paste block** — always, regardless of environment (Claude Code, Claude web, other CLI). The block is always emitted; it is not optional.
 
-Si terminas tu respuesta sin el bloque `add-task.mjs`, no has completado el modo.
+If you end your response without the `add-task.mjs` block, you have not completed the mode.
 
 ---
 
-## Paso 1 -- Identificar targets
+## Step 1 — Identify targets
 
 Via WebSearch:
-- Hiring manager del equipo
-- Recruiter asignado
-- 2-3 peers del equipo (gente con rol similar)
-- Interviewer (si el candidato ya tiene entrevista programada)
+- Hiring manager of the team
+- Assigned recruiter
+- 2-3 team peers (people with similar roles)
+- Interviewer (if the candidate already has a scheduled interview)
 
-## Paso 2 -- Clasificar tipo
+## Step 2 — Classify contact type
 
-Preguntar al candidato o inferir del contexto:
-- **Recruiter** -- persona cuyo rol es talent acquisition, sourcing, o recruiting
-- **Hiring Manager** -- la persona que lidera el equipo que contrata
-- **Peer** -- alguien con un rol similar en el equipo (referral indirecto)
-- **Interviewer** -- alguien que va a entrevistar al candidato (fecha conocida)
+Ask the candidate or infer from context:
+- **Recruiter** — person whose role is talent acquisition, sourcing, or recruiting
+- **Hiring Manager** — the person who leads the hiring team
+- **Peer** — someone with a similar role in the team (indirect referral)
+- **Interviewer** — someone who will interview the candidate (known date)
 
-## Paso 3 -- Seleccionar target primario
+## Step 3 — Select primary target
 
-La persona que mas se beneficiaria de que el candidato estuviera alli.
+The person who would benefit most from the candidate being there.
 
-## Paso 4 -- Generar mensaje (3 frases, ≤300 caracteres)
+## Step 4 — Generate message (3 sentences, ≤300 characters)
 
-Adaptar el framework al tipo de contacto:
+Adapt the framework to the contact type:
 
 ### Recruiter
-- **Frase 1 (Fit)**: Criterios de match directo -- rol, experiencia relevante, disponibilidad o ubicacion
-- **Frase 2 (Prueba)**: Dato que responda sus preguntas de screening antes de que las hagan (ej: "5 years building ML pipelines, currently in Berlin, available immediately")
-- **Frase 3 (CTA)**: "Happy to share my CV if this aligns with what you're looking for"
+- **Sentence 1 (Fit)**: Direct match criteria — role, relevant experience, availability, or location
+- **Sentence 2 (Proof)**: Data that answers their screening questions before they ask them (e.g., "5 years building ML pipelines, currently in Berlin, available immediately")
+- **Sentence 3 (CTA)**: "Happy to share my CV if this aligns with what you're looking for"
 
 ### Hiring Manager
-- **Frase 1 (Gancho)**: Reto especifico que enfrenta su equipo (extraido del JD, company blog, o noticias)
-- **Frase 2 (Prueba)**: Mayor logro cuantificable del candidato que demuestre que ha resuelto problemas similares
-- **Frase 3 (CTA)**: "Would love to hear how your team is approaching [reto especifico]"
+- **Sentence 1 (Hook)**: Specific challenge their team is facing (extracted from the JD, company blog, or news)
+- **Sentence 2 (Proof)**: Candidate's greatest quantifiable achievement showing they have solved similar problems
+- **Sentence 3 (CTA)**: "Would love to hear how your team is approaching [specific challenge]"
 
 ### Peer (referral)
-- **Frase 1 (Interes)**: Referencia genuina a su trabajo -- blog post, charla, proyecto open source, o publicacion
-- **Frase 2 (Conexion)**: Algo que el candidato esta haciendo en el mismo espacio (NO un pitch de empleo)
-- **Frase 3 (CTA)**: "I've been working on similar problems at [empresa], would love to hear your take on [tema]"
-- **Nota**: NO pedir empleo. La referral ocurre naturalmente si la conversacion fluye.
+- **Sentence 1 (Interest)**: Genuine reference to their work — blog post, talk, open-source project, or publication
+- **Sentence 2 (Connection)**: Something the candidate is doing in the same space (NOT a job pitch)
+- **Sentence 3 (CTA)**: "I've been working on similar problems at [company], would love to hear your take on [topic]"
+- **Note**: DO NOT ask for a job. The referral happens naturally if the conversation flows.
 
-### Interviewer (pre-entrevista)
-- **Frase 1 (Research)**: Referencia a algo especifico de su trabajo o trayectoria
-- **Frase 2 (Contexto)**: Conexion ligera con la experiencia del candidato en ese tema
-- **Frase 3 (CTA)**: "Looking forward to our conversation on [fecha]"
-- **Nota**: Tono ligero, no desesperado. El objetivo es que sepan que te preparaste.
+### Interviewer (pre-interview)
+- **Sentence 1 (Research)**: Reference to something specific from their work or trajectory
+- **Sentence 2 (Context)**: Light connection to the candidate's experience in that area
+- **Sentence 3 (CTA)**: "Looking forward to our conversation on [date]"
+- **Note**: Light tone, not desperate. The goal is to show that you prepared.
 
-**Idiomas**: EN (default). ES si la empresa es espanola.
+**Languages**: EN (default). ES if the company is Spanish.
 
-## Paso 5 -- Tabla de contactos + App# lookup (OBLIGATORIO)
+## Step 5 — Contacts table + App# lookup (MANDATORY)
 
-Listar el primario y los alternativos en una tabla. Antes de mostrarla, buscar el `App#` para cada uno:
+List the primary and the alternates in a table. Before showing it, look up the `App#` for each:
 
-- Abrir `data/applications.md`.
-- Buscar la fila mas reciente con `Company` == empresa del contacto y status activo (`Applied` / `Responded` / `Interview` / `Evaluated`).
-- Si hay match, escribir el numero de la columna `#` en la columna `App#` de la tabla. Si no hay match, escribir `-`.
+- Open `data/applications.md`.
+- Find the most recent row where `Company` == the contact's company and status is active (`Applied` / `Responded` / `Interview` / `Evaluated`).
+- If there is a match, write the number from the `#` column into the `App#` column of the table. If no match, write `-`.
 
 ```markdown
-| # | Nombre | Rol | Empresa | App# | LinkedIn |
-|---|--------|-----|---------|------|----------|
+| # | Name | Role | Company | App# | LinkedIn |
+|---|------|------|---------|------|----------|
 | 1 | Jane Doe | Recruiter | Acme | 412 | linkedin.com/in/jane-doe |
 | 2 | John Smith | Hiring Manager | Acme | 412 | linkedin.com/in/john-smith |
 ```
 
-## Paso 6 -- Bloque add-task.mjs (OBLIGATORIO -- siempre)
+## Step 6 — add-task.mjs block (MANDATORY — always)
 
-Inmediatamente despues de la tabla, **siempre** emitir un bloque bash listo para pegar. Una linea por contacto, sin pedir confirmacion previa (la idempotencia de `add-task.mjs` hace seguro que el usuario lo ejecute selectivamente o entero):
+Immediately after the table, **always** emit a paste-ready bash block. One line per contact, no prior confirmation needed (the idempotency of `add-task.mjs` makes it safe for the user to run selectively or in full):
 
 ```bash
 node add-task.mjs --type contact --app 412 --title "LinkedIn: Jane Doe (Recruiter)" --notes "linkedin.com/in/jane-doe"
 node add-task.mjs --type contact --app 412 --title "LinkedIn: John Smith (Hiring Manager)" --notes "linkedin.com/in/john-smith"
 ```
 
-Reglas del bloque (no negociables):
-- Un comando por linea, sin barras invertidas de continuacion -- el usuario debe poder pegar el bloque entero.
-- Incluir `--app {numero}` cuando exista match en el tracker. `add-task.mjs` auto-rellena `--company` desde `data/applications.md`, asi que se omite `--company` cuando hay `--app`.
-- Si no hay match, omitir `--app` y pasar `--company "{Empresa}"` explicitamente.
-- `--title` debe usar el patron exacto `LinkedIn: {Nombre} ({Rol})`. `--notes` debe contener la URL de LinkedIn (sin `https://`).
-- Citar comillas dobles externas; escapar comillas internas con `\"`.
+Block rules (non-negotiable):
+- One command per line, no backslash line continuations — the user must be able to paste the entire block.
+- Include `--app {number}` when there is a match in the tracker. `add-task.mjs` auto-fills `--company` from `data/applications.md`, so `--company` is omitted when `--app` is present.
+- If there is no match, omit `--app` and pass `--company "{Company}"` explicitly.
+- `--title` must use the exact pattern `LinkedIn: {Name} ({Role})`. `--notes` must contain the LinkedIn URL (without `https://`).
+- Quote outer double quotes; escape inner quotes with `\"`.
 
-Cerrar el bloque con la frase: **"Pega esto en una terminal en el directorio del proyecto."**
+Close the block with the line: **"Paste this into a terminal in the project directory."**
 
-Si el agente tiene acceso a Bash (Claude Code), ofrecer adicionalmente ejecutar el bloque al instante. En Claude web el usuario lo copia y pega.
+If the agent has Bash access (Claude Code), additionally offer to run the block immediately. In Claude web the user copies and pastes.
 
-`add-task.mjs` es idempotente: re-ejecutar con el mismo tipo, titulo y App# no duplica la tarea.
+`add-task.mjs` is idempotent: re-running with the same type, title, and App# does not duplicate the task.
 
 ---
 
-## Reglas del mensaje
+## Message rules
 
-- Maximo 300 caracteres (LinkedIn connection request limit)
+- Maximum 300 characters (LinkedIn connection request limit)
 - NO corporate-speak
 - NO "I'm passionate about..."
-- Algo que haga que quieran responder
-- NUNCA compartir telefono
-- El tipo de contacto cambia el ENFASIS, no la estructura
+- Something that makes them want to respond
+- NEVER share phone number
+- The contact type changes the EMPHASIS, not the structure

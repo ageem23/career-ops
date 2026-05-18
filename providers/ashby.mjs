@@ -1,3 +1,6 @@
+// @ts-check
+/** @typedef {import('./_types.js').Provider} Provider */
+
 // Ashby provider — hits the public posting-api endpoint.
 // Auto-detects from careers_url pattern `https://jobs.ashbyhq.com/<slug>`.
 
@@ -8,6 +11,7 @@ function resolveApiUrl(entry) {
   return `https://api.ashbyhq.com/posting-api/job-board/${match[1]}?includeCompensation=true`;
 }
 
+/** @type {Provider} */
 export default {
   id: 'ashby',
 
@@ -20,8 +24,6 @@ export default {
     const apiUrl = resolveApiUrl(entry);
     if (!apiUrl) throw new Error(`ashby: cannot derive API URL for ${entry.name}`);
     const json = await ctx.fetchJson(apiUrl);
-    // Guard against malformed upstream payloads — a truthy non-array
-    // `json.jobs` (e.g. an object on an error page) would crash `.map()`.
     const jobs = Array.isArray(json?.jobs) ? json.jobs : [];
     return jobs.map(j => ({
       title: j.title || '',

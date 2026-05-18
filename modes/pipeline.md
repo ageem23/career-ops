@@ -1,63 +1,63 @@
-# Modo: pipeline — Inbox de URLs (Second Brain)
+# Mode: pipeline — URL Inbox (Second Brain)
 
-Procesa URLs de ofertas acumuladas en `data/pipeline.md`. El usuario agrega URLs cuando quiera y luego ejecuta `/career-ops pipeline` para procesarlas todas.
+Process job URLs stored in `data/pipeline.md`. The user adds URLs at any time and then executes `/career-ops pipeline` to process them all.
 
 ## Workflow
 
-1. **Leer** `data/pipeline.md` → buscar items `- [ ]` en la sección "Pendientes"
-2. **Para cada URL pendiente**:
-   a. Calcular siguiente `REPORT_NUM` secuencial (leer `reports/`, tomar el número más alto + 1)
-   b. **Extraer JD** usando Playwright (browser_navigate + browser_snapshot) → WebFetch → WebSearch
-   c. Si la URL no es accesible → marcar como `- [!]` con nota y continuar
-   d. **Ejecutar auto-pipeline completo**: Evaluación A-F → Report .md → PDF (si score ≥ `auto_pdf_score_threshold`) → Tracker
-   e. **Mover de "Pendientes" a "Procesadas"**: `- [x] #NNN | URL | Empresa | Rol | Score/5 | PDF ✅/❌`
+1. **Read** `data/pipeline.md` → search for `- [ ]` items in the "Pending" section
+2. **For each pending URL**:
+   a. Calculate the next sequential `REPORT_NUM` (read `reports/`, take the highest number + 1)
+   b. **Extract JD** using Playwright (browser_navigate + browser_snapshot) → WebFetch → WebSearch
+   c. If the URL is not accessible → mark as `- [!]` with a note and continue
+   d. **Execute full auto-pipeline**: Evaluation A-F → Report .md → PDF (if score >= `auto_pdf_score_threshold`) → Tracker
+   e. **Move from "Pending" to "Processed"**: `- [x] #NNN | URL | Company | Role | Score/5 | PDF ✅/❌`
 
-   **Sobre el PDF gate (configurable, default-disabled):** Leer `config/profile.yml` → `auto_pdf_score_threshold`. Si la clave no existe, default `5.1` (efectivamente deshabilitado — el max score posible es 5.0). Si el score de la evaluación es menor que el threshold, omitir la generación de PDF: escribir el report normalmente, mostrar en el header `**PDF:** not generated — run /career-ops pdf {company-slug} to create on demand`, y marcar PDF ❌ en el tracker. Si el score es ≥ threshold, generar el PDF como siempre.
+   **About the PDF gate (configurable, default-disabled):** Read `config/profile.yml` → `auto_pdf_score_threshold`. If the key does not exist, default to `5.1` (effectively disabled — the maximum possible score is 5.0). If the evaluation score is less than the threshold, skip PDF generation: write the report normally, show in the header `**PDF:** not generated — run /career-ops pdf {company-slug} to create on demand`, and mark PDF ❌ in the tracker. If the score is ≥ threshold, generate the PDF as usual.
 
-   **Por qué default-disabled:** Generar un PDF tailored cuesta ~30–60s por entrada (Playwright launch + HTML render) y produce archivos que casi nunca se usan — la mayoría de roles puntúan en 2.x/3.x y nunca llegan a aplicación. Mejor escribir el report (barato, útil para triaje) y dejar el PDF como acción on-demand vía `/career-ops pdf {slug}` cuando el usuario decide aplicar.
+   **Why default-disabled:** Generating a tailored PDF costs ~30–60s per entry (Playwright launch + HTML render) and produces files that are rarely used — most roles score in the 2.x/3.x range and never reach the application stage. Better to write the report (cheap, useful for triage) and leave the PDF as an on-demand action via `/career-ops pdf {slug}` when the user decides to apply.
 
-   **Cómo activar auto-PDF:** Editar `config/profile.yml` y añadir `auto_pdf_score_threshold: 4.0` (o el valor preferido). Ambos modos (Path A `/career-ops pipeline` y Path B `batch/batch-runner.sh`) leen la misma clave para que el comportamiento sea consistente.
-3. **Si hay 3+ URLs pendientes**, lanzar agentes en paralelo (Agent tool con `run_in_background`) para maximizar velocidad.
-4. **Al terminar**, mostrar tabla resumen:
+   **How to enable auto-PDF:** Edit `config/profile.yml` and add `auto_pdf_score_threshold: 4.0` (or the preferred value). Both modes (Path A `/career-ops pipeline` and Path B `batch/batch-runner.sh`) read the same key so the behavior is consistent.
+3. **If there are 3+ pending URLs**, launch agents in parallel (Agent tool with `run_in_background`) to maximize speed.
+4. **At the end**, show summary table:
 
 ```
-| # | Empresa | Rol | Score | PDF | Acción recomendada |
+| # | Company | Role | Score | PDF | Recommended action |
 ```
 
-## Formato de pipeline.md
+## Format of pipeline.md
 
 ```markdown
-## Pendientes
+## Pending
 - [ ] https://jobs.example.com/posting/123
 - [ ] https://boards.greenhouse.io/company/jobs/456 | Company Inc | Senior PM
 - [!] https://private.url/job — Error: login required
 
-## Procesadas
+## Processed
 - [x] #143 | https://jobs.example.com/posting/789 | Acme Corp | AI PM | 4.2/5 | PDF ✅
 - [x] #144 | https://boards.greenhouse.io/xyz/jobs/012 | BigCo | SA | 2.1/5 | PDF ❌
 ```
 
-## Detección inteligente de JD desde URL
+## Intelligent JD detection from URL
 
-1. **Playwright (preferido):** `browser_navigate` + `browser_snapshot`. Funciona con todas las SPAs.
-2. **WebFetch (fallback):** Para páginas estáticas o cuando Playwright no está disponible.
-3. **WebSearch (último recurso):** Buscar en portales secundarios que indexan el JD.
+1. **Playwright (preferred):** `browser_navigate` + `browser_snapshot`. Works with all SPAs.
+2. **WebFetch (fallback):** For static pages or when Playwright is unavailable.
+3. **WebSearch (last resort):** Search in secondary portals that index the JD.
 
-**Casos especiales:**
-- **LinkedIn**: Puede requerir login → marcar `[!]` y pedir al usuario que pegue el texto
-- **PDF**: Si la URL apunta a un PDF, leerlo directamente con Read tool
-- **`local:` prefix**: Leer el archivo local. Ejemplo: `local:jds/linkedin-pm-ai.md` → leer `jds/linkedin-pm-ai.md`
+**Special cases:**
+- **LinkedIn**: May require login → mark `[!]` and ask the user to paste the text
+- **PDF**: If the URL points to a PDF, read it directly with the Read tool
+- **`local:` prefix**: Read the local file. Example: `local:jds/linkedin-pm-ai.md` → read `jds/linkedin-pm-ai.md`
 
-## Numeración automática
+## Automatic numbering
 
-1. Listar todos los archivos en `reports/`
-2. Extraer el número del prefijo (e.g., `142-medispend...` → 142)
-3. Nuevo número = máximo encontrado + 1
+1. List all files in `reports/`
+2. Extract the number from the prefix (e.g., `142-medispend...` → 142)
+3. New number = maximum found + 1
 
-## Sincronización de fuentes
+## Source synchronization
 
-Antes de procesar cualquier URL, verificar sync:
+Before processing any URL, verify sync:
 ```bash
 node cv-sync-check.mjs
 ```
-Si hay desincronización, advertir al usuario antes de continuar.
+If there is a desynchronization, warn the user before continuing.
