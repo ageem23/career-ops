@@ -22,7 +22,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, copyFileSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, resolve, relative, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
@@ -39,12 +39,23 @@ function argValue(flag) {
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : null;
 }
 
-const PIPELINE_FILE = argValue('--pipeline') || (
-  existsSync(join(CAREER_OPS, 'data/pipeline.md'))
-    ? join(CAREER_OPS, 'data/pipeline.md')
-    : join(CAREER_OPS, 'pipeline.md')
-);
-const STATE_FILE = argValue('--state') || join(CAREER_OPS, 'batch/batch-state.tsv');
+// Constrain user-supplied --state/--pipeline paths to the repository tree, so a
+// crafted path cannot read from or overwrite files outside the project.
+function resolveInsideRepo(inputPath, fallbackPath, flag) {
+  const abs = resolve(inputPath || fallbackPath);
+  const rel = relative(CAREER_OPS, abs);
+  if (rel.startsWith('..') || isAbsolute(rel)) {
+    console.error(`Invalid ${flag}: path must stay inside the repository (${abs})`);
+    process.exit(1);
+  }
+  return abs;
+}
+
+const defaultPipeline = existsSync(join(CAREER_OPS, 'data/pipeline.md'))
+  ? join(CAREER_OPS, 'data/pipeline.md')
+  : join(CAREER_OPS, 'pipeline.md');
+const PIPELINE_FILE = resolveInsideRepo(argValue('--pipeline'), defaultPipeline, '--pipeline');
+const STATE_FILE = resolveInsideRepo(argValue('--state'), join(CAREER_OPS, 'batch/batch-state.tsv'), '--state');
 const REPORTS_DIR = join(CAREER_OPS, 'reports');
 
 // ---- guards ----
@@ -229,10 +240,12 @@ for (let i = 0; i < lines.length; i++) {
     skipBlankAfterProc = true;
   }
 }
-// No Procesadas section yet — create one at the end of the file.
+// No Procesadas section yet — create one at the end of the file, matching the
+// language the pending section header already uses.
 if (procStart < 0 && movedProcLines.length > 0) {
+  const processedHeader = /Pending/i.test(lines[pendStart]) ? '## Processed' : '## Procesadas';
   if (out.length && out[out.length - 1].trim() !== '') out.push('');
-  out.push('## Procesadas', '', ...movedProcLines);
+  out.push(processedHeader, '', ...movedProcLines);
 }
 
 const newContent = out.join('\n');
