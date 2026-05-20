@@ -76,20 +76,18 @@ cv:
 # Auto-PDF threshold during evaluation (used by `/career-ops pipeline` and
 # `bash batch/batch-runner.sh`).
 #
-# Generating a tailored CV PDF costs ~30-60s per offer (Playwright launch +
-# HTML render) and most offers in a scan score 2.x/3.x and never become an
-# actual application — so the PDF goes unused. To avoid that waste, the
-# evaluation pipeline only auto-generates a PDF when the offer's score is
-# >= this threshold.
+# An offer's tailored CV PDF is auto-generated only when its score is
+# >= this threshold. Generating a PDF costs ~30-60s per offer (Playwright
+# launch + HTML render), and most offers in a scan score 2.x/3.x and never
+# become an actual application — so the gate avoids wasted renders.
 #
-# Default (key absent OR commented out): 5.1 — effectively disabled, since
-# the maximum possible score is 5.0. Reports are always written; PDFs are
-# only generated when you opt-in.
+# Default (key absent OR commented out): 3.0 — the original gate of
+# `/career-ops pipeline`. Both evaluation paths apply the same default, so
+# a batch run and an interactive run treat the same offer identically.
 #
-# Set this to a real number (e.g. 4.0) to opt in to auto-PDF for offers at
-# or above that score. Fractional thresholds work (e.g. 3.5 — half-point
-# scores like 3.5/5 occur in evaluations). Setting to 0 effectively
-# disables the gate and generates a PDF for every offer (old behavior).
-# Whatever doesn't make the cut can still be produced on demand later
-# via `/career-ops pdf {company-slug}`.
+# Raise it (e.g. 4.0) to auto-generate PDFs only for stronger matches and
+# leave the rest report-only — those can still be produced on demand via
+# `/career-ops pdf {company-slug}`. Fractional thresholds work (e.g. 3.5 —
+# half-point scores like 3.5/5 occur in evaluations). Set it to 0 to
+# generate a PDF for every offer.
 # auto_pdf_score_threshold: 4.0

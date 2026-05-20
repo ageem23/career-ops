@@ -200,7 +200,7 @@ Donde `{company-slug}` es el nombre de empresa en lowercase, sin espacios, con g
 **Score:** {X/5}
 **Legitimacy:** {High Confidence | Proceed with Caution | Suspicious}
 **URL:** {URL de la oferta original}
-**PDF:** {career-ops/output/cv-candidate-{company-slug}-{{DATE}}.pdf if score ≥ the resolved `auto_pdf_score_threshold` from Paso 4, else `not generated — run /career-ops pdf {company-slug} to create on demand`}
+**PDF:** {output/cv-candidate-{company-slug}-{{DATE}}.pdf if score ≥ the resolved `auto_pdf_score_threshold` from Paso 4, else `not generated — run /career-ops pdf {company-slug} to create on demand`}
 **Batch ID:** {{ID}}
 
 ---
@@ -232,13 +232,13 @@ Donde `{company-slug}` es el nombre de empresa en lowercase, sin espacios, con g
 (15-20 keywords del JD para ATS)
 ```
 
-### Paso 4 — Generar PDF (configurable; default-disabled)
+### Paso 4 — Generar PDF (configurable)
 
-**Gate:** Read `config/profile.yml` → `auto_pdf_score_threshold`. If the key is absent, default to **`5.1`** (effectively disabled — the max possible score is 5.0). This step ONLY runs when the score from Paso 2 is **≥ the resolved threshold**. For everything below it, skip this entire step — the user can generate a tailored PDF on demand later via `/career-ops pdf {company-slug}` using the report from Paso 3 as input.
+**Gate:** Read `config/profile.yml` → `auto_pdf_score_threshold`. If the key is absent, default to **`3.0`** (the original gate of Path A). This step ONLY runs when the score from Paso 2 is **≥ the resolved threshold**. For everything below it, skip this entire step — the user can generate a tailored PDF on demand later via `/career-ops pdf {company-slug}` using the report from Paso 3 as input.
 
-**Rationale:** Generating a tailored PDF costs ~30–60s per offer (Playwright launch + HTML render) and produces files the user rarely uses — most roles score 2.x/3.x and never reach application. Default to "no auto-PDF" and let the user opt in by setting `auto_pdf_score_threshold` to a real value (e.g. `4.0`) when they decide that tier is worth pre-generating. Both Path A (`/career-ops pipeline`) and Path B (this batch worker) read the same config key for consistency.
+**Rationale:** Generating a tailored PDF costs ~30–60s per offer (Playwright launch + HTML render) and produces files that often go unused — most roles score 2.x/3.x and never reach application. The `3.0` default matches Path A's original behavior; raise `auto_pdf_score_threshold` (e.g. `4.0`) to pre-generate fewer PDFs, or set `0` to generate one for every offer. Both Path A (`/career-ops pipeline`) and Path B (this batch worker) read the same config key for consistency.
 
-**If score < threshold (or threshold default-disabled):**
+**If score < threshold:**
 - Skip steps 1–14 below.
 - In the report header use: `**PDF:** not generated — run /career-ops pdf {company-slug} to create on demand`.
 - In Paso 5 (tracker line) use `pdf_emoji` = `❌`.
@@ -267,7 +267,8 @@ node generate-pdf.mjs \
   --format={letter|a4}
 ```
 14. Reporta: ruta PDF, nº páginas, % cobertura keywords
-15. In Paso 5 use `pdf_emoji` = `✅`; in Paso 6 set `"pdf"` to the output path.
+
+On success, in Paso 5 use `pdf_emoji` = `✅` and in Paso 6 set `"pdf"` to the output path.
 
 **Reglas ATS:**
 - Single-column (sin sidebars)
