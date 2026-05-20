@@ -21,7 +21,7 @@
  * Run: node reconcile-pipeline.mjs [--dry-run] [--state <path>] [--pipeline <path>]
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, copyFileSync, realpathSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, copyFileSync, realpathSync, statSync } from 'fs';
 import { join, dirname, resolve, relative, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -58,6 +58,12 @@ function resolveInsideRepo(inputPath, fallbackPath, flag) {
   const rel = relative(repoReal, targetReal);
   if (rel.startsWith('..') || isAbsolute(rel)) {
     console.error(`Invalid ${flag}: path must stay inside the repository (${abs})`);
+    process.exit(1);
+  }
+  // Reject a directory target early — otherwise readFileSync/copyFileSync would
+  // throw an unhandled EISDIR later instead of failing with a clear message.
+  if (existsSync(abs) && statSync(abs).isDirectory()) {
+    console.error(`Invalid ${flag}: expected a file, not a directory (${abs})`);
     process.exit(1);
   }
   return abs;
