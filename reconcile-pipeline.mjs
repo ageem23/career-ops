@@ -21,7 +21,7 @@
  * Run: node reconcile-pipeline.mjs [--dry-run] [--state <path>] [--pipeline <path>]
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, copyFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, copyFileSync, realpathSync } from 'fs';
 import { join, dirname, resolve, relative, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -41,9 +41,21 @@ function argValue(flag) {
 
 // Constrain user-supplied --state/--pipeline paths to the repository tree, so a
 // crafted path cannot read from or overwrite files outside the project.
+// Symlinks are resolved first (realpathSync) so an in-repo symlink cannot
+// smuggle the real target outside the tree past a purely lexical check.
 function resolveInsideRepo(inputPath, fallbackPath, flag) {
   const abs = resolve(inputPath || fallbackPath);
-  const rel = relative(CAREER_OPS, abs);
+  let repoReal, targetReal;
+  try {
+    repoReal = realpathSync(CAREER_OPS);
+    // The target may not exist yet (e.g. a fresh --pipeline path); fall back to
+    // its parent directory so the symlink-resolved boundary check still applies.
+    targetReal = existsSync(abs) ? realpathSync(abs) : realpathSync(dirname(abs));
+  } catch {
+    console.error(`Invalid ${flag}: cannot resolve path (${abs})`);
+    process.exit(1);
+  }
+  const rel = relative(repoReal, targetReal);
   if (rel.startsWith('..') || isAbsolute(rel)) {
     console.error(`Invalid ${flag}: path must stay inside the repository (${abs})`);
     process.exit(1);
