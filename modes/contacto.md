@@ -28,11 +28,14 @@ If you find yourself drafting a `Sending to:` line, opening WebSearch tabs, or c
 
 Your job is to emit a **single copy-paste-ready research prompt** that the user pastes into a new claude.ai web chat with **Research mode** enabled. You do NOT perform LinkedIn lookups, name verification, or message drafting yourself in this mode — the web Claude does all of that with better tooling.
 
+**Before emitting — resolve the App# once.** Open `data/applications.md` and find the most recent active row (`Applied` / `Responded` / `Interview` / `Evaluated`) for `{Company}`; note its `#`. Do this here because the web Claude cannot see the local tracker. Use it to fill the `{APP_OR_COMPANY}` placeholder in template **section 5**: on a match use `--app {number}`, otherwise use `--company "{Company}"`.
+
 **Output structure (in this exact order):**
 
 1. A short one-line intro: `Paste this into claude.ai with Research mode enabled:`
 2. **One single fenced markdown code block** containing the full research prompt (template below). The entire prompt MUST be inside one code block so it's one-click-to-copy.
-3. After the code block: the contacts table + `add-task.mjs` copy-paste block (per **Step 5** and **Step 6** in MODE B below — those still emit in prompt mode so the user can track follow-ups even without doing the lookups themselves).
+
+That is the entire output. **Do NOT emit a contacts table or an `add-task.mjs` block yourself.** In prompt mode you have not done the LinkedIn lookups, so you have no verified names and no dates — anything you emit would be placeholder noise. The research prompt makes the web Claude produce the `add-task.mjs` block itself (template **section 5**), filled with the real verified names and follow-up dates it discovers.
 
 **Prompt template — customize the placeholders before emitting:**
 
@@ -44,6 +47,7 @@ Your job is to emit a **single copy-paste-ready research prompt** that the user 
 - LinkedIn: {linkedin url from config/profile.yml}
 
 **Target role:** {Role} at {Company}{ — comp/location notes if known}. Job URL: {URL if provided}.
+**Today's date:** {YYYY-MM-DD — fill from the system date so the section 5 follow-up dates are correct}.
 
 ---
 
@@ -84,12 +88,26 @@ No corporate-speak. No "I'm passionate about." ≤ 300 chars hard limit.
 ### 4. Alternative Targets
 For each primary, one alternate at the same level with a one-sentence reason — a defensible second choice if the primary doesn't respond within a week.
 
+### 5. Follow-up Tracking Tasks (emit this last)
+
+After the targets and messages, emit one paste-ready `bash` code block — for a terminal in the career-ops project directory — with one `add-task.mjs` line per verified target, in this exact shape:
+
+```bash
+node add-task.mjs --type contact {APP_OR_COMPANY} --title "LinkedIn: {Full Name} ({Contact Type})" --notes "{LinkedIn URL without https://}" --due {YYYY-MM-DD}
+```
+
+Rules:
+- One command per line, no line continuations — the whole block must paste at once.
+- `--title` follows the exact pattern `LinkedIn: {Full Name} ({Contact Type})`, using the **verified** name from section 2 — never a guessed or remembered name.
+- `--notes` is the LinkedIn URL with `https://` stripped.
+- `--due` is required on every line — a real calendar date derived from **Today's date** above: a target to message first → 1–2 days out; a target to hold → the one-week fallback date; an interviewer → the interview date.
+- The `--app` / `--company` argument shown in the example is already filled in correctly for this company — reuse it verbatim on every line; never invent or change an App#.
+- Skip any target marked "name unverified — DO NOT SEND" — emit no task line for it.
+
 ---
 
-**Deliverable:** Up to 6 verified targets, lock-in lines per target, custom 3-sentence messages per target, alternates, and a 1-sentence sequencing recommendation (who to message first, who to wait on).
+**Deliverable:** up to 6 verified targets (as a table: name, title, contact type, LinkedIn URL), lock-in lines per target, custom 3-sentence messages per target, alternates, a 1-sentence sequencing recommendation (who to message first, who to wait on), and the section 5 `add-task.mjs` block.
 ````
-
-After the code block, emit the contacts table and the `add-task.mjs` block per **Step 5** and **Step 6** in MODE B.
 
 **END OF MODE A. Do not proceed into MODE B.**
 
