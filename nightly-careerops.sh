@@ -1,19 +1,32 @@
 #!/usr/bin/env bash
 # Nightly career-ops automation — runs portal scan, imports new offers, and
-# batch-evaluates them. Registered in Windows Task Scheduler ("career-ops-nightly")
-# to fire daily at 21:00. Each run logs to tmp/nightly-{date}.log and writes a
-# morning summary to tmp/nightly-latest-summary.txt.
+# batch-evaluates them. Registered in Windows Task Scheduler:
+#   - "career-ops-nightly"      → 21:00 daily (full run: scan + import + batch)
+#   - "career-ops-nightly-late" → 03:00 daily (--no-scan: pipeline leftovers only;
+#                                              timed so token bucket has reset by 8 AM)
+# Each run logs to tmp/nightly-{date}[-late].log and writes a morning summary
+# to tmp/nightly-latest-summary.txt.
 #
 # Steps:
-#   1. node scan.mjs                          — zero-token portal scan
+#   1. node scan.mjs                          — zero-token portal scan (skipped with --no-scan)
 #   2. import pipeline.md Pendientes           — append new offers to batch-input.tsv
 #   3. batch/batch-runner.sh --parallel 3      — evaluate; merge + reconcile + verify
 #
-# Caps at 30 offers per night; any overflow stays in data/pipeline.md Pendientes
+# Caps at 30 offers per run; any overflow stays in data/pipeline.md Pendientes
 # (picked up by the next run, or clear it manually with /career-ops pipeline).
 #
-# Manual run: bash nightly-careerops.sh
+# Manual run: bash nightly-careerops.sh           (full)
+#             bash nightly-careerops.sh --no-scan (leftovers only)
 set -uo pipefail
+
+# --- Parse flags ---
+NO_SCAN=false
+for arg in "$@"; do
+  case "$arg" in
+    --no-scan) NO_SCAN=true ;;
+    *) echo "Unknown arg: $arg" >&2; exit 2 ;;
+  esac
+done
 
 # Work from the repo root regardless of how Task Scheduler invokes us.
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
@@ -24,7 +37,11 @@ export PATH="/c/Users/magee/scoop/shims:/c/Users/magee/.local/bin:/c/Program Fil
 TS=$(date +%Y-%m-%d_%H%M%S)
 DATE=$(date +%Y-%m-%d)
 mkdir -p tmp
-LOG="tmp/nightly-$DATE.log"
+if $NO_SCAN; then
+  LOG="tmp/nightly-$DATE-late.log"
+else
+  LOG="tmp/nightly-$DATE.log"
+fi
 SUMMARY="tmp/nightly-latest-summary.txt"
 exec > >(tee -a "$LOG") 2>&1
 
@@ -33,9 +50,14 @@ echo "  Nightly career-ops run — $TS"
 echo "================================================"
 
 # --- Step 1: portal scan (zero-token) ---
-echo ""
-echo "--- Step 1/3: portal scan ---"
-node scan.mjs
+if $NO_SCAN; then
+  echo ""
+  echo "--- Step 1/3: portal scan — SKIPPED (--no-scan, processing leftovers) ---"
+else
+  echo ""
+  echo "--- Step 1/3: portal scan ---"
+  node scan.mjs
+fi
 
 # --- Step 2: import new pipeline.md Pendientes into batch-input.tsv ---
 echo ""
