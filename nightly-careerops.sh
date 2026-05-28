@@ -17,16 +17,29 @@
 #
 # Manual run: bash nightly-careerops.sh           (full)
 #             bash nightly-careerops.sh --no-scan (leftovers only)
+#
+# Non-interactive runs (Task Scheduler after wake-from-sleep) auto-sleep 60s
+# before scan.mjs so the VPN can connect — otherwise some providers return
+# ERR_CONNECTION_RESET. Override with --wait=SECS or --no-wait.
 set -uo pipefail
 
 # --- Parse flags ---
 NO_SCAN=false
+WAIT_SECS=""  # empty → auto-detect below; explicit value overrides
 for arg in "$@"; do
   case "$arg" in
     --no-scan) NO_SCAN=true ;;
+    --no-wait) WAIT_SECS=0 ;;
+    --wait=*) WAIT_SECS="${arg#--wait=}" ;;
     *) echo "Unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
+
+# Auto-detect: interactive (TTY) → no wait; non-interactive (scheduler) → 60s.
+# Must run BEFORE the tee exec below, which makes stdout non-TTY.
+if [[ -z "$WAIT_SECS" ]]; then
+  if [[ -t 1 ]]; then WAIT_SECS=0; else WAIT_SECS=60; fi
+fi
 
 # Work from the repo root regardless of how Task Scheduler invokes us.
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
@@ -54,10 +67,32 @@ if $NO_SCAN; then
   echo ""
   echo "--- Step 1/3: portal scan — SKIPPED (--no-scan, processing leftovers) ---"
 else
+  if [[ "$WAIT_SECS" -gt 0 ]]; then
+    echo ""
+    echo "Sleeping ${WAIT_SECS}s for VPN/network to come up before scan..."
+    sleep "$WAIT_SECS"
+  fi
   echo ""
   echo "--- Step 1/3: portal scan ---"
   node scan.mjs
 fi
+
+# --- Build scan-error banner for the morning summary ---
+SCAN_BANNER=""
+if ! $NO_SCAN; then
+  ERR_COUNT=$(grep -E "^Errors \([0-9]+\):" "$LOG" | head -1 | sed -E 's/^Errors \(([0-9]+)\):.*$/\1/')
+  TOTAL=$(grep -E "Companies scanned:" "$LOG" | head -1 | sed -E 's/.*Companies scanned:[[:space:]]+([0-9]+).*/\1/')
+  if [[ -n "${ERR_COUNT:-}" && "${ERR_COUNT:-0}" -gt 0 ]]; then
+    FIRST_FEW=$(awk '/^Errors \(/{flag=1; next} flag && /^  ✗ /{ sub(/^  ✗ /, ""); sub(/:.*$/, ""); if (n) printf ", "; printf "%s", $0; n++; if (n>=5) exit } END { print "" }' "$LOG")
+    EXTRA=$((ERR_COUNT - 5))
+    if [[ "$EXTRA" -gt 0 ]]; then
+      SCAN_BANNER="⚠️  Scan errors: $ERR_COUNT/${TOTAL:-?} providers — $FIRST_FEW (+$EXTRA more)"
+    else
+      SCAN_BANNER="⚠️  Scan errors: $ERR_COUNT/${TOTAL:-?} providers — $FIRST_FEW"
+    fi
+  fi
+fi
+export SCAN_BANNER
 
 # --- Step 2: import new pipeline.md Pendientes into batch-input.tsv ---
 echo ""
@@ -102,9 +137,28 @@ FIRST_NEW_ID=$(node -e '
   process.stdout.write(added ? String(firstNew) : "none");
 ')
 
+# Late run augments the evening summary; full run resets it.
+SUMMARY_APPEND=""
+if $NO_SCAN && [[ -s "$SUMMARY" ]]; then SUMMARY_APPEND=1; fi
+export SUMMARY_APPEND
+
 if [[ "$FIRST_NEW_ID" == "none" || -z "$FIRST_NEW_ID" ]]; then
   echo "No new offers to evaluate tonight."
-  { echo "career-ops nightly summary — $TS"; echo ""; echo "No new offers found."; } > "$SUMMARY"
+  if [[ -n "$SUMMARY_APPEND" ]]; then
+    {
+      echo ""
+      echo "--- late run — $TS ---"
+      [[ -n "$SCAN_BANNER" ]] && echo "$SCAN_BANNER"
+      echo "No new offers found."
+    } >> "$SUMMARY"
+  else
+    {
+      echo "career-ops nightly summary — $TS"
+      [[ -n "$SCAN_BANNER" ]] && echo "$SCAN_BANNER"
+      echo ""
+      echo "No new offers found."
+    } > "$SUMMARY"
+  fi
   echo ""
   echo "=== Run complete: $(date +%H:%M:%S) — no evaluations ==="
   exit 0
@@ -136,6 +190,7 @@ node -e '
   }
   rows.sort((a, b) => (b.score || 0) - (a.score || 0));
   let s = "career-ops nightly summary — " + ts + "\n";
+  if (process.env.SCAN_BANNER) s += process.env.SCAN_BANNER + "\n";
   s += "evaluated " + rows.length + " offer(s)\n\n";
   s += "score  report  offer\n";
   s += "-----  ------  -----------------------------------------------\n";
@@ -154,7 +209,13 @@ node -e '
     if (inPend && line.startsWith("- [ ]")) remaining++;
   }
   if (remaining) s += remaining + " offer(s) still in pipeline.md (over the 30/night cap) — run /career-ops pipeline to clear\n";
-  fs.writeFileSync("tmp/nightly-latest-summary.txt", s);
+  const path = "tmp/nightly-latest-summary.txt";
+  if (process.env.SUMMARY_APPEND) {
+    const body = s.replace(/^career-ops nightly summary — [^\n]*\n/, "");
+    fs.appendFileSync(path, "\n--- late run — " + ts + " ---\n" + body);
+  } else {
+    fs.writeFileSync(path, s);
+  }
   console.log(s);
 ' "$FIRST_NEW_ID" "$TS"
 
