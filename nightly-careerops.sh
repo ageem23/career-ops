@@ -25,12 +25,14 @@ set -uo pipefail
 
 # --- Parse flags ---
 NO_SCAN=false
+NO_PREFLIGHT=false
 WAIT_SECS=""  # empty → auto-detect below; explicit value overrides
 for arg in "$@"; do
   case "$arg" in
     --no-scan) NO_SCAN=true ;;
     --no-wait) WAIT_SECS=0 ;;
     --wait=*) WAIT_SECS="${arg#--wait=}" ;;
+    --no-preflight) NO_PREFLIGHT=true ;;
     *) echo "Unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
@@ -71,6 +73,37 @@ else
     echo ""
     echo "Sleeping ${WAIT_SECS}s for VPN/network to come up before scan..."
     sleep "$WAIT_SECS"
+  fi
+  # Pre-flight network probe: confirm we can reach a few representative hosts
+  # before the scan starts. Logs per-host transport success so the morning
+  # diagnosis isn't "scan failed; was the network up?"
+  if ! $NO_PREFLIGHT; then
+    echo ""
+    echo "Pre-flight network probe..."
+    # GET (not HEAD): api.anthropic.com rejects HEAD with no body, so HEAD
+    # gives a false negative. GET to a known endpoint returns a code (200/
+    # 301/401) which means transport succeeded — that's what we want to know.
+    PROBE_HOSTS=("https://api.anthropic.com/v1/models" "https://www.linkedin.com" "https://boards-api.greenhouse.io")
+    attempt=1
+    while :; do
+      ok=true
+      for h in "${PROBE_HOSTS[@]}"; do
+        if curl --silent --connect-timeout 5 --max-time 8 -o /dev/null "$h"; then
+          echo "  ok   $h"
+        else
+          echo "  fail $h"
+          ok=false
+        fi
+      done
+      $ok && break
+      if [[ $attempt -ge 3 ]]; then
+        echo "  WARN: pre-flight still failing after $attempt attempts — running scan anyway"
+        break
+      fi
+      echo "  retry in 20s (attempt $attempt/3)..."
+      sleep 20
+      ((attempt++))
+    done
   fi
   echo ""
   echo "--- Step 1/3: portal scan ---"

@@ -491,6 +491,28 @@ async function main() {
     return true;
   }
 
+  // Walk the err.cause chain (undici wraps the real cause one or two levels
+  // down). Surface code/errno/syscall/host so the scan log distinguishes
+  // DNS failures from TCP resets from TLS handshakes — otherwise everything
+  // collapses to "fetch failed" and we can't tell layers apart.
+  function describeError(err) {
+    const parts = [err.message || String(err)];
+    let cur = err.cause;
+    let depth = 0;
+    while (cur && depth < 2) {
+      const bits = [];
+      if (cur.code) bits.push(`code=${cur.code}`);
+      if (cur.errno) bits.push(`errno=${cur.errno}`);
+      if (cur.syscall) bits.push(`syscall=${cur.syscall}`);
+      if (cur.hostname) bits.push(`host=${cur.hostname}`);
+      else if (cur.address) bits.push(`addr=${cur.address}:${cur.port || '?'}`);
+      if (bits.length) parts.push(bits.join(','));
+      cur = cur.cause;
+      depth++;
+    }
+    return parts.join(' · ');
+  }
+
   const tasks = targets.map(company => async () => {
     const provider = company._provider;
     const ctx = company.transport === 'browser' ? makeBrowserCtx() : makeHttpCtx();
@@ -521,7 +543,7 @@ async function main() {
         }
       }
     } catch (err) {
-      errors.push({ company: company.name, error: err.message });
+      errors.push({ company: company.name, error: describeError(err) });
     }
   });
 
