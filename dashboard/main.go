@@ -435,18 +435,11 @@ func applyStatusUpdate(careerOpsPath string, app model.CareerApplication, newSta
 // terminal status (Rejected / Discarded) so stale follow-up reminders stop
 // surfacing in the dashboard for an app the user has already closed out.
 func autoCompletePendingTasksForApp(careerOpsPath string, app model.CareerApplication, newStatus string) {
-	existing := data.ParseTasks(careerOpsPath)
 	today := time.Now().Format("2006-01-02")
-	completed := 0
-	for _, t := range existing {
-		if t.AppNumber != app.Number || strings.ToLower(t.Status) != "pending" {
-			continue
-		}
-		if _, err := data.UpdateTaskStatus(careerOpsPath, t.Number, "done", today); err != nil {
-			fmt.Fprintf(os.Stderr, "WARN: auto-complete task #%d failed: %v\n", t.Number, err)
-			continue
-		}
-		completed++
+	completed, err := data.CompletePendingTasksForApp(careerOpsPath, app.Number, today)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: auto-complete tasks for #%d failed: %v\n", app.Number, err)
+		return
 	}
 	if completed > 0 {
 		fmt.Fprintf(os.Stderr, "auto-completed %d pending task(s) for #%d %s on %s transition\n",
