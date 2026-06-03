@@ -26,6 +26,8 @@ Genera un prompt estructurado para Perplexity/Claude/ChatGPT con 6 ejes:
 
 Contexto: Estoy evaluando una candidatura para [rol] en [empresa]. Necesito información accionable para la entrevista.
 
+**Formato de salida:** Responde en Markdown plano y crudo (raw Markdown): encabezados `##`/`###`, listas con `-`, y tablas Markdown cuando aporten. Para cada fuente incluye la URL completa como enlace Markdown `[título](https://…)`. NO uses artifacts, "internal links", citations widgets ni ningún elemento exclusivo de la interfaz web — el resultado debe poder copiarse y pegarse como texto Markdown en cualquier editor.
+
 ### 1. Estrategia AI
 - ¿Qué productos/features usan AI/ML?
 - ¿Cuál es su stack de AI? (modelos, infra, tools)
@@ -65,3 +67,6 @@ Dado mi perfil (read from cv.md and profile.yml for specific experience):
 
 Personalizar cada sección con el contexto específico de la oferta evaluada,
 en el idioma resuelto en la sección **Language** de arriba (NO siempre español).
+**Conservar siempre la instrucción de "Formato de salida" (Markdown crudo)** al
+traducir o personalizar — es lo que evita que Claude web devuelva artifacts o
+internal links en lugar de Markdown copiable.

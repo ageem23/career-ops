@@ -1,7 +1,9 @@
 # Personal data (user fills these)
 cv.md
+article-digest.md
 data/applications.md
 data/pipeline.md
+data/scan-semantic-log.tsv
 data/scan-history.tsv
 data/tasks.md
 data/follow-ups.md
@@ -10,6 +12,7 @@ reports/*.md
 output/*
 !output/.gitkeep
 batch/logs/*
+batch/bat*
 !batch/logs/.gitkeep
 batch/batch-state.tsv
 batch/batch-input.tsv
@@ -17,6 +20,12 @@ batch/tracker-additions/**/*.tsv
 !batch/tracker-additions/.gitkeep
 jds/*
 !jds/.gitkeep
+interview-prep/*
+tmp/*
+build-*
+.claude/pr*
+.claude/settings.json
+batch/*
 
 # Writing samples (user's personal files — never committed)
 writing-samples/*

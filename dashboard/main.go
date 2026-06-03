@@ -406,9 +406,10 @@ func runSyncTasks(careerOpsPath string) {
 }
 
 // applyStatusUpdate writes a status change for one application and fires any
-// per-app cascade side effects (currently: auto-create an Interview
-// thank-you task). Used by both the single-row and bulk status handlers so
-// the two paths stay byte-for-byte consistent on behavior.
+// per-app cascade side effects (auto-create an Interview thank-you task on
+// Interview, auto-complete pending tasks on Rejected/Discarded). Used by both
+// the single-row and bulk status handlers so the two paths stay byte-for-byte
+// consistent on behavior.
 func applyStatusUpdate(careerOpsPath string, app model.CareerApplication, newStatus string) {
 	if err := data.UpdateApplicationStatus(careerOpsPath, app, newStatus); err != nil {
 		// Bail out before firing the cascade. The status write is what makes
@@ -418,8 +419,31 @@ func applyStatusUpdate(careerOpsPath string, app model.CareerApplication, newSta
 		fmt.Fprintf(os.Stderr, "WARN: status update failed for #%d: %v\n", app.Number, err)
 		return
 	}
-	if data.NormalizeStatus(newStatus) == "interview" && app.Number > 0 {
+	if app.Number <= 0 {
+		return
+	}
+	switch data.NormalizeStatus(newStatus) {
+	case "interview":
 		autoCreateInterviewThankYou(careerOpsPath, app)
+	case "rejected", "discarded":
+		autoCompletePendingTasksForApp(careerOpsPath, app, newStatus)
+	}
+}
+
+// autoCompletePendingTasksForApp marks every pending task for the application
+// as done with today's completion date. Fired when the app transitions to a
+// terminal status (Rejected / Discarded) so stale follow-up reminders stop
+// surfacing in the dashboard for an app the user has already closed out.
+func autoCompletePendingTasksForApp(careerOpsPath string, app model.CareerApplication, newStatus string) {
+	today := time.Now().Format("2006-01-02")
+	completed, err := data.CompletePendingTasksForApp(careerOpsPath, app.Number, today)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: auto-complete tasks for #%d failed: %v\n", app.Number, err)
+		return
+	}
+	if completed > 0 {
+		fmt.Fprintf(os.Stderr, "auto-completed %d pending task(s) for #%d %s on %s transition\n",
+			completed, app.Number, app.Company, newStatus)
 	}
 }
 

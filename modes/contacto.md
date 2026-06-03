@@ -28,11 +28,14 @@ If you find yourself drafting a `Sending to:` line, opening WebSearch tabs, or c
 
 Your job is to emit a **single copy-paste-ready research prompt** that the user pastes into a new claude.ai web chat with **Research mode** enabled. You do NOT perform LinkedIn lookups, name verification, or message drafting yourself in this mode — the web Claude does all of that with better tooling.
 
+**Before emitting — resolve the App# once.** Open `data/applications.md` and find the most recent active row (`Applied` / `Responded` / `Interview` / `Evaluated`) for `{Company}`; note its `#`. Do this here because the web Claude cannot see the local tracker. Use it to fill the `{APP_OR_COMPANY}` placeholder in template **section 5**: on a match use `--app {number}`, otherwise use `--company "{Company}"`.
+
 **Output structure (in this exact order):**
 
 1. A short one-line intro: `Paste this into claude.ai with Research mode enabled:`
 2. **One single fenced markdown code block** containing the full research prompt (template below). The entire prompt MUST be inside one code block so it's one-click-to-copy.
-3. After the code block: the contacts table + `add-task.mjs` copy-paste block (per **Step 5** and **Step 6** in MODE B below — those still emit in prompt mode so the user can track follow-ups even without doing the lookups themselves).
+
+That is the entire output. **Do NOT emit a contacts table or an `add-task.mjs` block yourself.** In prompt mode you have not done the LinkedIn lookups, so you have no verified names and no dates — anything you emit would be placeholder noise. The research prompt makes the web Claude produce the `add-task.mjs` block itself (template **section 5**), filled with the real verified names and follow-up dates it discovers.
 
 **Prompt template — customize the placeholders before emitting:**
 
@@ -44,6 +47,7 @@ Your job is to emit a **single copy-paste-ready research prompt** that the user 
 - LinkedIn: {linkedin url from config/profile.yml}
 
 **Target role:** {Role} at {Company}{ — comp/location notes if known}. Job URL: {URL if provided}.
+**Today's date:** {YYYY-MM-DD — fill from the system date so the section 5 follow-up dates are correct}.
 
 ---
 
@@ -84,12 +88,26 @@ No corporate-speak. No "I'm passionate about." ≤ 300 chars hard limit.
 ### 4. Alternative Targets
 For each primary, one alternate at the same level with a one-sentence reason — a defensible second choice if the primary doesn't respond within a week.
 
+### 5. Follow-up Tracking Tasks (emit this last)
+
+After the targets and messages, emit one paste-ready `bash` code block — for a terminal in the career-ops project directory — with one `add-task.mjs` line per verified target, in this exact shape:
+
+```bash
+node add-task.mjs --type contact {APP_OR_COMPANY} --title "LinkedIn: {Full Name} ({Contact Type})" --notes "{LinkedIn URL without https://}" --due {YYYY-MM-DD}
+```
+
+Rules:
+- One command per line, no line continuations — the whole block must paste at once.
+- `--title` follows the exact pattern `LinkedIn: {Full Name} ({Contact Type})`, using the **verified** name from section 2 — never a guessed or remembered name.
+- `--notes` is the LinkedIn URL with `https://` stripped.
+- `--due` is required on every line — a real calendar date derived from **Today's date** above: a target to message first → 1–2 days out; a target to hold → the one-week fallback date; an interviewer → the interview date.
+- The `--app` / `--company` argument shown in the example is already filled in correctly for this company — reuse it verbatim on every line; never invent or change an App#.
+- Skip any target marked "name unverified — DO NOT SEND" — emit no task line for it.
+
 ---
 
-**Deliverable:** Up to 6 verified targets, lock-in lines per target, custom 3-sentence messages per target, alternates, and a 1-sentence sequencing recommendation (who to message first, who to wait on).
+**Deliverable:** up to 6 verified targets (as a table: name, title, contact type, LinkedIn URL), lock-in lines per target, custom 3-sentence messages per target, alternates, a 1-sentence sequencing recommendation (who to message first, who to wait on), and the section 5 `add-task.mjs` block.
 ````
-
-After the code block, emit the contacts table and the `add-task.mjs` block per **Step 5** and **Step 6** in MODE B.
 
 **END OF MODE A. Do not proceed into MODE B.**
 
@@ -103,11 +121,11 @@ After the code block, emit the contacts table and the `add-task.mjs` block per *
 
 Every `contacto` invocation in `inline` mode produces, in this order and without exceptions:
 
-1. A LinkedIn message for the **primary target** (sentences 1-2-3, ≤300 characters).
+1. A LinkedIn message for the **primary target** (sentences 1-2-3, ≤300 characters), **preceded by the `Sending to:` line** defined in Step 3.5 and the mandatory name verification at the bottom of this file.
 2. A **numbered table of suggested contacts** (primary + alternates), with the `App#` column resolved from `data/applications.md`.
 3. An **`add-task.mjs` copy-paste block** — always, regardless of environment (Claude Code, Claude web, other CLI). The block is always emitted; it is not optional.
 
-If you end your response without the `add-task.mjs` block, you have not completed the mode.
+If you end your response without the `Sending to:` line or without the `add-task.mjs` block, you have not completed the mode.
 
 ---
 
@@ -130,6 +148,17 @@ Ask the candidate or infer from context:
 ## Step 3 — Select primary target
 
 The person who would benefit most from the candidate being there.
+
+## Step 3.5 — Lock in recipient identity (MANDATORY before drafting)
+
+- Capture the verified **full name** exactly as it appears on their LinkedIn profile (or the source you pulled them from). Copy-paste — do NOT retype from memory.
+- Decide the **salutation form** explicitly: first name only (default for LinkedIn), preferred/known-as name if different from legal name, or honorific + last name if the context calls for it.
+- Watch for these failure modes:
+  - Pulled the recipient from one tab but drafted the message while looking at a different person/JD.
+  - Profile shows "Preferred: X" or a nickname in parentheses — use that, not the legal first name.
+  - Compound first names, accented characters, or non-Latin scripts — preserve exactly.
+  - Two people with similar names at the same company — re-confirm the URL/profile.
+- Write the locked-in recipient as a single line at the top of the draft block, e.g. `Recipient: Jane Doe (salutation: "Jane") — linkedin.com/in/janedoe`. This is the source of truth for the message in Step 4 and for the **mandatory name verification** at the bottom of this file.
 
 ## Step 4 — Generate message (3 sentences, ≤300 characters)
 
@@ -206,3 +235,19 @@ If the agent has Bash access (Claude Code), additionally offer to run the block 
 - Something that makes them want to respond
 - NEVER share phone number
 - The contact type changes the EMPHASIS, not the structure
+
+## MANDATORY name verification (do this BEFORE presenting the message to the user)
+
+Past incident: a `contacto` went out addressed to the right person but with the wrong first name. The user reviewed it but did not catch the error. This verification exists so that kind of mistake becomes impossible to miss.
+
+Before showing the final message, run this checklist explicitly in your response:
+
+1. **Literal check**: copy the salutation from the drafted message (e.g. "Hi Sarah,") and compare it character-by-character against the `Recipient` line confirmed in Step 3.5. Flag any discrepancy — capitalization, accents, missing/extra characters, or an entirely different name.
+2. **No substitutions**: confirm the name in the message did not autocomplete to a more common variant (Sara vs. Sarah, Stephen vs. Steven, José vs. Jose).
+3. **Right person**: re-confirm the recipient's LinkedIn URL and that the message hook (company, role, project reference) belongs to THAT person, not a target you considered earlier.
+4. **Presentation format**: when showing the final message to the user, lead with a confirmation line:
+   > **Sending to:** {Full name} ({LinkedIn URL}) — addressed as "{salutation in the message}"
+
+   Then the message body. The **Sending to:** line is pre-send verification metadata — it is **not** part of the outgoing message and does not count against the 300-character InMail limit. The user should be able to scan the salutation and the "Sending to:" line side-by-side without having to search.
+
+If any check fails or you have any doubt, STOP and ask the user to confirm before continuing. A wrong name in a cold message is unrecoverable — better to ask than to send.

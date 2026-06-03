@@ -43,6 +43,15 @@ type ViewerModel struct {
 	hasApp        bool
 	statusPicker  bool
 	statusCursor  int
+	// rawReport is the report file content exactly as read from disk — before
+	// the tasks header is prepended to `lines`. It (and the deep-research
+	// prompt extracted from it) back the clipboard-copy action so a yank
+	// reproduces the report, not the rendered task table.
+	rawReport  string
+	deepPrompt string
+	// flash is a transient status line shown in the footer (e.g. the result of
+	// a clipboard copy). Cleared on the next keypress.
+	flash string
 	// Add-task prompt sub-state — shared helper used by both pipeline and
 	// viewer so the keystroke + flow is identical between the two.
 	addTask addTaskPrompt
@@ -59,9 +68,10 @@ func NewViewerModel(t theme.Theme, path, title string, width, height int, app mo
 		content = []byte("Error reading file: " + err.Error())
 	}
 
+	raw := string(content)
 	var lines []string
 	if len(content) > 0 {
-		lines = strings.Split(string(content), "\n")
+		lines = strings.Split(raw, "\n")
 	}
 	if len(tasks) > 0 {
 		lines = append(buildTasksHeader(tasks), lines...)
@@ -76,6 +86,8 @@ func NewViewerModel(t theme.Theme, path, title string, width, height int, app mo
 		app:           app,
 		careerOpsPath: careerOpsPath,
 		hasApp:        app.ReportPath != "" || app.Company != "",
+		rawReport:     raw,
+		deepPrompt:    extractDeepPrompt(raw),
 	}
 	m.rebuildRender()
 	return m
@@ -151,7 +163,21 @@ func (m *ViewerModel) Resize(width, height int) {
 
 func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	switch msg := msg.(type) {
+	case viewerCopyResultMsg:
+		switch {
+		case msg.err != nil:
+			m.flash = "Copy failed: " + msg.err.Error()
+		case msg.withPrompt:
+			m.flash = "Copied deep prompt + evaluation to clipboard"
+		default:
+			m.flash = "Copied evaluation to clipboard (no deep prompt in report)"
+		}
+		return m, nil
+
 	case tea.KeyMsg:
+		// Any keystroke dismisses a lingering flash so it never sticks around
+		// past the action that produced it.
+		m.flash = ""
 		if m.statusPicker {
 			return m.handleStatusPicker(msg)
 		}
@@ -161,6 +187,19 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		switch msg.String() {
 		case "q", "esc":
 			return m, func() tea.Msg { return ViewerClosedMsg{} }
+
+		case "y":
+			// Yank the report to the clipboard. When the report embeds a
+			// deep-research prompt (score cleared the threshold at eval time),
+			// the prompt leads and the evaluation follows as context.
+			payload, withPrompt := m.clipboardPayload()
+			if strings.TrimSpace(payload) == "" {
+				m.flash = "Nothing to copy"
+				return m, nil
+			}
+			return m, func() tea.Msg {
+				return viewerCopyResultMsg{withPrompt: withPrompt, err: copyToClipboard(payload)}
+			}
 
 		case "c":
 			if m.hasApp {
@@ -843,6 +882,16 @@ func (m ViewerModel) renderFooter() string {
 	keyStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Text)
 	descStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
 
+	// A pending flash (e.g. clipboard-copy result) takes over the footer until
+	// the next keystroke clears it.
+	if m.flash != "" {
+		flashStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Green)
+		if strings.HasPrefix(m.flash, "Copy failed") {
+			flashStyle = flashStyle.Foreground(m.theme.Red)
+		}
+		return style.Render(flashStyle.Render(m.flash))
+	}
+
 	// While the add-task prompt is open, hide the navigation hints and
 	// show input-mode hints instead so the user knows what's reachable.
 	if m.addTask.active() {
@@ -866,7 +915,8 @@ func (m ViewerModel) renderFooter() string {
 		parts += keyStyle.Render("n") + descStyle.Render(" new task  ") +
 			keyStyle.Render("t") + descStyle.Render(" tasks  ")
 	}
-	parts += keyStyle.Render("Esc") + descStyle.Render(" back")
+	parts += keyStyle.Render("y") + descStyle.Render(" copy  ") +
+		keyStyle.Render("Esc") + descStyle.Render(" back")
 	return style.Render(parts)
 }
 

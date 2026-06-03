@@ -230,7 +230,12 @@ Donde `{company-slug}` es el nombre de empresa en lowercase, sin espacios, con g
 
 ## Keywords extraídas
 (15-20 keywords del JD para ATS)
+
+## Deep Research Prompt
+(solo si score ≥ el `deep_prompt_score_threshold` resuelto — ver "Gate del Deep Research Prompt" abajo)
 ```
+
+**Gate del Deep Research Prompt (configurable, default-on):** Lee `config/profile.yml` → `deep_prompt_score_threshold`. Si la key no existe, default a `3.5`. Si el score de la evaluación es **≥ threshold**, añade una sección `## Deep Research Prompt` al final del report con el TEXTO del prompt construido según `modes/deep.md` (6 ejes, empresa + rol rellenados, en el idioma resuelto). Envuélvelo en un bloque de código con fences para que se copie limpio. Si el score es **< threshold**, omite la sección por completo — no añadas un heading vacío. **Mantén el heading literalmente `## Deep Research Prompt` (en inglés) aunque el cuerpo del prompt esté localizado** — el dashboard localiza la sección por este heading exacto. **Genera SOLO el texto del prompt — NO ejecutes la deep research (nada de WebSearch/WebFetch para esto); es un prompt estático de copiar-pegar que el usuario corre luego en un LLM externo.** Path A (`/career-ops pipeline`) y Path B (este worker) leen la misma key.
 
 ### Paso 4 — Generar PDF (configurable; default-disabled)
 

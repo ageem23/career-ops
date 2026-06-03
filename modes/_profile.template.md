@@ -43,6 +43,36 @@
 | Forward Deployed Engineer | Fast delivery, client-facing, prototype to prod | cv.md + article-digest.md |
 | AI Transformation Lead | Change management, team enablement, adoption | cv.md + article-digest.md |
 
+## Evaluation Early-Exit (batch efficiency)
+
+<!-- ============================================================
+     OPTIONAL — speeds up batch runs by short-circuiting offers
+     that are clearly disqualified, instead of running the full
+     A–G evaluation on every one.
+
+     It is candidate-agnostic: every specific is read at runtime
+     from config/profile.yml (your archetypes) and cv.md (your
+     background + credentials) — nothing here is tied to a person.
+     Keep it as-is, tune the triggers, or delete the section to
+     always run the full evaluation.
+     ============================================================ -->
+
+A process override in the rules layer — applies to **all A–G evaluations** (batch workers and interactive). It is **candidate-agnostic**: every specific (target archetypes, level range, the candidate's background and credentials) is read at evaluation time from `config/profile.yml` and `cv.md`. Nothing about a particular candidate is hardcoded here.
+
+**Rule:** Run **Block A** (archetype) and **Block B** (CV match + hard blockers) first. If the offer hits a **clear disqualifier evident from the JD text alone**, stop there — write an abbreviated report, score it, mark status `SKIP`, and **skip Blocks C–F** (no comp research, no interview plan). Otherwise run the full A–G as normal.
+
+**Early-exit triggers** — fire only when one is unambiguous:
+1. **Archetype mismatch** — the role's domain or function falls entirely outside *every* archetype defined in `config/profile.yml`, with no plausible bridge.
+2. **Hard credential blocker** — the JD *requires* a credential, license, or clearance that `cv.md` shows the candidate does not hold and could not realistically acquire in time.
+3. **Level mismatch** — the role's level sits clearly outside the range covered by the archetypes in `config/profile.yml` (e.g. a pure individual-contributor role with no leadership scope when every archetype is a people-leadership role).
+
+**Do NOT early-exit — run the full A–G — when:**
+- The role plausibly matches any archetype in `config/profile.yml`, even if seniority, comp, or tech stack look weak.
+- It is likely to land in the mid-band (roughly 2.5–4.0 on the 1–5 scale). Early-exit is only for offers clearly heading to the bottom of the scale.
+- There is any genuine doubt. A wrongly-skipped good role costs an opportunity; a fully-evaluated weak role only costs ~5 minutes. **When in doubt, evaluate fully.**
+
+**Abbreviated report format (when early-exit fires):** standard header (Date, Archetype, Score, Legitimacy, URL, Verification, PDF, Batch ID) + full **Block A** + **Block B** (name the disqualifier and which trigger it hit) + one line for **Blocks C–F** (`Skipped — early-exit: {trigger}`) + a 1–2 line **Block G** (no web research) + **Score Global** table (low score, status `SKIP`) + **Keywords extracted**. The tracker TSV is written normally with status `SKIP`.
+
 ## Your Exit Narrative
 
 <!-- Replace with YOUR story. This frames everything. -->

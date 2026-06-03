@@ -205,6 +205,44 @@ func UpdateTaskStatus(careerOpsPath string, taskNumber int, newStatus, completed
 	return updated, nil
 }
 
+// CompletePendingTasksForApp marks every pending task belonging to appNumber as
+// done with the given completion date, in a single read-modify-write. Returns
+// the number of tasks updated. Unlike calling UpdateTaskStatus in a loop (one
+// full file read+write per task), this reads and rewrites tasks.md exactly
+// once regardless of how many tasks match — and skips the write entirely when
+// nothing matches.
+func CompletePendingTasksForApp(careerOpsPath string, appNumber int, completed string) (int, error) {
+	header, rows, err := readTasksFile(careerOpsPath)
+	if err != nil {
+		return 0, err
+	}
+	if completed == "" {
+		completed = "-"
+	}
+	updated := 0
+	for i, row := range rows {
+		parts := strings.Split(strings.Trim(strings.TrimSpace(row), "|"), "|")
+		if len(parts) < 9 {
+			continue
+		}
+		t := parseRowParts(parts)
+		if t.AppNumber != appNumber || strings.ToLower(t.Status) != "pending" {
+			continue
+		}
+		t.Status = "done"
+		t.Completed = completed
+		rows[i] = formatTaskRow(t)
+		updated++
+	}
+	if updated == 0 {
+		return 0, nil
+	}
+	if err := writeTasksFile(careerOpsPath, header, rows); err != nil {
+		return 0, err
+	}
+	return updated, nil
+}
+
 // AppendTask appends a new task row, assigning it the next sequential number
 // and a created date of today if not already set. Returns the persisted task.
 func AppendTask(careerOpsPath string, t model.Task) (model.Task, error) {
