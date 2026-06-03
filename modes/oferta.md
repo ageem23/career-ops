@@ -196,7 +196,16 @@ Save full evaluation in `reports/{###}-{company-slug}-{YYYY-MM-DD}.md`.
 
 ## Keywords extracted
 (list of 15-20 keywords from the JD for ATS optimization)
+
+## Deep Research Prompt
+(only if score >= the resolved `deep_prompt_score_threshold` — see "Deep Research Prompt gate" below)
 ```
+
+**Deep Research Prompt gate (configurable, default-on):** Read `config/profile.yml` → `deep_prompt_score_threshold`. If the key does not exist, default to `3.5`. If the evaluation score is **≥ threshold**, append a `## Deep Research Prompt` section to the report containing a personalized deep-research prompt built per `modes/deep.md` (6 axes, company + role filled in, in the resolved output language). Wrap the prompt in a fenced code block so it copies cleanly. If the score is **< threshold**, omit the section entirely — do not add an empty heading. **Keep the heading literally `## Deep Research Prompt` (English) even when the prompt body is localized** — the dashboard locates the section by this exact heading.
+
+**Generate the prompt; never run it.** This is text templating only — substitute company/role into the `deep.md` scaffold and write it. Do **NOT** execute the deep research itself (no WebSearch/WebFetch/browsing for it). It is a static, copy-paste prompt the user runs later in an external LLM (Perplexity/Claude/ChatGPT) — the dashboard's `y` copy hands it over. Running the research inline would add minutes per offer and defeat the purpose.
+
+**Why:** Offers that clear the bar are the ones the user is likely to pursue, so the interview-prep research prompt is worth pre-building. The Go dashboard viewer copies this section + the evaluation to the clipboard with `y`, so a promising offer arrives research-ready.
 
 ### 2. Record in tracker
 

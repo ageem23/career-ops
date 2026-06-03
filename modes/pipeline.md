@@ -17,6 +17,8 @@ Process job URLs stored in `data/pipeline.md`. The user adds URLs at any time an
    **Why default-disabled:** Generating a tailored PDF costs ~30–60s per entry (Playwright launch + HTML render) and produces files that are rarely used — most roles score in the 2.x/3.x range and never reach the application stage. Better to write the report (cheap, useful for triage) and leave the PDF as an on-demand action via `/career-ops pdf {slug}` when the user decides to apply.
 
    **How to enable auto-PDF:** Edit `config/profile.yml` and add `auto_pdf_score_threshold: 4.0` (or the preferred value). Both modes (Path A `/career-ops pipeline` and Path B `batch/batch-runner.sh`) read the same key so the behavior is consistent.
+
+   **About the Deep Research Prompt gate (configurable, default-on):** Read `config/profile.yml` → `deep_prompt_score_threshold`. If the key does not exist, default to `3.5`. If the evaluation score is ≥ threshold, append a `## Deep Research Prompt` section to the report (the prompt TEXT built per `modes/deep.md`, wrapped in a fenced code block) so the offer arrives interview-prep-ready. If the score is < threshold, omit the section. **Generate the prompt text only — do NOT run the deep research itself (no WebSearch/WebFetch for it); it's a static copy-paste prompt the user runs later in an external LLM.** The Go dashboard viewer copies this section + the evaluation to the clipboard with `y`. Both Path A and Path B read the same key.
 3. **If there are 3+ pending URLs**, launch agents in parallel (Agent tool with `run_in_background`) to maximize speed.
 4. **At the end**, show summary table:
 

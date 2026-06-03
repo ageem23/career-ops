@@ -128,3 +128,18 @@ skill_behavior:
 # Whatever doesn't make the cut can still be produced on demand later
 # via `/career-ops pdf {company-slug}`.
 # auto_pdf_score_threshold: 4.0
+
+# Deep-research-prompt threshold during evaluation (used by `/career-ops
+# pipeline` and `bash batch/batch-runner.sh`).
+#
+# When an offer's score is >= this threshold, the evaluation embeds a
+# ready-to-run "## Deep Research Prompt" section (see modes/deep.md) at the end
+# of the report. In the Go dashboard viewer you can then press `y` to copy that
+# prompt together with the full evaluation to your clipboard and paste it into
+# Perplexity/Claude/ChatGPT for interview-prep research — so the offers worth
+# chasing arrive with their research prompt already built.
+#
+# Default (key absent OR commented out): 3.5 — embed a prompt for any offer
+# worth a closer look. Set to 5.1 to effectively disable (max score is 5.0),
+# or to 0 to embed one for every report.
+# deep_prompt_score_threshold: 3.5

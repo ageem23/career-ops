@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Nightly career-ops automation — runs portal scan, imports new offers, and
 # batch-evaluates them. Registered in Windows Task Scheduler:
-#   - "career-ops-nightly"      → 21:00 daily (full run: scan + import + batch)
-#   - "career-ops-nightly-late" → 03:00 daily (--no-scan: pipeline leftovers only;
-#                                              timed so token bucket has reset by 8 AM)
+#   - "career-ops-nightly"      → 18:00 daily (full run: scan + import + batch)
+#   - "career-ops-nightly-late" → 00:00 daily (--no-scan: pipeline leftovers only;
+#                                              runs 6h after the full run)
 # Each run logs to tmp/nightly-{date}[-late].log and writes a morning summary
 # to tmp/nightly-latest-summary.txt.
 #
