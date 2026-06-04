@@ -428,6 +428,16 @@ func (m ViewerModel) renderHeader() string {
 
 	title := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Blue).Render(m.title)
 
+	// Prefix the header with the application ID (the tracker #) so the user can
+	// always see which application this report belongs to. Only shown when the
+	// viewer is backed by a real application row.
+	left := title
+	if m.app.Number > 0 {
+		idBadge := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Mauve).
+			Render(fmt.Sprintf("#%d", m.app.Number))
+		left = idBadge + "  " + title
+	}
+
 	right := lipgloss.NewStyle().Foreground(m.theme.Subtext)
 	scroll := right.Render(func() string {
 		if len(m.renderedLines) == 0 {
@@ -450,12 +460,12 @@ func (m ViewerModel) renderHeader() string {
 		}()
 	}())
 
-	gap := m.width - lipgloss.Width(m.title) - lipgloss.Width(scroll) - 4
+	gap := m.width - lipgloss.Width(left) - lipgloss.Width(scroll) - 4
 	if gap < 1 {
 		gap = 1
 	}
 
-	return style.Render(title + strings.Repeat(" ", gap) + scroll)
+	return style.Render(left + strings.Repeat(" ", gap) + scroll)
 }
 
 func (m ViewerModel) renderBody() string {
