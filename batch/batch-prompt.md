@@ -181,6 +181,34 @@ Analyze posting signals to assess whether this is a real, active opening.
 | Red flags | -X (si hay) |
 | **Global** | **X/5** |
 
+#### Machine Summary
+
+Create a machine-readable summary from the completed A-G evaluation and global score. This block is for downstream scripts; keep field names exact, use YAML, and do not add prose inside the fence.
+
+```yaml
+company: "{empresa}"
+role: "{rol}"
+score: {X.X}
+legitimacy_tier: "{High Confidence | Proceed with Caution | Suspicious}"
+archetype: "{detectado}"
+final_decision: "{Apply | Consider | Research first | Skip}"
+hard_stops:
+  - "{blocking gap or risk}"
+soft_gaps:
+  - "{non-blocking gap}"
+top_strengths:
+  - "{strength most relevant to this role}"
+risk_level: "{Low | Medium | High}"
+confidence: "{Low | Medium | High}"
+next_action: "{one concrete next step}"
+```
+
+Rules:
+- Use `[]` for `hard_stops`, `soft_gaps`, or `top_strengths` when empty.
+- `score` is numeric only, without `/5`.
+- `final_decision` must reflect the full evaluation, not only the CV match.
+- Do not invent missing data. If confidence is limited, set `confidence: "Low"` and explain the limitation in the human-readable sections.
+
 ### Paso 3 — Guardar Report .md
 
 Guardar evaluación completa en:
@@ -200,10 +228,30 @@ Donde `{company-slug}` es el nombre de empresa en lowercase, sin espacios, con g
 **Score:** {X/5}
 **Legitimacy:** {High Confidence | Proceed with Caution | Suspicious}
 **URL:** {URL de la oferta original}
-**PDF:** {career-ops/output/cv-candidate-{company-slug}-{{DATE}}.pdf if score ≥ the resolved `auto_pdf_score_threshold` from Paso 4, else `not generated — run /career-ops pdf {company-slug} to create on demand`}
+**PDF:** {output/cv-candidate-{company-slug}-{{DATE}}.pdf if score ≥ the resolved `auto_pdf_score_threshold` from Paso 4, else `not generated — run /career-ops pdf {company-slug} to create on demand`}
 **Batch ID:** {{ID}}
 
 ---
+
+## Machine Summary
+
+```yaml
+company: "{empresa}"
+role: "{rol}"
+score: {X.X}
+legitimacy_tier: "{High Confidence | Proceed with Caution | Suspicious}"
+archetype: "{detectado}"
+final_decision: "{Apply | Consider | Research first | Skip}"
+hard_stops:
+  - "{blocking gap or risk}"
+soft_gaps:
+  - "{non-blocking gap}"
+top_strengths:
+  - "{strength most relevant to this role}"
+risk_level: "{Low | Medium | High}"
+confidence: "{Low | Medium | High}"
+next_action: "{one concrete next step}"
+```
 
 ## A) Resumen del Rol
 (contenido completo)
@@ -268,6 +316,8 @@ node generate-pdf.mjs \
 ```
 14. Reporta: ruta PDF, nº páginas, % cobertura keywords
 15. In Paso 5 use `pdf_emoji` = `✅`; in Paso 6 set `"pdf"` to the output path.
+
+On success, in Paso 5 use `pdf_emoji` = `✅` and in Paso 6 set `"pdf"` to the output path.
 
 **Reglas ATS:**
 - Single-column (sin sidebars)
@@ -343,7 +393,7 @@ Formato TSV (una sola línea, sin header, 9 columnas tab-separated):
 | 5 | status | canonical | `Evaluada` | DEBE ser canónico (ver states.yml) |
 | 6 | score | X.XX/5 | `4.55/5` | O `N/A` si no evaluable |
 | 7 | pdf | emoji | `✅` o `❌` | Si se generó PDF |
-| 8 | report | md link | `[647](reports/647-...)` | Link al report |
+| 8 | report | md link | `[647](reports/647-...)` | Link root-relative; merge-tracker.mjs lo normaliza relativo al tracker (ej. `../reports/...`, #760) |
 | 9 | notes | string | `APPLY HIGH...` | Resumen 1 frase |
 
 **IMPORTANTE:** El orden TSV tiene status ANTES de score (col 5→status, col 6→score). En applications.md el orden es inverso (col 5→score, col 6→status). merge-tracker.mjs maneja la conversión.

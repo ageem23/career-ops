@@ -5,6 +5,9 @@ data/pipeline.md
 data/scan-history.tsv
 data/tasks.md
 data/follow-ups.md
+data/parser-output/**/*.json
+!data/parser-output/.gitkeep
+!data/parser-output/**/.gitkeep
 reports/*.md
 !reports/.gitkeep
 output/*
@@ -37,6 +40,9 @@ modes/_profile.md
 node_modules/
 bun.lock
 
+# Backup files written by normalize-statuses.mjs / dedup-tracker.mjs
+*.bak
+
 # OS
 .DS_Store
 *.mov
@@ -47,3 +53,6 @@ bun.lock
 .claude/memory/
 career-dashboard
 package-lock.json
+
+# Playwright MCP server run artifacts (ephemeral, machine-local — never commit)
+.playwright-mcp/
