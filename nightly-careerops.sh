@@ -199,9 +199,15 @@ fi
 echo "  first new batch ID: $FIRST_NEW_ID"
 
 # --- Step 3: batch-evaluate (merge + reconcile + verify run inside) ---
+# No --start-from: the runner processes every batch-input row whose state is
+# not yet "completed" (it skips completed rows, so this is idempotent). This
+# lets it self-heal orphans — offers imported on a prior night whose state row
+# was lost to a lock race and which a fixed start-from watermark would skip
+# forever. FIRST_NEW_ID is still used below to scope the morning summary to the
+# night's newly imported offers.
 echo ""
 echo "--- Step 3/3: batch evaluation ---"
-bash batch/batch-runner.sh --start-from "$FIRST_NEW_ID" --parallel 3
+bash batch/batch-runner.sh --parallel 3
 
 # --- Write morning summary ---
 node -e '

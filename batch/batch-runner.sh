@@ -25,6 +25,13 @@ PAUSE_FILE="$BATCH_DIR/batch-runner.paused"
 STATE_LOCK_DIR="$BATCH_DIR/.batch-state.lock"
 STATE_LOCK_PID_FILE="$STATE_LOCK_DIR/pid"
 STATE_LOCK_TIMEOUT_SECONDS=60
+# How many times process_offer retries reserving its state row before giving
+# up. acquire_state_lock can lose the mkdir race or time out under a parallel
+# burst; if the initial "processing" row never lands, the worker would run
+# claude -p with no state row and silently orphan the offer (in batch-input,
+# never in batch-state, never reconciled out of pipeline.md). On exhaustion we
+# mark the offer failed instead of evaluating it, so it's retried next run.
+RESERVE_STATE_MAX_ATTEMPTS=5
 # How often (in seconds of wall time) the parallel-mode wait loop runs the
 # orphan sweep to recover state rows where a worker finished but update_state
 # silently failed (e.g. lock-acquire timeout). 0 disables the periodic sweep;
@@ -390,8 +397,32 @@ process_offer() {
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   local retries
   retries=$(get_retries "$id")
-  local report_num
-  report_num=$(reserve_report_num "$id" "$url" "$started_at" "$retries")
+  # Reserve a report number AND persist the "processing" state row before doing
+  # any expensive work. reserve_report_num can come back empty (lock-acquire
+  # timeout) or the row can fail to land under a parallel burst; treat the
+  # reservation as successful only when we get a number AND can read the row
+  # back as "processing". Retry a few times, then bail rather than run claude -p
+  # with no state row (which is what produced silent orphans previously).
+  local report_num="" reserve_attempt=0
+  while (( reserve_attempt < RESERVE_STATE_MAX_ATTEMPTS )); do
+    if report_num=$(reserve_report_num "$id" "$url" "$started_at" "$retries") \
+        && [[ -n "$report_num" ]] \
+        && [[ "$(get_status "$id")" == "processing" ]]; then
+      break
+    fi
+    report_num=""
+    ((reserve_attempt += 1))
+    sleep 0.3
+  done
+  if [[ -z "$report_num" ]]; then
+    local failed_at
+    failed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    retries=$((retries + 1))
+    update_state "$id" "$url" "failed" "$started_at" "$failed_at" "-" "-" \
+      "could not persist state row (lock contention) after ${RESERVE_STATE_MAX_ATTEMPTS} attempts" "$retries"
+    echo "    ❌ #$id: could not reserve state row after $RESERVE_STATE_MAX_ATTEMPTS attempts — skipping evaluation (will retry next run)"
+    return 0
+  fi
   local date
   date=$(date +%Y-%m-%d)
   local jd_file="/tmp/batch-jd-${id}.txt"
