@@ -11,27 +11,38 @@ candidate:
   portfolio_url: "https://janesmith.dev"
   github: "github.com/janesmith"
   twitter: "https://x.com/janesmith"
-  # (Optional) Canva resume design ID for visual CV generation via /career-ops pdf.
-  # Find it in your Canva design URL: https://www.canva.com/design/DAxxxxxxx/...
-  # The ID starts with "D" and is 11 characters long.
-  # canva_resume_design_id: "DAxxxxxxxxx"
 
 target_roles:
-  # Your North Star roles — what you're optimizing for
+  # Your North Star roles — what you're optimizing for.
   primary:
     - "Senior AI Engineer"
     - "Staff ML Engineer"
-  # Archetypes help the evaluation system score fit
+
+  # Archetypes drive two surfaces:
+  #   1. scan.mjs reads `semantic_description` per archetype and hands it to
+  #      the title-filter LLM (scan-semantic.mjs) to recover neutral titles
+  #      that don't hit a literal positive/negative keyword.
+  #   2. The agent reads this whole block at evaluation time as Block B
+  #      "North Star alignment" context — `name`, `level`, and `fit` shape
+  #      how strongly each archetype scores in reports.
+  # Per-archetype scoring narrative (proof points, framing) lives in
+  # `modes/_profile.md`, keyed by archetype name.
+  #
+  # `semantic_description` is optional — leave it off and scan.mjs falls
+  # back to broader keyword matching for that archetype.
   archetypes:
     - name: "AI/ML Engineer"
       level: "Senior/Staff"
       fit: "primary"        # primary = dream role, secondary = good fit, adjacent = stretch
+      semantic_description: "Senior or Staff AI/ML engineer building production model pipelines (training, eval, serving)"
     - name: "AI Product Manager"
       level: "Senior"
       fit: "secondary"
+      semantic_description: "Senior product manager owning an AI product surface (LLM features, agentic flows, model-driven UX)"
     - name: "Solutions Architect"
       level: "Mid-Senior"
       fit: "adjacent"
+      semantic_description: "Solutions architect — pre-sales or post-sales senior IC, technical role"
 
 narrative:
   # Your professional headline (1 line)
@@ -69,3 +80,107 @@ location:
   visa_status: "No sponsorship needed"
   # For remote roles outside your country:
   # onsite_availability: "1 week/month in any city"
+
+# Optional follow-up cadence preferences for `node followup-cadence.mjs`.
+# CLI flags still win for one-off runs (for example `--applied-days 10`).
+# followup_cadence:
+#   applied_first_days: 7
+#   applied_subsequent_days: 7
+#   applied_max_followups: 2
+#   responded_initial_days: 1
+#   responded_subsequent_days: 3
+#   interview_thankyou_days: 1
+
+cv:
+  output_format: "html" # "html" (default) or "latex"
+  # (Optional) Canva resume design ID for visual CV generation via /career-ops pdf.
+  # Find it in your Canva design URL: https://www.canva.com/design/DAxxxxxxx/...
+  # The ID starts with "D" and is 11 characters long.
+  # canva_resume_design_id: "DAxxxxxxxxx"
+
+# Optional per-skill behavior overrides.
+#
+# Some skills (notably `contacto`) need broad web search + LinkedIn lookups
+# that the web Claude (with Research mode) does much better than Claude Code's
+# WebSearch. For those skills, set `default_mode: prompt` and the skill will
+# emit a single copy-paste prompt that you paste into a new claude.ai chat
+# with Research enabled — instead of trying to execute the workflow inline.
+#
+# The full description (with override path) lives in modes/_profile.md ->
+# "Skill Behavior Defaults". This block exists so the same preference is also
+# machine-readable for future tooling.
+#
+# Per-invocation override: tell the agent "run inline" or "give me the prompt"
+# in your message to force one mode for a single invocation.
+skill_behavior:
+  contacto:
+    default_mode: prompt   # prompt (default) | inline
+  deep:
+    default_mode: prompt   # deep is prompt-generating by design
+
+# ── Cover Letter Settings ──────────────────────────────────────────────────
+#
+# Used by `/career-ops cover` and the cover letter sub-flow in `/career-ops pdf`.
+# All fields are optional — omit any you don't need.
+
+cover_letter:
+  # Your notice period in calendar days. Surfaced as a prompt default when the
+  # JD requests an immediate start. The user confirms the actual value before it
+  # appears in the letter.
+  notice_period_days: 30
+
+  # Your current professional domain (used to detect domain gaps vs the JD).
+  # Plain English, e.g. "digital media", "fintech", "healthcare IT".
+  primary_domain: "your current domain"
+
+  # Languages you are actively learning. Each entry MAY produce a closing
+  # sentence in that language IF the JD location matches one of the listed
+  # countries AND the user confirms inclusion during the cover letter flow.
+  # Remove the block entirely if not applicable.
+  language_learning:
+    - language: Spanish
+      current_level: B1
+      target_level: B2
+      target_date: "end of 2026"
+      # The sentence to include, written in that language. Keep it one line.
+      sentence: "Estoy aprendiendo español y espero alcanzar el nivel B2 a finales de 2026."
+      # Only trigger this entry when the JD location is in one of these countries.
+      countries: [Spain, Mexico, Argentina, Colombia, Chile]
+
+# ── Auto-PDF threshold ──────────────────────────────────────────────────────
+#
+# Auto-PDF threshold during evaluation (used by `/career-ops pipeline` and
+# `bash batch/batch-runner.sh`).
+#
+# Generating a tailored CV PDF costs ~30-60s per offer (Playwright launch +
+# HTML render) and most offers in a scan score 2.x/3.x and never become an
+# actual application — so the PDF goes unused. To avoid that waste, the
+# evaluation pipeline only auto-generates a PDF when the offer's score is
+# >= this threshold.
+#
+# Default (key absent OR commented out): 5.1 — effectively disabled, since
+# the maximum possible score is 5.0. Reports are always written; PDFs are
+# only generated when you opt-in.
+#
+# Set this to a real number (e.g. 4.0) to opt in to auto-PDF for offers at
+# or above that score. Fractional thresholds work (e.g. 3.5 — half-point
+# scores like 3.5/5 occur in evaluations). Setting to 0 effectively
+# disables the gate and generates a PDF for every offer (old behavior).
+# Whatever doesn't make the cut can still be produced on demand later
+# via `/career-ops pdf {company-slug}`.
+# auto_pdf_score_threshold: 4.0
+
+# Deep-research-prompt threshold during evaluation (used by `/career-ops
+# pipeline` and `bash batch/batch-runner.sh`).
+#
+# When an offer's score is >= this threshold, the evaluation embeds a
+# ready-to-run "## Deep Research Prompt" section (see modes/deep.md) at the end
+# of the report. In the Go dashboard viewer you can then press `y` to copy that
+# prompt together with the full evaluation to your clipboard and paste it into
+# Perplexity/Claude/ChatGPT for interview-prep research — so the offers worth
+# chasing arrive with their research prompt already built.
+#
+# Default (key absent OR commented out): 3.5 — embed a prompt for any offer
+# worth a closer look. Set to 5.1 to effectively disable (max score is 5.0),
+# or to 0 to embed one for every report.
+# deep_prompt_score_threshold: 3.5

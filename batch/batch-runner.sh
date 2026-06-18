@@ -4,6 +4,11 @@ set -euo pipefail
 # career-ops batch runner — standalone orchestrator for claude -p workers
 # Reads batch-input.tsv, delegates each offer to a claude -p worker,
 # tracks state in batch-state.tsv for resumability.
+#
+# NOTE: This script is Claude Code-specific. It uses claude -p with
+# --dangerously-skip-permissions and --append-system-prompt-file flags
+# that are not available in other CLIs. Multi-CLI support is out of scope
+# for now — contributions welcome.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -16,18 +21,35 @@ TRACKER_DIR="$BATCH_DIR/tracker-additions"
 REPORTS_DIR="$PROJECT_DIR/reports"
 APPLICATIONS_FILE="$PROJECT_DIR/data/applications.md"
 LOCK_FILE="$BATCH_DIR/batch-runner.pid"
+PAUSE_FILE="$BATCH_DIR/batch-runner.paused"
 STATE_LOCK_DIR="$BATCH_DIR/.batch-state.lock"
 STATE_LOCK_PID_FILE="$STATE_LOCK_DIR/pid"
-STATE_LOCK_TIMEOUT_SECONDS=30
+STATE_LOCK_TIMEOUT_SECONDS=60
+# How many times process_offer retries reserving its state row before giving
+# up. acquire_state_lock can lose the mkdir race or time out under a parallel
+# burst; if the initial "processing" row never lands, the worker would run
+# claude -p with no state row and silently orphan the offer (in batch-input,
+# never in batch-state, never reconciled out of pipeline.md). On exhaustion we
+# mark the offer failed instead of evaluating it, so it's retried next run.
+RESERVE_STATE_MAX_ATTEMPTS=5
+# How often (in seconds of wall time) the parallel-mode wait loop runs the
+# orphan sweep to recover state rows where a worker finished but update_state
+# silently failed (e.g. lock-acquire timeout). 0 disables the periodic sweep;
+# the end-of-batch sweep still runs.
+ORPHAN_SWEEP_INTERVAL_SECONDS=30
 MAIN_PID="${BASHPID:-$$}"
 
 # Defaults
 PARALLEL=1
 DRY_RUN=false
 RETRY_FAILED=false
+RESUME_PAUSED=false
 START_FROM=0
 MAX_RETRIES=2
 MIN_SCORE=0
+MODEL=""  # empty = let claude -p use the Claude Max default
+RATE_LIMIT_SLEEP=300
+BATCH_PAUSED=false
 
 usage() {
   cat <<'USAGE'
@@ -40,9 +62,15 @@ Options:
   --parallel N         Number of parallel workers (default: 1)
   --dry-run            Show what would be processed, don't execute
   --retry-failed       Only retry offers marked as "failed" in state
+  --resume-paused      Resume offers paused by a Claude session/rate limit
   --start-from N       Start from offer ID N (skip earlier IDs)
   --max-retries N      Max retry attempts per offer (default: 2)
   --min-score N        Skip PDF/tracker for offers scoring below N (default: 0 = off)
+  --rate-limit-sleep N Seconds to wait before retrying a rate-limited worker
+                       (default: 300)
+  --model NAME         Claude model passed to `claude -p --model` (default:
+                       unset = Claude Max default). Use a cheaper model for
+                       large batches, e.g. `--model claude-sonnet-4-6`.
   -h, --help           Show this help
 
 Files:
@@ -73,13 +101,25 @@ while [[ $# -gt 0 ]]; do
     --parallel) PARALLEL="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --retry-failed) RETRY_FAILED=true; shift ;;
+    --resume-paused) RESUME_PAUSED=true; shift ;;
     --start-from) START_FROM="$2"; shift 2 ;;
     --max-retries) MAX_RETRIES="$2"; shift 2 ;;
     --min-score) MIN_SCORE="$2"; shift 2 ;;
+    --rate-limit-sleep)
+      [[ $# -ge 2 ]] || { echo "ERROR: --rate-limit-sleep requires an argument"; exit 1; }
+      RATE_LIMIT_SLEEP="$2"
+      shift 2
+      ;;
+    --model) MODEL="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1"; usage; exit 1 ;;
   esac
 done
+
+if ! [[ "$RATE_LIMIT_SLEEP" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --rate-limit-sleep must be a non-negative integer (seconds)."
+  exit 1
+fi
 
 # Lock file to prevent double execution
 acquire_lock() {
@@ -289,6 +329,51 @@ update_state() {
   run_with_state_lock update_state_unlocked "$@"
 }
 
+# Atomic compare-and-set: only patch a row to "completed" if its current
+# status is still "processing". Used by sweep_orphans to avoid racing
+# worker updates that legitimately marked the row "skipped" / "failed" /
+# "completed" between the sweep's snapshot of processing IDs and the
+# patch step. Returns 0 if the row was patched, 1 if it was no longer
+# processing (caller should skip silently).
+# Caller must hold STATE_LOCK_DIR while this runs.
+update_state_if_processing_unlocked() {
+  local id="$1" url="$2" started="$3" completed="$4" report_num="$5" score="$6" retries="$7"
+  if [[ ! -f "$STATE_FILE" ]]; then
+    return 1
+  fi
+  local current
+  current=$(awk -F'\t' -v id="$id" '$1==id {print $3; exit}' "$STATE_FILE")
+  if [[ "$current" != "processing" ]]; then
+    return 1
+  fi
+  update_state_unlocked "$id" "$url" "completed" "$started" "$completed" "$report_num" "$score" "-" "$retries"
+}
+
+update_state_if_processing() {
+  run_with_state_lock update_state_if_processing_unlocked "$@"
+}
+
+is_rate_limit_log() {
+  local log_file="$1"
+  grep -Eiq '(rate limit|rate_limit|too many requests|429|quota exceeded|try again later|temporarily unavailable)' "$log_file"
+}
+
+is_session_limit_log() {
+  local log_file="$1"
+  grep -Eiq '(session limit|resets [0-9:]+[ap]m|usage limit|limit[[:space:]]+reached)' "$log_file"
+}
+
+mark_paused_rate_limit() {
+  local id="$1" url="$2" started_at="$3" report_num="$4" retries="$5" log_file="$6"
+  local completed_at
+  completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local error_msg
+  error_msg=$(tail -5 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c1-200 || echo "session/rate limit reached")
+  update_state "$id" "$url" "paused_rate_limit" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries"
+  printf '%s\t%s\t%s\n' "$id" "$report_num" "$error_msg" > "$PAUSE_FILE"
+  BATCH_PAUSED=true
+}
+
 reserve_report_num_unlocked() {
   local id="$1" url="$2" started="$3" retries="$4"
 
@@ -312,8 +397,32 @@ process_offer() {
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   local retries
   retries=$(get_retries "$id")
-  local report_num
-  report_num=$(reserve_report_num "$id" "$url" "$started_at" "$retries")
+  # Reserve a report number AND persist the "processing" state row before doing
+  # any expensive work. reserve_report_num can come back empty (lock-acquire
+  # timeout) or the row can fail to land under a parallel burst; treat the
+  # reservation as successful only when we get a number AND can read the row
+  # back as "processing". Retry a few times, then bail rather than run claude -p
+  # with no state row (which is what produced silent orphans previously).
+  local report_num="" reserve_attempt=0
+  while (( reserve_attempt < RESERVE_STATE_MAX_ATTEMPTS )); do
+    if report_num=$(reserve_report_num "$id" "$url" "$started_at" "$retries") \
+        && [[ -n "$report_num" ]] \
+        && [[ "$(get_status "$id")" == "processing" ]]; then
+      break
+    fi
+    report_num=""
+    ((reserve_attempt += 1))
+    sleep 0.3
+  done
+  if [[ -z "$report_num" ]]; then
+    local failed_at
+    failed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    retries=$((retries + 1))
+    update_state "$id" "$url" "failed" "$started_at" "$failed_at" "-" "-" \
+      "could not persist state row (lock contention) after ${RESERVE_STATE_MAX_ATTEMPTS} attempts" "$retries"
+    echo "    ❌ #$id: could not reserve state row after $RESERVE_STATE_MAX_ATTEMPTS attempts — skipping evaluation (will retry next run)"
+    return 0
+  fi
   local date
   date=$(date +%Y-%m-%d)
   local jd_file="/tmp/batch-jd-${id}.txt"
@@ -350,13 +459,68 @@ process_offer() {
     -e "s|{{ID}}|${esc_id}|g" \
     "$PROMPT_FILE" > "$resolved_prompt"
 
-  # Launch claude -p worker (uses default model from Claude Max subscription)
+  # Inject user-layer personalization into the temporary worker prompt.
+  # The resolved prompt is gitignored runtime state, so user profile data stays
+  # out of the system layer while batch scoring matches interactive scoring.
+  for context_file in "$PROJECT_DIR/modes/_profile.md" "$PROJECT_DIR/config/profile.yml"; do
+    if [[ -f "$context_file" ]]; then
+      {
+        printf '\n\n---\n\n'
+        printf '## Runtime personalization: %s\n\n' "${context_file#$PROJECT_DIR/}"
+        sed 's/^/    /' "$context_file"
+        printf '\n'
+      } >> "$resolved_prompt"
+    fi
+  done
+
+  # Launch claude -p worker.
+  # Model defaults to the Claude Max subscription default unless --model was
+  # passed. Building the command in an array keeps quoting safe regardless.
+  # --strict-mcp-config (with no --mcp-config) starts workers with no MCP
+  # servers: they only evaluate offers and need none. Without it each parallel
+  # worker inherits the parent session's MCP (e.g. Playwright) and they deadlock
+  # fighting over the single shared browser when --parallel > 1 (issue #506).
+  local -a claude_args=(-p --dangerously-skip-permissions --strict-mcp-config)
+  if [[ -n "$MODEL" ]]; then
+    claude_args+=(--model "$MODEL")
+  fi
+  claude_args+=(--append-system-prompt-file "$resolved_prompt" "$prompt")
+
   local exit_code=0
-  claude -p \
-    --dangerously-skip-permissions \
-    --append-system-prompt-file "$resolved_prompt" \
-    "$prompt" \
-    > "$log_file" 2>&1 || exit_code=$?
+  local terminal_failure_recorded=false
+  while true; do
+    exit_code=0
+    claude "${claude_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+      break
+    fi
+
+    if is_session_limit_log "$log_file"; then
+      mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
+      echo "    ⏸️  Session/rate limit reached; pausing batch without consuming retry budget."
+      terminal_failure_recorded=true
+      break
+    fi
+
+    if is_rate_limit_log "$log_file" && (( retries < MAX_RETRIES )); then
+      if (( RATE_LIMIT_SLEEP <= 0 )); then
+        mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
+        echo "    ⏸️  Rate limited and --rate-limit-sleep is 0; pausing batch without consuming retry budget."
+        terminal_failure_recorded=true
+        break
+      fi
+      retries=$((retries + 1))
+      local retry_completed_at
+      retry_completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      update_state "$id" "$url" "rate_limited" "$started_at" "$retry_completed_at" "$report_num" "-" "rate-limit; retrying after ${RATE_LIMIT_SLEEP}s" "$retries"
+      echo "    ⏳ Rate limited (attempt $retries/$MAX_RETRIES). Waiting ${RATE_LIMIT_SLEEP}s before retry..."
+      sleep "$RATE_LIMIT_SLEEP"
+      continue
+    fi
+
+    break
+  done
 
   # Cleanup resolved prompt
   rm -f "$resolved_prompt"
@@ -373,23 +537,108 @@ process_offer() {
       score="$score_match"
     fi
 
-    # Check min-score gate
-    if [[ "$score" != "-" && -n "$score" ]] && (( $(echo "$MIN_SCORE > 0" | bc -l) )); then
-      if (( $(echo "$score < $MIN_SCORE" | bc -l) )); then
+    # Check min-score gate (awk: bc is not available on all platforms, e.g. Git-Bash on Windows)
+    if [[ "$score" != "-" && -n "$score" ]] && awk "BEGIN{exit !(${MIN_SCORE:-0} > 0)}"; then
+      if awk "BEGIN{exit !($score < ${MIN_SCORE:-0})}"; then
         update_state "$id" "$url" "skipped" "$started_at" "$completed_at" "$report_num" "$score" "below-min-score" "$retries"
         echo "    ⏭️  Skipped (score: $score < min-score: $MIN_SCORE)"
-        continue
+        return 0
       fi
     fi
 
     update_state "$id" "$url" "completed" "$started_at" "$completed_at" "$report_num" "$score" "-" "$retries"
     echo "    ✅ Completed (score: $score, report: $report_num)"
-  else
-    retries=$((retries + 1))
+  elif [[ "$terminal_failure_recorded" == "false" ]]; then
+    if (( retries < MAX_RETRIES )); then
+      retries=$((retries + 1))
+    fi
     local error_msg
     error_msg=$(tail -5 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c1-200 || echo "Unknown error (exit code $exit_code)")
     update_state "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries"
     echo "    ❌ Failed (attempt $retries, exit code $exit_code)"
+  fi
+}
+
+# Recover orphan rows in batch-state.tsv where status=processing but the
+# worker's log JSON shows it actually completed. This happens when
+# acquire_state_lock returns non-zero (mkdir race on burst completions,
+# stale lock timeout) and the update_state call inside process_offer fails
+# silently — the caller doesn't check the return code and the row stays
+# "processing" forever. Without this sweep, the user has to patch state
+# manually and the slot is wasted until they do.
+#
+# Called periodically during the parallel wait loop AND once at end-of-batch
+# (before merge_tracker) so anything still slipping through gets caught.
+sweep_orphans() {
+  local phase="${1:-sweep}"
+  local patched=0
+  local processing_ids
+  processing_ids=$(awk -F'\t' 'NR>1 && $3=="processing" {print $1}' "$STATE_FILE" 2>/dev/null)
+  [[ -z "$processing_ids" ]] && return 0
+
+  # Workers that completed within the last (lock_timeout + buffer) seconds might
+  # still be queuing for the state lock — patching their state now would race
+  # with their own update_state call and inflate the recovered count with
+  # non-orphans. Past this window the worker has either succeeded (state row
+  # already updated, we'd skip it) or given up (timed out / crashed), so any
+  # row still in `processing` is a genuine orphan worth recovering.
+  #
+  # The freshness gate is bypassed for the "end-of-batch" phase: at that point
+  # every worker has been reaped (main() waited on every spawned pid), so there
+  # is no remaining lock-queue race to avoid. Leaving the gate active here
+  # would leave just-completed orphans behind for a future invocation.
+  local orphan_min_age=$((STATE_LOCK_TIMEOUT_SECONDS + 30))
+  local now_epoch
+  now_epoch=$(date +%s)
+
+  for id in $processing_ids; do
+    # Find the most recent log for this id (logs are named {report_num}-{id}.log).
+    # ls fails with a non-zero exit when the glob matches nothing; under
+    # `set -euo pipefail` that would kill the script, so swallow with `|| log=""`
+    # and let the empty-string check below handle it.
+    local log
+    log=$(ls -t "$LOGS_DIR"/*-"${id}".log 2>/dev/null | head -1) || log=""
+    [[ -z "$log" ]] && continue
+    # Only recover if the worker JSON shows completion. Empty / partial logs
+    # (silent worker death) stay as "processing" so the human can decide
+    # whether to mark them failed and retry.
+    grep -q '"status": "completed"' "$log" || continue
+
+    # Freshness check: skip rows where the worker MAY still be holding/queuing
+    # for the state lock. Skipped entirely at end-of-batch (all workers reaped).
+    if [[ "$phase" != "end-of-batch" ]]; then
+      local log_epoch
+      log_epoch=$(date -r "$log" +%s 2>/dev/null || echo 0)
+      local log_age=$((now_epoch - log_epoch))
+      if (( log_age < orphan_min_age )); then
+        continue
+      fi
+    fi
+
+    local recovered_score recovered_report recovered_ts
+    recovered_score=$(grep '"score":' "$log" | head -1 | sed -E 's/.*"score": ([0-9.]+).*/\1/')
+    recovered_report=$(grep '"report_num":' "$log" | head -1 | sed -E 's/.*"report_num": "?([0-9]+)"?.*/\1/')
+    recovered_ts=$(date -u -r "$log" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Preserve started_at + url + retries from the existing row
+    local existing
+    existing=$(awk -F'\t' -v id="$id" '$1==id {print; exit}' "$STATE_FILE")
+    local existing_url existing_started existing_retries
+    IFS=$'\t' read -r _ existing_url _ existing_started _ _ _ _ existing_retries <<<"$existing"
+
+    # Compare-and-set: only write if the row is still "processing" under
+    # the lock. Between this loop's snapshot and now, a worker may have
+    # legitimately patched it to "skipped" / "failed" / "completed";
+    # blindly writing "completed" would clobber that. update_state_if_processing
+    # returns 1 if the row changed underneath us; treat that as a quiet skip.
+    if update_state_if_processing "$id" "$existing_url" "$existing_started" "$recovered_ts" "$recovered_report" "$recovered_score" "${existing_retries:-0}"; then
+      echo "    🔧 [${phase}] recovered orphan #${id} (score: ${recovered_score}, report: ${recovered_report})"
+      patched=$((patched + 1))
+    fi
+  done
+
+  if (( patched > 0 )); then
+    echo "    [${phase}] recovered ${patched} orphan(s) total"
   fi
 }
 
@@ -398,6 +647,9 @@ merge_tracker() {
   echo ""
   echo "=== Merging tracker additions ==="
   node "$PROJECT_DIR/merge-tracker.mjs"
+  echo ""
+  echo "=== Reconciling pipeline.md ==="
+  node "$PROJECT_DIR/reconcile-pipeline.mjs" || echo "⚠️  Pipeline reconcile had issues (see above)"
   echo ""
   echo "=== Verifying pipeline integrity ==="
   node "$PROJECT_DIR/verify-pipeline.mjs" || echo "⚠️  Verification found issues (see above)"
@@ -413,7 +665,7 @@ print_summary() {
     return
   fi
 
-  local total=0 completed=0 failed=0 pending=0
+  local total=0 completed=0 skipped=0 failed=0 pending=0
   local score_sum=0 score_count=0
 
   while IFS=$'\t' read -r sid _ sstatus _ _ _ sscore _ _; do
@@ -422,20 +674,21 @@ print_summary() {
     case "$sstatus" in
       completed) completed=$((completed + 1))
         if [[ "$sscore" != "-" && -n "$sscore" ]]; then
-          score_sum=$(echo "$score_sum + $sscore" | bc 2>/dev/null || echo "$score_sum")
+          score_sum=$(awk "BEGIN{printf \"%.2f\", $score_sum + $sscore}" 2>/dev/null || echo "$score_sum")
           score_count=$((score_count + 1))
         fi
         ;;
+      skipped) skipped=$((skipped + 1)) ;;
       failed) failed=$((failed + 1)) ;;
       *) pending=$((pending + 1)) ;;
     esac
   done < "$STATE_FILE"
 
-  echo "Total: $total | Completed: $completed | Failed: $failed | Pending: $pending"
+  echo "Total: $total | Completed: $completed | Skipped: $skipped | Failed: $failed | Pending: $pending"
 
   if (( score_count > 0 )); then
     local avg
-    avg=$(echo "scale=1; $score_sum / $score_count" | bc 2>/dev/null || echo "N/A")
+    avg=$(awk "BEGIN{printf \"%.1f\", $score_sum / $score_count}" 2>/dev/null || echo "N/A")
     echo "Average score: $avg/5 ($score_count scored)"
   fi
 }
@@ -446,6 +699,7 @@ main() {
 
   if [[ "$DRY_RUN" == "false" ]]; then
     acquire_lock
+    rm -f "$PAUSE_FILE"
   fi
 
   init_state
@@ -486,7 +740,11 @@ main() {
     local status
     status=$(get_status "$id")
 
-    if [[ "$RETRY_FAILED" == "true" ]]; then
+    if [[ "$RESUME_PAUSED" == "true" ]]; then
+      if [[ "$status" != "paused_rate_limit" ]]; then
+        continue
+      fi
+    elif [[ "$RETRY_FAILED" == "true" ]]; then
       # Only process failed offers
       if [[ "$status" != "failed" ]]; then
         continue
@@ -499,8 +757,12 @@ main() {
         continue
       fi
     else
-      # Skip completed offers
-      if [[ "$status" == "completed" ]]; then
+      # Skip terminal offers
+      if [[ "$status" == "completed" || "$status" == "skipped" ]]; then
+        continue
+      fi
+      # Paused rate-limit offers resume explicitly with --resume-paused.
+      if [[ "$status" == "paused_rate_limit" ]]; then
         continue
       fi
       # Skip failed offers that hit retry limit (unless --retry-failed)
@@ -549,14 +811,24 @@ main() {
     # Sequential processing
     for i in "${!pending_ids[@]}"; do
       process_offer "${pending_ids[$i]}" "${pending_urls[$i]}" "${pending_sources[$i]}" "${pending_notes[$i]}"
+      if [[ "$BATCH_PAUSED" == "true" || -f "$PAUSE_FILE" ]]; then
+        echo "=== Batch paused: session/rate limit reached. Resume later with --resume-paused. ==="
+        break
+      fi
     done
   else
     # Parallel processing with job control
     local running=0
     local -a pids=()
     local -a pid_ids=()
+    local last_sweep=$SECONDS
 
     for i in "${!pending_ids[@]}"; do
+      if [[ "$BATCH_PAUSED" == "true" || -f "$PAUSE_FILE" ]]; then
+        echo "=== Batch paused: session/rate limit reached. Waiting for running workers, not scheduling new offers. ==="
+        break
+      fi
+
       # Wait if we're at parallel limit
       while (( running >= PARALLEL )); do
         # Wait for any child to finish
@@ -571,8 +843,27 @@ main() {
         # Compact arrays
         pids=("${pids[@]}")
         pid_ids=("${pid_ids[@]}")
+
+        # Periodic orphan sweep — recovers slots where a worker finished
+        # but its state row didn't update (lock race). Without this, the
+        # main loop counts those slots as "in flight" forever and effective
+        # parallelism drops over time. Runs from the orchestrator thread,
+        # not from workers, so no extra lock contention.
+        if (( ORPHAN_SWEEP_INTERVAL_SECONDS > 0 && SECONDS - last_sweep >= ORPHAN_SWEEP_INTERVAL_SECONDS )); then
+          sweep_orphans "mid-run"
+          last_sweep=$SECONDS
+        fi
+
+        if [[ "$BATCH_PAUSED" == "true" || -f "$PAUSE_FILE" ]]; then
+          echo "=== Batch paused: session/rate limit reached. Waiting for running workers, not scheduling new offers. ==="
+          break
+        fi
         sleep 1
       done
+
+      if [[ "$BATCH_PAUSED" == "true" || -f "$PAUSE_FILE" ]]; then
+        break
+      fi
 
       # Launch worker in background
       process_offer "${pending_ids[$i]}" "${pending_urls[$i]}" "${pending_sources[$i]}" "${pending_notes[$i]}" &
@@ -586,6 +877,11 @@ main() {
       wait "$pid" 2>/dev/null || true
     done
   fi
+
+  # Final orphan sweep — catch anything that slipped past the periodic check.
+  # Runs in both sequential and parallel modes for consistency. Cheap when
+  # there's nothing to recover.
+  sweep_orphans "end-of-batch"
 
   # Merge tracker additions
   merge_tracker

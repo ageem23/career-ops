@@ -1,42 +1,153 @@
 package screens
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/lipgloss/table"
+	"github.com/charmbracelet/x/ansi"
 
+	"github.com/santifer/career-ops/dashboard/internal/model"
 	"github.com/santifer/career-ops/dashboard/internal/theme"
 )
 
 // ViewerClosedMsg is emitted when the viewer is dismissed.
 type ViewerClosedMsg struct{}
 
+// ViewerOpenTasksMsg is emitted when the user wants to jump from the viewer
+// to the tasks list, focused on the first task for the current application.
+type ViewerOpenTasksMsg struct {
+	AppNumber int
+}
+
 // ViewerModel implements an integrated file viewer screen.
+//
+// `lines` is the raw file content split on newlines; `renderedLines` is the
+// width-aware rendered output (markdown tables, code blocks, wrapped
+// paragraphs) produced by renderAll(). Re-rendered on Resize.
 type ViewerModel struct {
-	lines        []string
-	title        string
-	scrollOffset int
-	width        int
-	height       int
-	theme        theme.Theme
+	lines         []string
+	renderedLines []string
+	title         string
+	scrollOffset  int
+	width         int
+	height        int
+	theme         theme.Theme
+	app           model.CareerApplication
+	careerOpsPath string
+	hasApp        bool
+	statusPicker  bool
+	statusCursor  int
+	// rawReport is the report file content exactly as read from disk — before
+	// the tasks header is prepended to `lines`. It (and the deep-research
+	// prompt extracted from it) back the clipboard-copy action so a yank
+	// reproduces the report, not the rendered task table.
+	rawReport  string
+	deepPrompt string
+	// flash is a transient status line shown in the footer (e.g. the result of
+	// a clipboard copy). Cleared on the next keypress.
+	flash string
+	// Add-task prompt sub-state — shared helper used by both pipeline and
+	// viewer so the keystroke + flow is identical between the two.
+	addTask addTaskPrompt
 }
 
 // NewViewerModel creates a new file viewer for the given path.
-func NewViewerModel(t theme.Theme, path, title string, width, height int) ViewerModel {
+// If app.ReportPath is non-empty, the viewer enables in-place status changes.
+// tasks is the list of tasks linked to this application (filtered by App#);
+// the viewer renders them as a markdown table prepended to the report body so
+// the user can review all open work on this application at a glance.
+func NewViewerModel(t theme.Theme, path, title string, width, height int, app model.CareerApplication, careerOpsPath string, tasks []model.Task) ViewerModel {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		content = []byte("Error reading file: " + err.Error())
 	}
 
-	return ViewerModel{
-		lines:  strings.Split(string(content), "\n"),
-		title:  title,
-		width:  width,
-		height: height,
-		theme:  t,
+	raw := string(content)
+	var lines []string
+	if len(content) > 0 {
+		lines = strings.Split(raw, "\n")
+	}
+	if len(tasks) > 0 {
+		lines = append(buildTasksHeader(tasks), lines...)
+	}
+
+	m := ViewerModel{
+		lines:         lines,
+		title:         title,
+		width:         width,
+		height:        height,
+		theme:         t,
+		app:           app,
+		careerOpsPath: careerOpsPath,
+		hasApp:        app.ReportPath != "" || app.Company != "",
+		rawReport:     raw,
+		deepPrompt:    extractDeepPrompt(raw),
+	}
+	m.rebuildRender()
+	return m
+}
+
+// buildTasksHeader produces the markdown lines for the "Tasks for this
+// application" panel rendered at the top of the report viewer. The existing
+// renderTableBlock turns the table into a properly formatted box.
+func buildTasksHeader(tasks []model.Task) []string {
+	pending, done, skipped := 0, 0, 0
+	for _, t := range tasks {
+		switch t.Status {
+		case "pending":
+			pending++
+		case "done":
+			done++
+		case "skipped":
+			skipped++
+		}
+	}
+	lines := []string{
+		"## Tasks for this application",
+		"",
+		fmt.Sprintf("**Summary:** %d pending · %d done · %d skipped", pending, done, skipped),
+		"",
+		"| # | Status | Type | Title | Due | Completed |",
+		"|---|--------|------|-------|-----|-----------|",
+	}
+	for _, t := range tasks {
+		due := t.Due
+		if due == "" {
+			due = "-"
+		}
+		completed := t.Completed
+		if completed == "" {
+			completed = "-"
+		}
+		lines = append(lines, fmt.Sprintf("| %d | %s | %s | %s | %s | %s |",
+			t.Number, t.Status, t.Type, t.Title, due, completed))
+	}
+	lines = append(lines, "", "---", "")
+	return lines
+}
+
+// rebuildRender recomputes renderedLines from raw lines using the current width.
+func (m *ViewerModel) rebuildRender() {
+	m.renderedLines = m.renderAll()
+	m.clampScrollOffset()
+}
+
+func (m *ViewerModel) clampScrollOffset() {
+	maxScroll := len(m.renderedLines) - m.bodyHeight()
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.scrollOffset > maxScroll {
+		m.scrollOffset = maxScroll
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
 	}
 }
 
@@ -47,17 +158,82 @@ func (m ViewerModel) Init() tea.Cmd {
 func (m *ViewerModel) Resize(width, height int) {
 	m.width = width
 	m.height = height
+	m.rebuildRender()
 }
 
 func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	switch msg := msg.(type) {
+	case viewerCopyResultMsg:
+		switch {
+		case msg.err != nil:
+			m.flash = "Copy failed: " + msg.err.Error()
+		case msg.withPrompt:
+			m.flash = "Copied deep prompt + evaluation to clipboard"
+		default:
+			m.flash = "Copied evaluation to clipboard (no deep prompt in report)"
+		}
+		return m, nil
+
 	case tea.KeyMsg:
+		// Any keystroke dismisses a lingering flash so it never sticks around
+		// past the action that produced it.
+		m.flash = ""
+		if m.statusPicker {
+			return m.handleStatusPicker(msg)
+		}
+		if m.addTask.active() {
+			return m.handleAddTaskInput(msg)
+		}
 		switch msg.String() {
 		case "q", "esc":
 			return m, func() tea.Msg { return ViewerClosedMsg{} }
 
+		case "y":
+			// Yank the report to the clipboard. When the report embeds a
+			// deep-research prompt (score cleared the threshold at eval time),
+			// the prompt leads and the evaluation follows as context.
+			payload, withPrompt := m.clipboardPayload()
+			if strings.TrimSpace(payload) == "" {
+				m.flash = "Nothing to copy"
+				return m, nil
+			}
+			return m, func() tea.Msg {
+				return viewerCopyResultMsg{withPrompt: withPrompt, err: copyToClipboard(payload)}
+			}
+
+		case "c":
+			if m.hasApp {
+				m.statusPicker = true
+				m.statusCursor = 0
+			}
+
+		case "n":
+			// Same shortcut as the pipeline view — open the shared
+			// add-task prompt for the application currently displayed
+			// in the viewer. Requires a real App# so the resulting
+			// task can be linked back.
+			if m.app.Number > 0 {
+				m.addTask.open()
+			}
+
+		case "t":
+			if m.app.Number > 0 {
+				appNum := m.app.Number
+				return m, func() tea.Msg {
+					return ViewerOpenTasksMsg{AppNumber: appNum}
+				}
+			}
+
+		case "o":
+			if m.app.JobURL != "" {
+				url := m.app.JobURL
+				return m, func() tea.Msg {
+					return PipelineOpenURLMsg{URL: url}
+				}
+			}
+
 		case "down", "j":
-			maxScroll := len(m.lines) - m.bodyHeight()
+			maxScroll := len(m.renderedLines) - m.bodyHeight()
 			if maxScroll < 0 {
 				maxScroll = 0
 			}
@@ -72,7 +248,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 
 		case "pgdown", "ctrl+d":
 			jump := m.bodyHeight() / 2
-			maxScroll := len(m.lines) - m.bodyHeight()
+			maxScroll := len(m.renderedLines) - m.bodyHeight()
 			if maxScroll < 0 {
 				maxScroll = 0
 			}
@@ -92,7 +268,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			m.scrollOffset = 0
 
 		case "end", "G":
-			maxScroll := len(m.lines) - m.bodyHeight()
+			maxScroll := len(m.renderedLines) - m.bodyHeight()
 			if maxScroll < 0 {
 				maxScroll = 0
 			}
@@ -102,9 +278,92 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.rebuildRender()
 	}
 
 	return m, nil
+}
+
+func (m ViewerModel) handleStatusPicker(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.statusPicker = false
+		return m, nil
+
+	case "down", "j":
+		m.statusCursor++
+		if m.statusCursor >= len(statusOptions) {
+			m.statusCursor = len(statusOptions) - 1
+		}
+
+	case "up", "k":
+		m.statusCursor--
+		if m.statusCursor < 0 {
+			m.statusCursor = 0
+		}
+
+	case "enter":
+		m.statusPicker = false
+		newStatus := statusOptions[m.statusCursor].label
+		app := m.app
+		path := m.careerOpsPath
+		return m, func() tea.Msg {
+			return PipelineUpdateStatusMsg{
+				CareerOpsPath: path,
+				App:           app,
+				NewStatus:     newStatus,
+			}
+		}
+
+	default:
+		key := strings.ToLower(msg.String())
+		if len(key) == 1 {
+			for i, opt := range statusOptions {
+				if opt.shortcut == key {
+					m.statusCursor = i
+					m.statusPicker = false
+					newStatus := opt.label
+					app := m.app
+					path := m.careerOpsPath
+					return m, func() tea.Msg {
+						return PipelineUpdateStatusMsg{
+							CareerOpsPath: path,
+							App:           app,
+							NewStatus:     newStatus,
+						}
+					}
+				}
+			}
+		}
+	}
+	return m, nil
+}
+
+// handleAddTaskInput routes a key into the shared add-task prompt. On submit
+// (Enter at stage 2), resolves the offset and emits PipelineAddTaskMsg —
+// same message the pipeline view uses so main.go has one handler for both
+// entry points.
+func (m ViewerModel) handleAddTaskInput(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
+	if !m.addTask.handleKey(msg) {
+		return m, nil
+	}
+	app := m.app
+	title := m.addTask.Title()
+	due := m.addTask.ResolvedDue()
+	m.addTask.close()
+	return m, func() tea.Msg {
+		return PipelineAddTaskMsg{App: app, Title: title, Due: due}
+	}
+}
+
+// overlayAddTaskPrompt delegates to the shared renderer with the viewer's
+// application as the target label.
+func (m ViewerModel) overlayAddTaskPrompt(body string) string {
+	target := fmt.Sprintf("#%d %s", m.app.Number, m.app.Company)
+	if m.app.Number == 0 {
+		target = m.app.Company
+	}
+	return m.addTask.render(body, m.theme, target)
 }
 
 func (m ViewerModel) bodyHeight() int {
@@ -120,7 +379,43 @@ func (m ViewerModel) View() string {
 	body := m.renderBody()
 	footer := m.renderFooter()
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	view := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	if m.statusPicker {
+		view = m.overlayStatusPicker(view)
+	}
+	if m.addTask.active() {
+		view = m.overlayAddTaskPrompt(view)
+	}
+	return view
+}
+
+func (m ViewerModel) overlayStatusPicker(body string) string {
+	bodyLines := strings.Split(body, "\n")
+
+	pickerWidth := 30
+	padStyle := lipgloss.NewStyle().Padding(0, 2)
+	borderStyle := lipgloss.NewStyle().
+		Foreground(m.theme.Blue).
+		Bold(true)
+
+	var picker []string
+	picker = append(picker, padStyle.Render(borderStyle.Render("Change status:")))
+
+	for i, opt := range statusOptions {
+		style := lipgloss.NewStyle().Foreground(m.theme.Text).Width(pickerWidth)
+		if i == m.statusCursor {
+			style = style.Background(m.theme.Overlay).Bold(true)
+		}
+		prefix := "  "
+		if i == m.statusCursor {
+			prefix = "> "
+		}
+		label := fmt.Sprintf("%s (%s)", opt.label, strings.ToUpper(opt.shortcut))
+		picker = append(picker, padStyle.Render(style.Render(prefix+label)))
+	}
+
+	bodyLines = append(bodyLines, picker...)
+	return strings.Join(bodyLines, "\n")
 }
 
 func (m ViewerModel) renderHeader() string {
@@ -133,42 +428,23 @@ func (m ViewerModel) renderHeader() string {
 
 	title := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Blue).Render(m.title)
 
+	// Prefix the header with the application ID (the tracker #) so the user can
+	// always see which application this report belongs to. Only shown when the
+	// viewer is backed by a real application row.
+	left := title
+	if m.app.Number > 0 {
+		idBadge := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Mauve).
+			Render(fmt.Sprintf("#%d", m.app.Number))
+		left = idBadge + "  " + title
+	}
+
 	right := lipgloss.NewStyle().Foreground(m.theme.Subtext)
-	pos := right.Render(strings.TrimRight(
-		strings.Repeat(" ", max(0, m.width-lipgloss.Width(m.title)-30)),
-		" ",
-	))
-
-	lineInfo := right.Render(
-		strings.Join([]string{
-			"L",
-			strings.TrimSpace(lipgloss.NewStyle().Render(
-				strings.Join([]string{
-					func() string {
-						s := m.scrollOffset + 1
-						if s > len(m.lines) {
-							s = len(m.lines)
-						}
-						return string(rune('0'+s/100%10)) + string(rune('0'+s/10%10)) + string(rune('0'+s%10))
-					}(),
-				}, ""),
-			)),
-			"/",
-			func() string {
-				t := len(m.lines)
-				return string(rune('0'+t/100%10)) + string(rune('0'+t/10%10)) + string(rune('0'+t%10))
-			}(),
-		}, ""),
-	)
-	_ = pos
-	_ = lineInfo
-
 	scroll := right.Render(func() string {
-		if len(m.lines) == 0 {
+		if len(m.renderedLines) == 0 {
 			return ""
 		}
 		pct := 0
-		maxScroll := len(m.lines) - m.bodyHeight()
+		maxScroll := len(m.renderedLines) - m.bodyHeight()
 		if maxScroll > 0 {
 			pct = m.scrollOffset * 100 / maxScroll
 		}
@@ -184,69 +460,121 @@ func (m ViewerModel) renderHeader() string {
 		}()
 	}())
 
-	gap := m.width - lipgloss.Width(m.title) - lipgloss.Width(scroll) - 4
+	gap := m.width - lipgloss.Width(left) - lipgloss.Width(scroll) - 4
 	if gap < 1 {
 		gap = 1
 	}
 
-	return style.Render(title + strings.Repeat(" ", gap) + scroll)
+	return style.Render(left + strings.Repeat(" ", gap) + scroll)
 }
 
 func (m ViewerModel) renderBody() string {
 	bh := m.bodyHeight()
 	padStyle := lipgloss.NewStyle().Padding(0, 2)
 
-	if len(m.lines) == 0 {
+	if len(m.renderedLines) == 0 {
 		emptyStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
 		return padStyle.Render(emptyStyle.Render("(empty file)"))
 	}
 
 	end := m.scrollOffset + bh
-	if end > len(m.lines) {
-		end = len(m.lines)
+	if end > len(m.renderedLines) {
+		end = len(m.renderedLines)
 	}
-	visible := m.lines[m.scrollOffset:end]
+	visible := m.renderedLines[m.scrollOffset:end]
 
-	// Render with table block detection
+	flat := make([]string, bh)
+	copy(flat, visible)
+
+	return padStyle.Render(strings.Join(flat, "\n"))
+}
+
+// renderAll converts every raw markdown line into visual terminal lines.
+func (m ViewerModel) renderAll() []string {
 	var styled []string
 	i := 0
-	for i < len(visible) {
-		if isTableLine(visible[i]) {
-			// Collect consecutive table lines
+	for i < len(m.lines) {
+		line := m.lines[i]
+		trimmed := strings.TrimSpace(line)
+
+		if trimmed == "" {
+			styled = append(styled, "")
+			i++
+			continue
+		}
+
+		if isTableLine(line) {
 			tableStart := i
-			for i < len(visible) && isTableLine(visible[i]) {
+			for i < len(m.lines) && isTableLine(m.lines[i]) {
 				i++
 			}
-			tableLines := visible[tableStart:i]
+			styled = append(styled, m.renderTableBlock(m.lines[tableStart:i])...)
+			continue
+		}
 
-			// Also look ahead in full document for remaining table rows
-			// that may be just beyond the visible window, to get correct column widths
-			fullTableStart := m.scrollOffset + tableStart
-			fullTableEnd := fullTableStart
-			for fullTableEnd < len(m.lines) && isTableLine(m.lines[fullTableEnd]) {
-				fullTableEnd++
-			}
-			fullTable := m.lines[fullTableStart:fullTableEnd]
-
-			// Compute column widths from the full table, render only visible rows
-			colWidths := computeColumnWidths(fullTable, m.width-6)
-			rendered := m.renderTableBlock(tableLines, colWidths, fullTableStart)
-			styled = append(styled, rendered...)
-		} else {
-			styled = append(styled, m.styleLine(visible[i]))
+		if strings.HasPrefix(trimmed, "```") {
 			i++
+			var codeLines []string
+			for i < len(m.lines) {
+				if strings.TrimSpace(m.lines[i]) == "```" {
+					i++
+					break
+				}
+				codeLines = append(codeLines, m.lines[i])
+				i++
+			}
+			codeStyle := lipgloss.NewStyle().Background(m.theme.Surface).Foreground(m.theme.Text)
+			w := m.width - 6
+			if w < 10 {
+				w = 10
+			}
+			for _, cl := range codeLines {
+				for _, wl := range strings.Split(ansi.Wrap("  "+cl, w, ""), "\n") {
+					styled = append(styled, codeStyle.Render(wl))
+				}
+			}
+			continue
+		}
+
+		if isSpecialBlockLine(trimmed) {
+			styled = append(styled, m.styleLine(line))
+			i++
+			continue
+		}
+
+		start := i
+		for i < len(m.lines) {
+			next := strings.TrimSpace(m.lines[i])
+			if next == "" || isSpecialBlockLine(next) {
+				break
+			}
+			i++
+		}
+		if i > start {
+			paraLines := m.lines[start:i]
+			para := strings.Join(paraLines, " ")
+			w := m.width - 6
+			if w < 10 {
+				w = 10
+			}
+			wrapped := m.wrapParagraph(m.renderInlineElements(para), w)
+			for _, wl := range wrapped {
+				styled = append(styled, wl)
+			}
 		}
 	}
 
-	// Pad to fill height
-	for len(styled) < bh {
-		styled = append(styled, "")
+	var flat []string
+	for _, s := range styled {
+		if strings.IndexByte(s, '\n') >= 0 {
+			flat = append(flat, strings.Split(s, "\n")...)
+		} else {
+			flat = append(flat, s)
+		}
 	}
-
-	return padStyle.Render(strings.Join(styled, "\n"))
+	return flat
 }
 
-// isTableLine checks if a line is part of a markdown table.
 func isTableLine(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	return len(trimmed) > 1 && trimmed[0] == '|'
@@ -280,86 +608,48 @@ func parseTableCells(line string) []string {
 	return cells
 }
 
-// computeColumnWidths calculates max width per column across all table rows.
-func computeColumnWidths(lines []string, maxTotal int) []int {
-	maxCols := 0
-	for _, line := range lines {
-		if isTableSeparator(line) {
-			continue
-		}
-		cells := parseTableCells(line)
-		if len(cells) > maxCols {
-			maxCols = len(cells)
-		}
+func detectAlignment(sep string) lipgloss.Position {
+	s := strings.TrimSpace(sep)
+	if strings.HasPrefix(s, ":") && strings.HasSuffix(s, ":") {
+		return lipgloss.Center
 	}
-	if maxCols == 0 {
+	if strings.HasSuffix(s, ":") {
+		return lipgloss.Right
+	}
+	return lipgloss.Left
+}
+
+func (m ViewerModel) renderTableBlock(lines []string) []string {
+	if len(lines) == 0 {
 		return nil
 	}
 
-	widths := make([]int, maxCols)
+	var headers []string
+	var dataRows [][]string
+	var alignments []lipgloss.Position
+
 	for _, line := range lines {
 		if isTableSeparator(line) {
+			if len(alignments) == 0 {
+				for _, cell := range parseTableCells(line) {
+					alignments = append(alignments, detectAlignment(cell))
+				}
+			}
 			continue
 		}
 		cells := parseTableCells(line)
-		for i, cell := range cells {
-			if i < maxCols {
-				w := lipgloss.Width(cell)
-				if w > widths[i] {
-					widths[i] = w
-				}
-			}
+		rendered := make([]string, len(cells))
+		for i, c := range cells {
+			rendered[i] = m.renderInlineElements(c)
+		}
+		if headers == nil {
+			headers = rendered
+		} else {
+			dataRows = append(dataRows, rendered)
 		}
 	}
 
-	// Cap individual columns based on column count
-	maxColW := 45
-	if maxCols > 5 {
-		maxColW = 30
-	}
-	if maxCols > 7 {
-		maxColW = 22
-	}
-	for i := range widths {
-		if widths[i] > maxColW {
-			widths[i] = maxColW
-		}
-		if widths[i] < 3 {
-			widths[i] = 3
-		}
-	}
-
-	// Shrink to fit available width
-	for {
-		total := 1 // trailing border
-		for _, w := range widths {
-			total += w + 3 // cell padding + border
-		}
-		if total <= maxTotal {
-			break
-		}
-		// Find the widest column and shrink it by 1
-		widestIdx := 0
-		widestVal := 0
-		for i, w := range widths {
-			if w > widestVal {
-				widestVal = w
-				widestIdx = i
-			}
-		}
-		if widths[widestIdx] <= 3 {
-			break // can't shrink further
-		}
-		widths[widestIdx]--
-	}
-
-	return widths
-}
-
-// renderTableBlock renders table lines with aligned columns and box-drawing borders.
-func (m ViewerModel) renderTableBlock(lines []string, colWidths []int, firstLineIdx int) []string {
-	if len(lines) == 0 || len(colWidths) == 0 {
-		// Fallback: render as plain text
+	if len(headers) == 0 {
 		var result []string
 		for _, line := range lines {
 			result = append(result, m.styleLine(line))
@@ -367,177 +657,229 @@ func (m ViewerModel) renderTableBlock(lines []string, colWidths []int, firstLine
 		return result
 	}
 
-	maxCols := len(colWidths)
+	w := m.width - 6
+	if w < 10 {
+		w = 10
+	}
+
 	borderStyle := lipgloss.NewStyle().Foreground(m.theme.Overlay)
-	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Sky)
-	dataStyle := lipgloss.NewStyle().Foreground(m.theme.Text)
+	t := table.New().
+		Width(w).
+		Wrap(true).
+		BorderStyle(borderStyle).
+		BorderTop(true).BorderBottom(true).
+		BorderLeft(true).BorderRight(true).
+		BorderHeader(true).BorderColumn(true)
 
-	// Build top border
-	var result []string
-	var topParts []string
-	for _, w := range colWidths {
-		topParts = append(topParts, strings.Repeat("─", w+2))
-	}
-	result = append(result, borderStyle.Render("┌"+strings.Join(topParts, "┬")+"┐"))
-
-	isFirstDataRow := true
-	for _, line := range lines {
-		if isTableSeparator(line) {
-			// Render middle separator
-			var sepParts []string
-			for _, w := range colWidths {
-				sepParts = append(sepParts, strings.Repeat("─", w+2))
-			}
-			result = append(result, borderStyle.Render("├"+strings.Join(sepParts, "┼")+"┤"))
-			continue
-		}
-
-		cells := parseTableCells(line)
-		var paddedCells []string
-		for i := 0; i < maxCols; i++ {
-			cell := ""
-			if i < len(cells) {
-				cell = cells[i]
-			}
-			cellWidth := lipgloss.Width(cell)
-			colW := colWidths[i]
-
-			if cellWidth > colW {
-				// Truncate — need to handle multi-byte/emoji carefully
-				runes := []rune(cell)
-				truncated := string(runes)
-				for lipgloss.Width(truncated) > colW-3 && len(runes) > 0 {
-					runes = runes[:len(runes)-1]
-					truncated = string(runes)
-				}
-				cell = truncated + "..."
-				cellWidth = lipgloss.Width(cell)
-			}
-
-			padding := colW - cellWidth
-			if padding < 0 {
-				padding = 0
-			}
-			paddedCells = append(paddedCells, " "+cell+strings.Repeat(" ", padding)+" ")
-		}
-
-		// Build row with borders
-		border := borderStyle.Render("│")
-		var rowParts []string
-		for _, cell := range paddedCells {
-			if isFirstDataRow {
-				rowParts = append(rowParts, headerStyle.Render(cell))
-			} else {
-				rowParts = append(rowParts, dataStyle.Render(cell))
-			}
-		}
-		row := border + strings.Join(rowParts, border) + border
-		result = append(result, row)
-		isFirstDataRow = false
+	t.Headers(headers...)
+	if len(dataRows) > 0 {
+		t.Rows(dataRows...)
 	}
 
-	// Bottom border
-	var bottomParts []string
-	for _, w := range colWidths {
-		bottomParts = append(bottomParts, strings.Repeat("─", w+2))
-	}
-	result = append(result, borderStyle.Render("└"+strings.Join(bottomParts, "┴")+"┘"))
+	t.StyleFunc(func(row, col int) lipgloss.Style {
+		st := lipgloss.NewStyle().Padding(0, 1)
+		if row == table.HeaderRow {
+			return st.Bold(true).Foreground(m.theme.Sky)
+		}
+		if col < len(alignments) {
+			st = st.Align(alignments[col])
+		}
+		return st.Foreground(m.theme.Text)
+	})
 
-	return result
+	return strings.Split(t.String(), "\n")
 }
 
-var reBold = regexp.MustCompile(`\*\*([^*]+)\*\*`)
+var (
+	reBold       = regexp.MustCompile(`\*\*([^*]+)\*\*`)
+	reLink       = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+	reBareURL    = regexp.MustCompile(`https?://\S*[^\s\)\]\.,;:!?]`)
+	reInlineCode = regexp.MustCompile("`([^`]+)`")
+	reListNumber = regexp.MustCompile(`^(\s*\d+\.\s+)(.*)$`)
+)
+
+func isHeadingLine(line string) bool {
+	return strings.HasPrefix(line, "# ") ||
+		strings.HasPrefix(line, "## ") ||
+		strings.HasPrefix(line, "### ") ||
+		strings.HasPrefix(line, "#### ") ||
+		strings.HasPrefix(line, "##### ") ||
+		strings.HasPrefix(line, "###### ")
+}
+
+func isSpecialBlockLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return isHeadingLine(trimmed) ||
+		trimmed == "---" || trimmed == "***" ||
+		strings.HasPrefix(trimmed, "> ") ||
+		strings.HasPrefix(trimmed, "|") ||
+		strings.HasPrefix(trimmed, "```") ||
+		strings.HasPrefix(trimmed, "- ") ||
+		strings.HasPrefix(trimmed, "* ") ||
+		reListNumber.MatchString(trimmed) ||
+		(strings.HasPrefix(trimmed, "**") && strings.Contains(trimmed, ":**"))
+}
+
+func (m ViewerModel) wrapParagraph(text string, width int) []string {
+	if width <= 0 {
+		return []string{text}
+	}
+	wrapped := ansi.Wrap(text, width, "")
+	return strings.Split(wrapped, "\n")
+}
+
+func (m ViewerModel) renderInlineElements(line string) string {
+	return m.renderInlineElementsAs(line, m.theme.Subtext)
+}
+
+// renderInlineElementsAs walks the raw line once and reapplies baseColor around
+// every plain-text span, so resets emitted by inline tokens (code, bold, link,
+// bare URL) don't leak through to subsequent text.
+func (m ViewerModel) renderInlineElementsAs(line string, baseColor lipgloss.Color) string {
+	baseStyle := lipgloss.NewStyle().Foreground(baseColor)
+	codeStyle := lipgloss.NewStyle().Background(m.theme.Surface).Foreground(m.theme.Text)
+	boldStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Yellow)
+	linkStyle := lipgloss.NewStyle().Foreground(m.theme.Blue)
+
+	var b strings.Builder
+	rest := line
+	for rest != "" {
+		match := findInlineMatch(rest, codeStyle, boldStyle, linkStyle)
+		if match == nil {
+			b.WriteString(baseStyle.Render(rest))
+			break
+		}
+		if match.start > 0 {
+			b.WriteString(baseStyle.Render(rest[:match.start]))
+		}
+		b.WriteString(match.rendered)
+		rest = rest[match.end:]
+	}
+	return b.String()
+}
+
+type inlineMatch struct {
+	start, end int
+	rendered   string
+}
+
+func findInlineMatch(s string, codeStyle, boldStyle, linkStyle lipgloss.Style) *inlineMatch {
+	var best *inlineMatch
+	consider := func(loc []int, rendered func() string) {
+		if loc == nil || (best != nil && loc[0] >= best.start) {
+			return
+		}
+		best = &inlineMatch{start: loc[0], end: loc[1], rendered: rendered()}
+	}
+
+	if loc := reInlineCode.FindStringIndex(s); loc != nil {
+		consider(loc, func() string { return codeStyle.Render(s[loc[0]+1 : loc[1]-1]) })
+	}
+	if loc := reBold.FindStringIndex(s); loc != nil {
+		consider(loc, func() string { return boldStyle.Render(s[loc[0]+2 : loc[1]-2]) })
+	}
+	if loc := reLink.FindStringIndex(s); loc != nil {
+		consider(loc, func() string {
+			sm := reLink.FindStringSubmatch(s[loc[0]:loc[1]])
+			if len(sm) >= 2 {
+				return linkStyle.Render(sm[1])
+			}
+			return s[loc[0]:loc[1]]
+		})
+	}
+	if loc := reBareURL.FindStringIndex(s); loc != nil {
+		consider(loc, func() string { return linkStyle.Render(s[loc[0]:loc[1]]) })
+	}
+	return best
+}
 
 func (m ViewerModel) styleLine(line string) string {
 	trimmed := strings.TrimSpace(line)
+	w := m.width - 6
+	if w < 10 {
+		w = 10
+	}
 
-	// H1 — render without the "# " prefix
 	if strings.HasPrefix(trimmed, "# ") && !strings.HasPrefix(trimmed, "## ") {
 		content := strings.TrimPrefix(trimmed, "# ")
-		return lipgloss.NewStyle().
-			Bold(true).
-			Foreground(m.theme.Blue).
-			Render("  " + content)
+		return lipgloss.NewStyle().Bold(true).Foreground(m.theme.Blue).Width(w).Render("  " + content)
 	}
-	// H2 — render without the "## " prefix
 	if strings.HasPrefix(trimmed, "## ") && !strings.HasPrefix(trimmed, "### ") {
 		content := strings.TrimPrefix(trimmed, "## ")
-		return lipgloss.NewStyle().
-			Bold(true).
-			Foreground(m.theme.Mauve).
-			Render("  " + content)
+		return lipgloss.NewStyle().Bold(true).Foreground(m.theme.Mauve).Width(w).Render("  " + content)
 	}
-	// H3 — render without the "### " prefix
-	if strings.HasPrefix(trimmed, "### ") {
+	if strings.HasPrefix(trimmed, "### ") && !strings.HasPrefix(trimmed, "#### ") {
 		content := strings.TrimPrefix(trimmed, "### ")
-		return lipgloss.NewStyle().
-			Bold(true).
-			Foreground(m.theme.Sky).
-			Render("  " + content)
+		return lipgloss.NewStyle().Bold(true).Foreground(m.theme.Sky).Width(w).Render("  " + content)
 	}
-	// Horizontal rule
+	if strings.HasPrefix(trimmed, "#### ") && !strings.HasPrefix(trimmed, "##### ") {
+		content := strings.TrimPrefix(trimmed, "#### ")
+		return lipgloss.NewStyle().Bold(true).Foreground(m.theme.Subtext).Width(w).Render("    " + content)
+	}
+	if strings.HasPrefix(trimmed, "##### ") && !strings.HasPrefix(trimmed, "###### ") {
+		content := strings.TrimPrefix(trimmed, "##### ")
+		return lipgloss.NewStyle().Bold(true).Foreground(m.theme.Overlay).Width(w).Render("      " + content)
+	}
+	if strings.HasPrefix(trimmed, "###### ") {
+		content := strings.TrimPrefix(trimmed, "###### ")
+		return lipgloss.NewStyle().Bold(true).Foreground(m.theme.Overlay).Width(w).Render("        " + content)
+	}
 	if trimmed == "---" || trimmed == "***" {
-		return lipgloss.NewStyle().
-			Foreground(m.theme.Overlay).
-			Render(strings.Repeat("─", m.width-4))
+		return lipgloss.NewStyle().Foreground(m.theme.Overlay).Width(w).Render(strings.Repeat("─", w))
 	}
-	// Blockquote
 	if strings.HasPrefix(trimmed, "> ") {
 		content := strings.TrimPrefix(trimmed, "> ")
 		border := lipgloss.NewStyle().Foreground(m.theme.Overlay).Render("▎ ")
-		text := lipgloss.NewStyle().Foreground(m.theme.Subtext).Italic(true).Render(content)
-		return border + text
+		textStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext).Italic(true)
+		wrapped := strings.Split(ansi.Wrap(textStyle.Render(content), w-2, ""), "\n")
+		result := make([]string, 0, len(wrapped))
+		for i, line := range wrapped {
+			if i == 0 {
+				result = append(result, border+line)
+			} else {
+				result = append(result, strings.Repeat(" ", ansi.StringWidth(border))+line)
+			}
+		}
+		return strings.Join(result, "\n")
 	}
-	// Bold fields like **Score:** 4.0/5 — render with bold label, strip asterisks
 	if strings.HasPrefix(trimmed, "**") && strings.Contains(trimmed, ":**") {
-		return m.renderInlineBold(line, m.theme.Yellow)
+		styled := m.renderInlineElements(line)
+		return ansi.Wrap(styled, w, "")
 	}
-	// Bullet points and numbered lists
 	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
-		return m.renderInlineBold(line, m.theme.Text)
+		content := trimmed[2:]
+		marker := lipgloss.NewStyle().Foreground(m.theme.Blue).Render("• ")
+		return m.renderListItem(marker, content, w)
 	}
-	if len(trimmed) > 2 && trimmed[0] >= '0' && trimmed[0] <= '9' && strings.Contains(trimmed[:3], ".") {
-		return m.renderInlineBold(line, m.theme.Text)
+	if reListNumber.MatchString(trimmed) {
+		sm := reListNumber.FindStringSubmatch(trimmed)
+		if len(sm) >= 3 {
+			marker := lipgloss.NewStyle().Foreground(m.theme.Blue).Render(sm[1])
+			return m.renderListItem(marker, sm[2], w)
+		}
 	}
 
-	// Default — still check for inline bold
-	if strings.Contains(trimmed, "**") {
-		return m.renderInlineBold(line, m.theme.Subtext)
-	}
-
-	return lipgloss.NewStyle().
-		Foreground(m.theme.Subtext).
-		Render(line)
+	styled := m.renderInlineElementsAs(trimmed, m.theme.Subtext)
+	return ansi.Wrap(styled, w, "")
 }
 
-// renderInlineBold renders a line with **bold** segments highlighted.
-func (m ViewerModel) renderInlineBold(line string, baseColor lipgloss.Color) string {
-	baseStyle := lipgloss.NewStyle().Foreground(baseColor)
-	boldStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Yellow)
-
-	matches := reBold.FindAllStringIndex(line, -1)
-	if len(matches) == 0 {
-		return baseStyle.Render(line)
+func (m ViewerModel) renderListItem(marker, content string, width int) string {
+	markerWidth := ansi.StringWidth(marker)
+	textWidth := width - markerWidth
+	if textWidth < 10 {
+		textWidth = 10
 	}
-
-	var result strings.Builder
-	last := 0
-	for _, loc := range matches {
-		// Render text before the bold
-		if loc[0] > last {
-			result.WriteString(baseStyle.Render(line[last:loc[0]]))
+	styled := m.renderInlineElementsAs(content, m.theme.Text)
+	lines := strings.Split(ansi.Wrap(styled, textWidth, ""), "\n")
+	result := make([]string, 0, len(lines))
+	for i, line := range lines {
+		if i == 0 {
+			result = append(result, marker+line)
+		} else {
+			result = append(result, strings.Repeat(" ", markerWidth)+line)
 		}
-		// Extract bold content (without **)
-		boldText := line[loc[0]+2 : loc[1]-2]
-		result.WriteString(boldStyle.Render(boldText))
-		last = loc[1]
 	}
-	// Render remaining text
-	if last < len(line) {
-		result.WriteString(baseStyle.Render(line[last:]))
-	}
-
-	return result.String()
+	return strings.Join(result, "\n")
 }
 
 func (m ViewerModel) renderFooter() string {
@@ -550,9 +892,71 @@ func (m ViewerModel) renderFooter() string {
 	keyStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Text)
 	descStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
 
-	return style.Render(
-		keyStyle.Render("↑↓") + descStyle.Render(" scroll  ") +
-			keyStyle.Render("PgUp/Dn") + descStyle.Render(" page  ") +
-			keyStyle.Render("g/G") + descStyle.Render(" top/end  ") +
-			keyStyle.Render("Esc") + descStyle.Render(" back"))
+	// A pending flash (e.g. clipboard-copy result) takes over the footer until
+	// the next keystroke clears it.
+	if m.flash != "" {
+		flashStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Green)
+		if strings.HasPrefix(m.flash, "Copy failed") {
+			flashStyle = flashStyle.Foreground(m.theme.Red)
+		}
+		return style.Render(flashStyle.Render(m.flash))
+	}
+
+	// While the add-task prompt is open, hide the navigation hints and
+	// show input-mode hints instead so the user knows what's reachable.
+	if m.addTask.active() {
+		return style.Render(
+			keyStyle.Render("type") + descStyle.Render(" input  ") +
+				keyStyle.Render("↑↓") + descStyle.Render(" ±day  ") +
+				keyStyle.Render("Enter") + descStyle.Render(" next/save  ") +
+				keyStyle.Render("Esc") + descStyle.Render(" cancel"))
+	}
+
+	parts := keyStyle.Render("↑↓") + descStyle.Render(" scroll  ") +
+		keyStyle.Render("PgUp/Dn") + descStyle.Render(" page  ") +
+		keyStyle.Render("g/G") + descStyle.Render(" top/end  ")
+	if m.hasApp {
+		parts += keyStyle.Render("c") + descStyle.Render(" change status  ")
+	}
+	if m.app.JobURL != "" {
+		parts += keyStyle.Render("o") + descStyle.Render(" open URL  ")
+	}
+	if m.app.Number > 0 {
+		parts += keyStyle.Render("n") + descStyle.Render(" new task  ") +
+			keyStyle.Render("t") + descStyle.Render(" tasks  ")
+	}
+	parts += keyStyle.Render("y") + descStyle.Render(" copy  ") +
+		keyStyle.Render("Esc") + descStyle.Render(" back")
+	return style.Render(parts)
+}
+
+// wordWrap performs greedy word-wrap: pack as many whitespace-separated
+// tokens as fit, then start a new line. A single word longer than width is
+// kept on its own line rather than mid-word split.
+func wordWrap(text string, width int) []string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return []string{text}
+	}
+	var lines []string
+	var current strings.Builder
+	for _, w := range words {
+		if current.Len() == 0 {
+			current.WriteString(w)
+			continue
+		}
+		runeLen := utf8.RuneCountInString(current.String()) + 1 + utf8.RuneCountInString(w)
+		if runeLen <= width {
+			current.WriteByte(' ')
+			current.WriteString(w)
+		} else {
+			lines = append(lines, current.String())
+			current.Reset()
+			current.WriteString(w)
+		}
+	}
+	if current.Len() > 0 {
+		lines = append(lines, current.String())
+	}
+	return lines
 }

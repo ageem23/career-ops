@@ -16,15 +16,34 @@ import (
 var (
 	reReportLink     = regexp.MustCompile(`\[(\d+)\]\(([^)]+)\)`)
 	reScoreValue     = regexp.MustCompile(`(\d+\.?\d*)/5`)
-	reArchetype      = regexp.MustCompile(`(?i)\*\*Arquetipo(?:\s+detectado)?\*\*\s*\|\s*(.+)`)
+	reArchetype      = regexp.MustCompile(`(?i)\*\*(?:Arquetipo|Archetype)(?:\s+detectado|\s+detected)?\*\*\s*\|\s*(.+)`)
 	reTlDr           = regexp.MustCompile(`(?i)\*\*TL;DR\*\*\s*\|\s*(.+)`)
 	reTlDrColon      = regexp.MustCompile(`(?i)\*\*TL;DR:\*\*\s*(.+)`)
 	reRemote         = regexp.MustCompile(`(?i)\*\*Remote\*\*\s*\|\s*(.+)`)
 	reComp           = regexp.MustCompile(`(?i)\*\*Comp\*\*\s*\|\s*(.+)`)
-	reArchetypeColon = regexp.MustCompile(`(?i)\*\*Arquetipo:\*\*\s*(.+)`)
+	reArchetypeColon = regexp.MustCompile(`(?i)\*\*(?:Arquetipo|Archetype):\*\*\s*(.+)`)
 	reReportURL      = regexp.MustCompile(`(?m)^\*\*URL:\*\*\s*(https?://\S+)`)
 	reBatchID        = regexp.MustCompile(`(?m)^\*\*Batch ID:\*\*\s*(\d+)`)
 )
+
+// resolveReportPath converts a report link from the tracker into a path
+// relative to careerOpsPath. Links are normally relative to the tracker
+// file's own directory (see merge-tracker.mjs link normalization, #760);
+// legacy trackers may still carry root-relative links, so fall back to the
+// raw link when the tracker-relative resolution does not exist on disk.
+func resolveReportPath(careerOpsPath, trackerPath, link string) string {
+	resolved := filepath.Join(filepath.Dir(trackerPath), link)
+	if _, err := os.Stat(resolved); err != nil {
+		legacy := filepath.Join(careerOpsPath, link)
+		if _, err2 := os.Stat(legacy); err2 == nil {
+			resolved = legacy
+		}
+	}
+	if rel, err := filepath.Rel(careerOpsPath, resolved); err == nil {
+		return rel
+	}
+	return link
+}
 
 // ParseApplications reads applications.md and returns parsed applications.
 // It tries both {path}/applications.md and {path}/data/applications.md for compatibility.
@@ -77,8 +96,12 @@ func ParseApplications(careerOpsPath string) []model.CareerApplication {
 		}
 
 		num++
+		trackerNumber := num
+		if parsedNumber, err := strconv.Atoi(fields[0]); err == nil {
+			trackerNumber = parsedNumber
+		}
 		app := model.CareerApplication{
-			Number:  num,
+			Number:  trackerNumber,
 			Date:    fields[1],
 			Company: fields[2],
 			Role:    fields[3],
@@ -92,16 +115,24 @@ func ParseApplications(careerOpsPath string) []model.CareerApplication {
 			app.Score, _ = strconv.ParseFloat(sm[1], 64)
 		}
 
-		// Parse report link
+		// Parse report link. Tracker links are written relative to the
+		// tracker file itself (e.g. ../reports/... when the tracker lives in
+		// data/), so resolve against the tracker's directory and normalize
+		// back to a careerOpsPath-relative path, which is what every
+		// consumer joins against. Legacy root-relative links are kept as a
+		// fallback when the resolved file does not exist.
 		if rm := reReportLink.FindStringSubmatch(fields[7]); rm != nil {
 			app.ReportNumber = rm[1]
-			app.ReportPath = rm[2]
+			app.ReportPath = resolveReportPath(careerOpsPath, filePath, rm[2])
 		}
 
 		// Notes (field 8 if exists)
 		if len(fields) > 8 {
 			app.Notes = fields[8]
 		}
+
+		// Lift location / work mode / pay / last-contact out of the notes free-text
+		deriveNoteFields(&app)
 
 		apps = append(apps, app)
 	}
@@ -576,6 +607,72 @@ func UpdateApplicationStatus(careerOpsPath string, app model.CareerApplication, 
 func replaceStatusInLine(line, oldStatus, newStatus string) string {
 	// Case-insensitive replacement of the status field
 	return strings.Replace(line, oldStatus, newStatus, 1)
+}
+
+// AppendApplicationNote appends a note fragment to the Notes column of the
+// application row identified by reportNumber. Joined to existing notes with
+// "; " (a non-pipe separator so the table parser still sees a single column).
+// No-op if the application is not found.
+func AppendApplicationNote(careerOpsPath, reportNumber, note string) error {
+	if reportNumber == "" || note == "" {
+		return nil
+	}
+	// Pipes inside a markdown table cell fracture the row when split by '|'.
+	// Replace them with the broken-bar U+00A6 so the cell stays single-column.
+	note = strings.ReplaceAll(note, "|", "¦")
+	filePath := filepath.Join(careerOpsPath, "applications.md")
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		filePath = filepath.Join(careerOpsPath, "data", "applications.md")
+		content, err = os.ReadFile(filePath)
+		if err != nil {
+			return err
+		}
+	}
+
+	lines := strings.Split(string(content), "\n")
+	marker := fmt.Sprintf("[%s]", reportNumber)
+	for i, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), "|") || !strings.Contains(line, marker) {
+			continue
+		}
+		// Update last column (Notes). Find last pipe before optional trailing pipe.
+		trimmed := strings.TrimRight(line, " \t")
+		trailingPipe := strings.HasSuffix(trimmed, "|")
+		body := trimmed
+		if trailingPipe {
+			body = strings.TrimSuffix(body, "|")
+			body = strings.TrimRight(body, " \t")
+		}
+		lastPipe := strings.LastIndex(body, "|")
+		if lastPipe < 0 {
+			return nil
+		}
+		notesField := strings.TrimSpace(body[lastPipe+1:])
+		var newNotes string
+		if notesField == "" {
+			newNotes = note
+		} else {
+			newNotes = notesField + "; " + note
+		}
+		rebuilt := body[:lastPipe+1] + " " + newNotes
+		if trailingPipe {
+			rebuilt += " |"
+		}
+		lines[i] = rebuilt
+		return os.WriteFile(filePath, []byte(strings.Join(lines, "\n")), 0644)
+	}
+	return nil
+}
+
+// FindApplicationByNumber returns the application matching tracker number, or false.
+func FindApplicationByNumber(apps []model.CareerApplication, number int) (model.CareerApplication, bool) {
+	for _, a := range apps {
+		if a.Number == number {
+			return a, true
+		}
+	}
+	return model.CareerApplication{}, false
 }
 
 // cleanTableCell removes trailing pipes and whitespace from a table cell value.
