@@ -57,6 +57,7 @@ const SYSTEM_PATHS = [
   'generate-latex.mjs',
   'merge-tracker.mjs',
   'verify-pipeline.mjs',
+  'reconcile-pipeline.mjs',
   'dedup-tracker.mjs',
   'normalize-statuses.mjs',
   'cv-sync-check.mjs',
