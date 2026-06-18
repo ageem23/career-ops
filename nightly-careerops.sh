@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 # Nightly career-ops automation — runs portal scan, imports new offers, and
 # batch-evaluates them. Registered in Windows Task Scheduler:
-#   - "career-ops-nightly"      → 18:00 daily (full run: scan + import + batch)
-#   - "career-ops-nightly-late" → 00:00 daily (--no-scan: pipeline leftovers only;
-#                                              runs 6h after the full run)
+#   - "career-ops-scan"         → 18:00 daily (--scan-only: portal scan, no eval)
+#   - "career-ops-nightly"      → 22:00 daily (--no-scan --cap=30: import + eval)
+#   - "career-ops-nightly-late" → 04:00 daily (--no-scan --cap=30: leftovers + eval)
 # Each run logs to tmp/nightly-{date}[-late].log and writes a morning summary
 # to tmp/nightly-latest-summary.txt.
 #
 # Steps:
-#   1. node scan.mjs                          — zero-token portal scan (skipped with --no-scan)
+#   1. node scan.mjs                          — zero-token portal scan (skipped with --no-scan; --scan-only stops after this step)
 #   2. import pipeline.md Pendientes           — append new offers to batch-input.tsv
 #   3. batch/batch-runner.sh --parallel 3      — evaluate; merge + reconcile + verify
 #
-# Caps at 30 offers per run; any overflow stays in data/pipeline.md Pendientes
-# (picked up by the next run, or clear it manually with /career-ops pipeline).
+# Caps at --cap=N offers per run (default 20); any overflow stays in
+# data/pipeline.md Pendientes (picked up by the next run, or clear it manually
+# with /career-ops pipeline).
 #
-# Manual run: bash nightly-careerops.sh           (full)
-#             bash nightly-careerops.sh --no-scan (leftovers only)
+# Manual run: bash nightly-careerops.sh            (full: scan + import + eval)
+#             bash nightly-careerops.sh --no-scan  (leftovers only)
+#             bash nightly-careerops.sh --scan-only (scan only, no eval)
 #
 # Non-interactive runs (Task Scheduler after wake-from-sleep) auto-sleep 60s
 # before scan.mjs so the VPN can connect — otherwise some providers return
@@ -26,16 +28,30 @@ set -uo pipefail
 # --- Parse flags ---
 NO_SCAN=false
 NO_PREFLIGHT=false
+SCAN_ONLY=false
+CAP=20          # max offers imported+evaluated per run; override with --cap=N
 WAIT_SECS=""  # empty → auto-detect below; explicit value overrides
 for arg in "$@"; do
   case "$arg" in
     --no-scan) NO_SCAN=true ;;
+    --scan-only) SCAN_ONLY=true ;;
+    --cap=*) CAP="${arg#--cap=}" ;;
     --no-wait) WAIT_SECS=0 ;;
     --wait=*) WAIT_SECS="${arg#--wait=}" ;;
     --no-preflight) NO_PREFLIGHT=true ;;
     *) echo "Unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
+
+if ! [[ "$CAP" =~ ^[0-9]+$ ]]; then
+  echo "Invalid --cap value: '$CAP' (must be a non-negative integer)" >&2
+  exit 2
+fi
+if $SCAN_ONLY && $NO_SCAN; then
+  echo "--scan-only and --no-scan are mutually exclusive" >&2
+  exit 2
+fi
+export NIGHTLY_CAP="$CAP"
 
 # Auto-detect: interactive (TTY) → no wait; non-interactive (scheduler) → 60s.
 # Must run BEFORE the tee exec below, which makes stdout non-TTY.
@@ -127,6 +143,32 @@ if ! $NO_SCAN; then
 fi
 export SCAN_BANNER
 
+# --- Scan-only mode: stop after the scan, leave offers in pipeline.md ---
+# The evaluation jobs (--no-scan) import and score them later. We still write a
+# morning summary so the scan result is visible even when no eval ran.
+if $SCAN_ONLY; then
+  PENDING=$(node -e '
+    const fs = require("fs");
+    let inPend = false, n = 0;
+    for (const line of fs.readFileSync("data/pipeline.md", "utf8").split("\n")) {
+      if (line.startsWith("## ")) { inPend = /pend/i.test(line); continue; }
+      if (inPend && line.startsWith("- [ ]")) n++;
+    }
+    process.stdout.write(String(n));
+  ')
+  {
+    echo "career-ops scan summary — $TS"
+    [[ -n "$SCAN_BANNER" ]] && echo "$SCAN_BANNER"
+    echo ""
+    echo "$PENDING offer(s) pending in pipeline.md — evaluation jobs (22:00 / 04:00) will process up to ${CAP} each."
+  } > "$SUMMARY"
+  echo ""
+  echo "--- scan-only: $PENDING offer(s) pending in pipeline.md, skipping import + eval ---"
+  echo ""
+  echo "=== Scan complete: $(date +%H:%M:%S) — summary: $SUMMARY ==="
+  exit 0
+fi
+
 # --- Step 2: import new pipeline.md Pendientes into batch-input.tsv ---
 echo ""
 echo "--- Step 2/3: import new offers into batch-input.tsv ---"
@@ -156,7 +198,7 @@ FIRST_NEW_ID=$(node -e '
   if (!txt.endsWith("\n")) txt += "\n";
   const firstNew = maxId + 1;
   const src = "nightly-" + new Date().toISOString().slice(0, 10);
-  const CAP = 30;  // max offers evaluated per night; overflow stays in pipeline.md
+  const CAP = parseInt(process.env.NIGHTLY_CAP || "20", 10);  // max offers evaluated per run; overflow stays in pipeline.md
   let added = 0, out = "", deferred = 0;
   for (const [url, notes] of pending) {
     if (seen.has(url)) continue;
@@ -247,7 +289,7 @@ node -e '
     if (line.startsWith("## ")) { inPend = /pend/i.test(line); continue; }
     if (inPend && line.startsWith("- [ ]")) remaining++;
   }
-  if (remaining) s += remaining + " offer(s) still in pipeline.md (over the 30/night cap) — run /career-ops pipeline to clear\n";
+  if (remaining) s += remaining + " offer(s) still in pipeline.md (over the " + (process.env.NIGHTLY_CAP || "20") + "/run cap) — run /career-ops pipeline to clear\n";
   const path = "tmp/nightly-latest-summary.txt";
   if (process.env.SUMMARY_APPEND) {
     const body = s.replace(/^career-ops nightly summary — [^\n]*\n/, "");
