@@ -11,6 +11,12 @@ candidate:
   portfolio_url: "https://janesmith.dev"
   github: "github.com/janesmith"
   twitter: "https://x.com/janesmith"
+  # Optional profile photo for the PDF CV (opt-in, #264). Leave empty to omit it
+  # entirely: US/UK and many-market ATS penalize photos, so the photoless layout
+  # is the default. Set it only for DACH/European markets (Germany, Austria,
+  # Switzerland) where a professional photo is expected. Use a local file path or
+  # a data: URL — the PDF renderer inlines local images.
+  photo: ""
 
 target_roles:
   # Your North Star roles — what you're optimizing for
@@ -154,3 +160,15 @@ cover_letter:
 # Whatever doesn't make the cut can still be produced on demand later
 # via `/career-ops pdf {company-slug}`.
 # auto_pdf_score_threshold: 4.0
+
+# ── Re-apply Cooldown Windows ──────────────────────────────────────────────
+#
+# Define cooldown windows for companies where you've recently applied.
+# The scanner will skip new postings at these companies during the window.
+#
+# re_apply_windows:
+#   CompanyA:
+#     same_role_days: 180
+#     cross_role_bucket: "all_EM_roles"
+#     applied_to: ["Senior Software Engineer"]
+#     last_apply_date: "2026-01-01"
