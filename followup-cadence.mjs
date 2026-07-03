@@ -12,9 +12,10 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, relative, sep } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import yaml from 'js-yaml';
+import { resolveColumns, parseTrackerRow } from './tracker-parse.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 const APPS_FILE = existsSync(join(CAREER_OPS, 'data/applications.md'))
@@ -114,6 +115,17 @@ export function parseDate(dateStr) {
   return new Date(dateStr.trim());
 }
 
+// The tracker `date` column is often the evaluation date, while the real
+// submission date is recorded in the notes as "Applied YYYY-MM-DD" (or
+// "APPLIED ..."). Prefer that so cadence reflects when the application actually
+// went out, not when the role was evaluated. Returns the first such date, or
+// null when the notes don't carry one (caller falls back to the date column).
+export function parseAppliedDate(notes) {
+  if (!notes) return null;
+  const m = String(notes).match(/\bapplied\s+(\d{4}-\d{2}-\d{2})/i);
+  return m ? m[1] : null;
+}
+
 export function daysBetween(d1, d2) {
   return Math.floor((d2 - d1) / (1000 * 60 * 60 * 24));
 }
@@ -128,18 +140,12 @@ export function addDays(date, days) {
 function parseTracker() {
   if (!existsSync(APPS_FILE)) return [];
   const content = readFileSync(APPS_FILE, 'utf-8');
+  const lines = content.split('\n');
+  const colmap = resolveColumns(lines);
   const entries = [];
-  for (const line of content.split('\n')) {
-    if (!line.startsWith('|')) continue;
-    const parts = line.split('|').map(s => s.trim());
-    if (parts.length < 9) continue;
-    const num = parseInt(parts[1]);
-    if (isNaN(num)) continue;
-    entries.push({
-      num, date: parts[2], company: parts[3], role: parts[4],
-      score: parts[5], status: parts[6], pdf: parts[7], report: parts[8],
-      notes: parts[9] || '',
-    });
+  for (const line of lines) {
+    const row = parseTrackerRow(line, colmap);
+    if (row) entries.push(row);
   }
   return entries;
 }
@@ -187,11 +193,17 @@ function extractContacts(notes) {
 }
 
 // --- Resolve report path ---
-function resolveReportPath(reportField) {
+export function resolveReportPath(reportField, appsFile = APPS_FILE, repoRoot = CAREER_OPS) {
   const match = reportField.match(/\]\(([^)]+)\)/);
   if (!match) return null;
-  const fullPath = join(CAREER_OPS, match[1]);
-  return existsSync(fullPath) ? match[1] : null;
+  // Report links in the tracker are normalized relative to the tracker file's
+  // own directory (see PR #760 — `merge-tracker.mjs --migrate`). Resolve against
+  // dirname(APPS_FILE), not the project root, otherwise relative paths like
+  // `../reports/...` (the data/applications.md layout) escape above the project.
+  const fullPath = join(dirname(appsFile), match[1]);
+  const repoRelative = relative(repoRoot, fullPath).split(sep).join('/');
+  if (repoRelative.startsWith('../') || repoRelative === '..' || !repoRelative.startsWith('reports/')) return null;
+  return existsSync(fullPath) ? repoRelative : null;
 }
 
 // --- Compute urgency ---
@@ -224,7 +236,7 @@ export function computeNextFollowupDate(status, appDate, lastFollowupDate, follo
   }
   if (status === 'responded') {
     if (lastFollowupDate) return addDays(parseDate(lastFollowupDate), CADENCE.responded_subsequent);
-    return addDays(parseDate(appDate), CADENCE.responded_subsequent);
+    return addDays(parseDate(appDate), CADENCE.responded_initial);
   }
   if (status === 'interview') {
     return addDays(parseDate(appDate), CADENCE.interview_thankyou);
@@ -255,7 +267,9 @@ function analyze() {
     const normalized = normalizeStatus(app.status);
     if (!ACTIONABLE_STATUSES.includes(normalized)) continue;
 
-    const appDate = parseDate(app.date);
+    // Prefer the "Applied YYYY-MM-DD" date from notes; fall back to the column.
+    const appliedDate = parseAppliedDate(app.notes) || app.date;
+    const appDate = parseDate(appliedDate);
     if (!appDate) continue;
 
     const daysSinceApp = daysBetween(appDate, now);
@@ -273,7 +287,7 @@ function analyze() {
     }
 
     const urgency = computeUrgency(normalized, daysSinceApp, daysSinceLastFollowup, followupCount);
-    const nextFollowupDate = computeNextFollowupDate(normalized, app.date, lastFollowupDate, followupCount);
+    const nextFollowupDate = computeNextFollowupDate(normalized, appliedDate, lastFollowupDate, followupCount);
     const nextDate = nextFollowupDate ? parseDate(nextFollowupDate) : null;
     const daysUntilNext = nextDate ? daysBetween(now, nextDate) : null;
 
@@ -283,6 +297,7 @@ function analyze() {
     entries.push({
       num: app.num,
       date: app.date,
+      appliedDate,
       company: app.company,
       role: app.role,
       status: normalized,

@@ -1,5 +1,7 @@
 # Mode: contacto -- LinkedIn Power Move
 
+> Apply `voice-dna.md` (if present) to every generated message — full guardrail, conversational voice included (Tier 1 + Tier 2). See `_shared.md` → Voice DNA.
+
 ## 🚦 STOP — RESOLVE ACTIVE MODE FIRST (before reading anything else)
 
 This skill has **two execution modes**. You MUST decide which one is active **before** reading any other section of this file. Both modes are mutually exclusive — running both is a bug.

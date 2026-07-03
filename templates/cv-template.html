@@ -5,7 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{{NAME}} — CV</title>
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
+  /* ATS-safe typography: this template uses a standard static system sans
+     stack (Helvetica/Arial) so PDF text extractors read clean, machine-readable
+     words. Ligatures are disabled (below) because headless Chromium substitutes
+     fi/fl/ffi with the Unicode glyphs U+FB01/FB02/FB03 at PDF layout time, and
+     PDF text extractors (what ATS systems read) decode them back to those
+     codepoints — so "verification" becomes "veriﬁcation" and a literal keyword
+     search misses it. Required ligatures (rlig) stay on, so Arabic shaping is
+     unaffected. */
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    font-variant-ligatures: none;
+    font-feature-settings: "liga" 0, "clig" 0, "dlig" 0;
+  }
   html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 
   body {
@@ -14,6 +28,9 @@
     line-height: 1.45;
     color: #1a1a1a;
     background: #ffffff;
+    /* Disable ligatures here as well; see the * rule above. */
+    font-variant-ligatures: none;
+    font-feature-settings: "liga" 0, "clig" 0, "dlig" 0;
   }
 
   .page {
@@ -211,11 +228,57 @@
     .role-header { break-after: avoid; page-break-after: avoid; }
     .role-summary { break-before: avoid; page-break-before: avoid; }
   }
+
+  /* === OPTIONAL PROFILE PHOTO (opt-in, DACH/European markets — #264) ===
+     Off by default: with no candidate.photo the {{PHOTO}} slot is empty, no
+     <img> is emitted, and the layout is byte-identical to a photoless CV.
+     When opted in (candidate.photo in config/profile.yml) the photo floats into
+     the top corner and the header/summary text wraps beside it. Photos are
+     penalized by US/UK/many-market ATS, so this is never on by default. */
+  .cv-photo {
+    float: right;
+    width: 80px;
+    height: 100px;
+    object-fit: cover;
+    margin: 0 0 8px 14px;
+    border-radius: 3px;
+    border: 1px solid #e2e2e2;
+  }
+
+  html[lang="ar"] .cv-photo {
+    float: left;
+    margin: 0 14px 8px 0;
+  }
+
+  /* === CJK (Japanese) font fallback === */
+  /* The bundled webfonts are Latin-only (see #951). Without a CJK fallback,
+     Japanese text renders as tofu (□) in headless Chromium on any system
+     without a CJK system font (Linux/CI, minimal containers). The Latin brand
+     fonts are kept first so ASCII still uses Space Grotesk / DM Sans, then the
+     browser's per-glyph fallback picks the first installed CJK face for kana
+     and kanji. Mirrors the lang="ar" precedent above. */
+  html[lang="ja"] body {
+    font-family: 'Liberation Sans', 'Helvetica Neue', Arial, 'Hiragino Sans', 'Hiragino Kaku Gothic ProN',
+      'Yu Gothic', 'YuGothic', 'Noto Sans CJK JP', 'Noto Sans JP',
+      Meiryo, 'MS PGothic', sans-serif;
+  }
+
+  html[lang="ja"] .header h1,
+  html[lang="ja"] .section-title,
+  html[lang="ja"] .job-company,
+  html[lang="ja"] .project-title,
+  html[lang="ja"] .competency-tag,
+  html[lang="ja"] .skill-category {
+    font-family: 'Liberation Sans', 'Helvetica Neue', Arial, 'Hiragino Sans', 'Hiragino Kaku Gothic ProN',
+      'Yu Gothic', 'YuGothic', 'Noto Sans CJK JP', 'Noto Sans JP',
+      Meiryo, 'MS PGothic', sans-serif;
+  }
 </style>
 </head>
 <body>
 <div class="page">
 
+  {{PHOTO}}
   <!-- HEADER -->
   <div class="header">
     <div class="header-name">{{NAME}}</div>
