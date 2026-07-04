@@ -24,10 +24,10 @@
  * ## Usage
  *
  *   node reserve-report-num.mjs
- *   # stdout: 035           (zero-padded, 3 digits)
+ *   # stdout: 035           (min 3 digits; grows to 4+ once the sequence passes 999)
  *
- *   node reserve-report-num.mjs --release 035
- *   # Deletes the sentinel for 035 (call after writing the real report).
+ *   node reserve-report-num.mjs --release 2493
+ *   # Deletes the sentinel for 2493 (call after writing the real report).
  *
  *   node reserve-report-num.mjs --gc
  *   # Removes all stale sentinels older than MAX_SENTINEL_AGE_MS.
@@ -63,7 +63,11 @@ function maxSlot() {
   const entries = readdirSync(REPORTS_DIR);
   let max = 0;
   for (const name of entries) {
-    const m = name.match(/^(\d{3})-/);
+    // Match 3-or-more leading digits: reports started at 3-digit numbers but
+    // the sequence has since grown past 999 into 4+ digits. A fixed \d{3} here
+    // silently ignored every 4-digit report and handed out already-used low
+    // numbers (e.g. 990 on a repo whose real max was 2492).
+    const m = name.match(/^(\d{3,})-/);
     if (m) max = Math.max(max, parseInt(m[1], 10));
   }
   return max;
@@ -124,8 +128,8 @@ function gc() {
 const [,, cmd, arg] = process.argv;
 
 if (cmd === '--release') {
-  if (!arg || !/^\d{1,3}$/.test(arg)) {
-    process.stderr.write('Usage: node reserve-report-num.mjs --release <NNN>\n');
+  if (!arg || !/^\d+$/.test(arg)) {
+    process.stderr.write('Usage: node reserve-report-num.mjs --release <N>\n');
     process.exit(1);
   }
   releaseSlot(parseInt(arg, 10));
