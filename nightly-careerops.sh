@@ -218,6 +218,36 @@ if $NO_SCAN && [[ -s "$SUMMARY" ]]; then SUMMARY_APPEND=1; fi
 export SUMMARY_APPEND
 
 if [[ "$FIRST_NEW_ID" == "none" || -z "$FIRST_NEW_ID" ]]; then
+  # No new offers imported. Before giving up, check batch-state for stuck work
+  # left by a prior failed/interrupted run — orphaned "processing" rows (worker
+  # died before recording state) and "failed" offers at the retry cap. Without
+  # this, the "no new offers" early-exit skips Step 3 entirely, so a bad night
+  # (e.g. an auth blip that 401s every worker) strands those offers until someone
+  # runs batch-runner.sh --retry-failed by hand. A plain run reprocesses orphaned
+  # "processing"; --retry-failed clears failed-at-cap. The runner picks only one
+  # category per invocation, so run each mode that has work (sequential — no lock
+  # contention; each invocation self-merges + verifies).
+  STATE_FILE="batch/batch-state.tsv"
+  STUCK_PROC=0; STUCK_FAIL=0
+  if [[ -f "$STATE_FILE" ]]; then
+    STUCK_PROC=$(awk -F'\t' 'NR>1 && $3=="processing"{n++} END{print n+0}' "$STATE_FILE")
+    STUCK_FAIL=$(awk -F'\t' 'NR>1 && $3=="failed"{n++} END{print n+0}' "$STATE_FILE")
+  fi
+  STUCK_TOTAL=$((STUCK_PROC + STUCK_FAIL))
+  if [[ "$STUCK_TOTAL" -gt 0 ]]; then
+    echo "No new offers, but $STUCK_TOTAL stuck offer(s) from a prior run (processing=$STUCK_PROC failed=$STUCK_FAIL) — running recovery pass."
+    [[ "$STUCK_PROC" -gt 0 ]] && bash batch/batch-runner.sh --parallel 3
+    [[ "$STUCK_FAIL" -gt 0 ]] && bash batch/batch-runner.sh --parallel 3 --retry-failed
+    RECOVERED_NOTE="No new offers; ran recovery on $STUCK_TOTAL stuck offer(s) (processing=$STUCK_PROC failed=$STUCK_FAIL) — see applications.md / batch logs."
+    if [[ -n "$SUMMARY_APPEND" ]]; then
+      { echo ""; echo "--- late run — $TS ---"; [[ -n "$SCAN_BANNER" ]] && echo "$SCAN_BANNER"; echo "$RECOVERED_NOTE"; } >> "$SUMMARY"
+    else
+      { echo "career-ops nightly summary — $TS"; [[ -n "$SCAN_BANNER" ]] && echo "$SCAN_BANNER"; echo ""; echo "$RECOVERED_NOTE"; } > "$SUMMARY"
+    fi
+    echo ""
+    echo "=== Run complete: $(date +%H:%M:%S) — recovery pass on $STUCK_TOTAL stuck offer(s) ==="
+    exit 0
+  fi
   echo "No new offers to evaluate tonight."
   if [[ -n "$SUMMARY_APPEND" ]]; then
     {
