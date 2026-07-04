@@ -441,16 +441,20 @@ let COLMAP = LEGACY_COLMAP;
 // on the inner pipe. This is additive — normal cells are unchanged; only values
 // that would already break the table get sanitized (also keeps the web reader safe).
 function cell(v) {
-  return String(v ?? '').replace(/[\r\n]+/g, ' ').replace(/\s*\|\s*/g, ' / ').trim();
+  return String(v ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s*\|\s*/g, ' / ').trim();
 }
 
 // Build a tracker row string matching the detected layout (with or without the
 // optional Location column) so writes round-trip through the same schema.
 function buildRow(o) {
+  const num = cell(o.num), date = cell(o.date), company = cell(o.company), role = cell(o.role);
+  const score = cell(o.score), status = cell(o.status), pdf = cell(o.pdf);
+  const report = cell(o.report), notes = cell(o.notes);
   if (COLMAP.location != null) {
-    return `| ${o.num} | ${o.date} | ${cell(o.company)} | ${cell(o.role)} | ${cell(o.location) || '—'} | ${o.score} | ${o.status} | ${o.pdf} | ${o.report} | ${cell(o.notes)} |`;
+    const location = cell(o.location || '—');
+    return `| ${num} | ${date} | ${company} | ${role} | ${location} | ${score} | ${status} | ${pdf} | ${report} | ${notes} |`;
   }
-  return `| ${o.num} | ${o.date} | ${cell(o.company)} | ${cell(o.role)} | ${o.score} | ${o.status} | ${o.pdf} | ${o.report} | ${cell(o.notes)} |`;
+  return `| ${num} | ${date} | ${company} | ${role} | ${score} | ${status} | ${pdf} | ${report} | ${notes} |`;
 }
 
 /**
