@@ -2,8 +2,8 @@
 # Nightly career-ops automation — runs portal scan, imports new offers, and
 # batch-evaluates them. Registered in Windows Task Scheduler:
 #   - "career-ops-scan"         → 18:00 daily (--scan-only: portal scan, no eval)
-#   - "career-ops-nightly"      → 22:00 daily (--no-scan --cap=30: import + eval)
-#   - "career-ops-nightly-late" → 04:00 daily (--no-scan --cap=30: leftovers + eval)
+#   - "career-ops-nightly"      → 22:00 daily (--no-scan --cap=40: import + eval)
+#   - "career-ops-nightly-late" → 04:00 daily (--no-scan --cap=40: leftovers + eval)
 # Each run logs to tmp/nightly-{date}[-late].log and writes a morning summary
 # to tmp/nightly-latest-summary.txt.
 #
