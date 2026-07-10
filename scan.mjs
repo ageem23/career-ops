@@ -60,6 +60,7 @@ const SCAN_HISTORY_PATH = 'data/scan-history.tsv';
 const SEMANTIC_LOG_PATH = 'data/scan-semantic-log.tsv';
 const PIPELINE_PATH = 'data/pipeline.md';
 const APPLICATIONS_PATH = 'data/applications.md';
+const REPORTS_DIR = 'reports';
 const PROVIDERS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'providers');
 
 // Ensure required directories exist (fresh setup)
@@ -597,6 +598,13 @@ export function loadSeenUrls(policy = {}) {
 // Sources read (closes Gap 1 — formerly only applications.md):
 //   1. applications.md table rows
 //   2. pipeline.md ## Pendientes and ## Procesadas entries
+//   3. reports/*.md `# Evaluation: Company — Role` headers (closes the
+//      orphaned-eval gap): an evaluated role whose result never landed in
+//      applications.md — a re-eval collapsed at merge time, or a dropped
+//      merge — was previously invisible here, so its NEXT repost got
+//      re-evaluated from scratch (observed: the same role evaluated 2-3×,
+//      none in the tracker). Indexing the report headers means every
+//      evaluated role blocks re-evaluation, regardless of tracker state.
 function loadSeenCompanyRoles() {
   const byCompany = new Map();
 
@@ -620,6 +628,24 @@ function loadSeenCompanyRoles() {
     const pattern = /^- \[[ x!]\]\s+(?:#\d+\s*\|\s*)?\S+\s*\|\s*([^|\n]+?)\s*\|\s*([^|\n]+?)(?:\s*\|.*)?$/gm;
     for (const match of text.matchAll(pattern)) {
       addSeenCompanyRole(byCompany, match[1].trim(), match[2].trim());
+    }
+  }
+
+  // reports/*.md: parse the `# Evaluation: Company — Role` H1. Only the first
+  // ~200 bytes are needed; the em/en/hyphen dash separator all match. Every
+  // report ever written (including orphans) contributes, so a role stays
+  // deduped even if it never reached applications.md.
+  if (existsSync(REPORTS_DIR)) {
+    for (const file of readdirSync(REPORTS_DIR)) {
+      if (!file.endsWith('.md')) continue;
+      let head;
+      try {
+        head = readFileSync(path.join(REPORTS_DIR, file), 'utf-8').slice(0, 200);
+      } catch {
+        continue;
+      }
+      const m = head.match(/^#\s*Evaluation:\s*(.+?)\s+[—–-]\s+(.+?)\s*$/m);
+      if (m) addSeenCompanyRole(byCompany, m[1].trim(), m[2].trim());
     }
   }
 

@@ -21,12 +21,37 @@
 //     corpus dedup-tracker.mjs already processes. Bump them if false
 //     positives bite; lower them if cross-board dupes are slipping through.
 
+// Legal-entity suffixes stripped so "Acme, Inc." / "Acme LLC" / "Acme"
+// collapse to one company key. Kept deliberately tight — ONLY true corporate
+// suffixes, never descriptive words like "group"/"labs"/"systems"/"holdings"
+// that are part of the actual name (stripping those merges distinct companies).
+// "as" is excluded on purpose: it is the Norwegian suffix but also the English
+// word "as", too risky to strip.
+export const COMPANY_SUFFIXES = new Set([
+  'inc', 'incorporated', 'llc', 'llp', 'lp', 'ltd', 'limited',
+  'corp', 'corporation', 'co', 'company', 'gmbh', 'ag', 'sa', 'sas',
+  'bv', 'nv', 'plc', 'pllc', 'pty', 'pte', 'srl', 'spa', 'oy', 'ab', 'kk',
+]);
+
+// normalizeCompany builds a stable same-company key. Two hardening steps beyond
+// the old lowercase/strip-punctuation behaviour, both motivated by real misses
+// where the SAME company+role got evaluated twice:
+//   1. Strip corporate suffixes  → "Vizient" === "Vizient, Inc".
+//   2. Sort the remaining tokens → parenthetical-alias reorderings collapse,
+//      so "FreeWheel (Comcast)" === "Comcast (FreeWheel)".
 export function normalizeCompany(name) {
-  return name.toLowerCase()
-    .replace(/[()]/g, '')
-    .replace(/\s+/g, ' ')
-    .replace(/[^a-z0-9 ]/g, '')
-    .trim();
+  const tokens = String(name ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ') // drop punctuation incl. parens/commas
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter(t => !COMPANY_SUFFIXES.has(t));
+  tokens.sort();
+  const key = tokens.join(' ');
+  // Guard: never return "" when the name was ONLY a suffix (e.g. literally
+  // "Inc") — fall back to the bare alphanumerics so distinct such names don't
+  // all collapse to the empty key.
+  return key || String(name ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
 export function normalizeRole(role) {

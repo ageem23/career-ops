@@ -48,7 +48,7 @@ START_FROM=0
 MAX_RETRIES=2
 MIN_SCORE=0
 SKIP_PDF=false
-MODEL=""  # empty = let claude -p use the Claude Max default
+MODEL="claude-sonnet-5"  # default eval model; override with --model. Empty string = Claude Max default
 RATE_LIMIT_SLEEP=300
 BATCH_PAUSED=false
 STATUS_ONLY=false
@@ -63,7 +63,7 @@ is_decimal_number() {
 usage() {
   cat <<'USAGE'
 career-ops batch runner — process job offers in batch via claude -p workers
-Uses your default Claude model (Claude Max subscription).
+Defaults to Claude Sonnet 5 for evaluation (override with --model).
 
 Usage: batch-runner.sh [OPTIONS]
 
@@ -79,9 +79,10 @@ Options:
   --skip-pdf           Skip PDF generation entirely (write ❌ in tracker PDF column)
   --rate-limit-sleep N Seconds to wait before retrying a rate-limited worker
                        (default: 300)
-  --model NAME         Claude model passed to `claude -p --model` (default:
-                       unset = Claude Max default). Use a cheaper model for
-                       large batches, e.g. `--model claude-sonnet-4-6`.
+  --model NAME         Claude model passed to `claude -p --model`
+                       (default: claude-sonnet-5). Pass an empty string
+                       (--model "") to fall back to the Claude Max default,
+                       or e.g. --model claude-opus-4-8 for higher capability.
   --status             Show batch progress and a per-job table, then exit
   --watch              Live-refresh progress until the run completes
   -h, --help           Show this help

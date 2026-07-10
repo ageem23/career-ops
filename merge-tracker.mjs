@@ -22,6 +22,7 @@ import { createHash, randomUUID } from 'crypto';
 import { tmpdir } from 'os';
 import { normalizeReportLink as normalizeLink } from './tracker-links.mjs';
 import { roleFuzzyMatch } from './role-matcher.mjs';
+import { normalizeCompany } from './dedup-utils.mjs';
 import { LEGACY_COLMAP, detectColumns } from './tracker-parse.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
@@ -377,20 +378,11 @@ function validateStatus(status) {
   return 'Evaluated';
 }
 
-/**
- * Normalize company names for duplicate lookup during tracker merges.
- *
- * Company names can contain spaces, punctuation, or branding variants in the
- * tracker and incoming TSV rows. Removing non-alphanumeric characters gives the
- * merge step a stable same-company key before it compares report numbers or
- * fuzzy role titles.
- *
- * @param {string} name - Company name from the tracker or addition row.
- * @returns {string} Lowercase alphanumeric company key.
- */
-function normalizeCompany(name) {
-  return name.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
+// normalizeCompany is imported from ./dedup-utils.mjs so the post-eval merge
+// path and the pre-eval scan path (scan.mjs) share ONE company key definition.
+// Previously merge-tracker had its own weaker version (bare alphanumerics),
+// which let the merge collapse duplicates that the scan had failed to catch —
+// producing wasted evaluations and orphaned report files.
 
 /**
  * Extract the bracketed report number from a Markdown report link.
