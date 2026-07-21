@@ -13,8 +13,14 @@ import { stripEmptySections } from '../cv-sections-core.mjs';
 
 console.log('\ncv-sections-core.mjs — optional sections leave no bare header');
 
-const EMPTY = { projects: [], education: [] };
-const FULL = { projects: [{ name: 'P' }], education: [{ degree: 'D' }] };
+// FULL must populate every entry in OPTIONAL_SECTIONS, otherwise the
+// "populated payload is a no-op" check strips whichever one it forgot.
+const EMPTY = { projects: [], education: [], key_achievements: [] };
+const FULL = {
+  projects: [{ name: 'P' }],
+  education: [{ degree: 'D' }],
+  key_achievements: ['A'],
+};
 
 function check(label, actual, expected) {
   if (actual === expected) pass(label);
@@ -25,7 +31,9 @@ function check(label, actual, expected) {
 // Assert against the shipped templates so a template edit that renames or
 // reorders a marker fails here instead of silently reviving the bare header.
 const TEMPLATES = [
-  { file: 'templates/cv-template.html', format: 'html', after: 'CERTIFICATIONS' },
+  // This fork's cv-template.html has no certifications block, so SKILLS is the
+  // section that follows education and anchors the "strip stopped here" check.
+  { file: 'templates/cv-template.html', format: 'html', after: 'SKILLS' },
   { file: 'templates/resume-template.html', format: 'html', after: 'SKILLS' },
   { file: 'templates/cv-template.tex', format: 'tex', after: 'Technical Skills' },
 ];

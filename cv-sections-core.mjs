@@ -33,14 +33,21 @@ const PATTERNS = {
   html: {
     projects: new RegExp(String.raw`<!--\s+PROJECTS\s+-->[\s\S]*?` + HTML_BOUNDARY),
     education: new RegExp(String.raw`<!--\s+EDUCATION\s+-->[\s\S]*?` + HTML_BOUNDARY),
+    key_achievements: new RegExp(String.raw`<!--\s+KEY ACHIEVEMENTS\s+-->[\s\S]*?` + HTML_BOUNDARY),
   },
   tex: {
     projects: new RegExp(String.raw`%{4,}\s+PROJECTS\s+%{4,}[\s\S]*?` + TEX_BOUNDARY),
     education: new RegExp(String.raw`%{4,}\s+Education\s+%{4,}[\s\S]*?` + TEX_BOUNDARY),
+    key_achievements: new RegExp(String.raw`%{4,}\s+Key Achievements\s+%{4,}[\s\S]*?` + TEX_BOUNDARY),
   },
 };
 
-export const OPTIONAL_SECTIONS = ['projects', 'education'];
+// key_achievements is optional for the same reason as the other two: a template
+// that has no such block simply never matches its pattern, and a payload with
+// no entries must not leave the header stranded. Every format needs an entry
+// here — `String.replace(undefined, '')` would replace the literal text
+// "undefined" rather than no-op.
+export const OPTIONAL_SECTIONS = ['projects', 'education', 'key_achievements'];
 
 export function isEmptySection(payload, section) {
   const entries = payload?.[section];

@@ -46,6 +46,7 @@ const DEFAULT_SECTION_TITLES = {
   education: 'Education',
   certifications: 'Certifications',
   skills: 'Skills',
+  key_achievements: 'Key Achievements',
 };
 
 // Escape user text for HTML text/attribute context. Covers the five characters
@@ -151,6 +152,27 @@ function joinItems(items) {
 
 // --- Section builders: each returns the inner HTML for one {{PLACEHOLDER}}. ---
 
+// Lead-in achievements block: a short list of the strongest results, shown
+// above Work Experience. Entries are plain strings; a `**Label:**` prefix is
+// left as markdown here and converted to <strong> by generate-pdf.mjs's
+// normalizeTextForATS, which is the ATS-safe path every other section uses.
+function buildKeyAchievements(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return '';
+  return entries
+    .filter(Boolean)
+    .map(item => `      <li>${escapeHtml(String(item))}</li>`)
+    .join('\n');
+}
+
+// Optional headline under the name (e.g. "Director of Engineering · …"), used
+// to mirror the target role back at the reader. The whole block is emitted so
+// an absent title leaves no empty div behind — same approach as {{PHOTO}}.
+function buildTargetTitle(payload, candidate) {
+  const title = payload.target_title || candidate.target_title || '';
+  if (!String(title).trim()) return '';
+  return `<div class="header-title">${escapeHtml(String(title))}</div>`;
+}
+
 function buildCompetencies(entries) {
   if (!Array.isArray(entries) || entries.length === 0) return '';
   return entries
@@ -159,9 +181,44 @@ function buildCompetencies(entries) {
     .join('\n      ');
 }
 
+// One company, several roles — a promotion arc rendered as a single grouped
+// block instead of repeating the employer once per title. Used only when an
+// entry carries a `roles` array; without it the flat one-role-per-entry shape
+// below is produced unchanged, so stock payloads render byte-identically.
+function buildGroupedRoles(e) {
+  const blurb = e.blurb
+    ? `\n    <div class="job-blurb">${escapeHtml(e.blurb)}</div>`
+    : '';
+  const period = [e.location, e.dates || e.period].filter(Boolean).join(' | ');
+  const roles = e.roles.filter(Boolean).map(r => {
+    const marker = r.marker
+      ? ` <span class="role-marker">${escapeHtml(r.marker)}</span>`
+      : '';
+    const dates = (r.dates || r.period)
+      ? `<span class="role-dates"><span class="job-period">${escapeHtml(r.dates || r.period)}</span>${marker}</span>`
+      : (marker ? `<span class="role-dates">${marker}</span>` : '');
+    const summary = r.summary
+      ? `\n    <div class="role-summary">${escapeHtml(r.summary)}</div>`
+      : '';
+    const bullets = Array.isArray(r.bullets)
+      ? r.bullets.filter(Boolean).map(b => `        <li>${escapeHtml(b)}</li>`).join('\n')
+      : '';
+    const list = bullets ? `\n    <ul class="bullet-list">\n${bullets}\n    </ul>` : '';
+    // The space before the dates block is load-bearing: .role-header is a flex
+    // container, so it costs nothing visually, but PDF text extraction reads the
+    // raw text nodes and would otherwise emit "Chief Technology Officer2019".
+    return `    <div class="role-header">${escapeHtml(r.role)} ${dates}</div>${summary}${list}`;
+  }).join('\n');
+  return `<div class="job">
+    <div class="job-header">${escapeHtml(e.company)}${period ? ` <span class="job-period">${escapeHtml(period)}</span>` : ''}</div>${blurb}
+${roles}
+  </div>`;
+}
+
 function buildExperience(entries) {
   if (!Array.isArray(entries) || entries.length === 0) return '';
   return entries.filter(Boolean).map(e => {
+    if (Array.isArray(e.roles) && e.roles.length > 0) return buildGroupedRoles(e);
     const bullets = Array.isArray(e.bullets)
       ? e.bullets.filter(Boolean).map(b => `        <li>${escapeHtml(b)}</li>`).join('\n')
       : '';
@@ -291,8 +348,11 @@ function renderReport(payload) {
     LANG: escapeHtml(payload.lang || 'en'),
     PAGE_WIDTH: pageWidth,
     NAME: escapeHtml(candidate.name || ''),
+    TARGET_TITLE: buildTargetTitle(payload, candidate),
     SECTION_SUMMARY: escapeHtml(sectionTitles.summary),
     SUMMARY_TEXT: escapeHtml(payload.summary || ''),
+    SECTION_KEY_ACHIEVEMENTS: escapeHtml(sectionTitles.key_achievements),
+    KEY_ACHIEVEMENTS: buildKeyAchievements(payload.key_achievements),
     SECTION_COMPETENCIES: escapeHtml(sectionTitles.competencies),
     COMPETENCIES: buildCompetencies(payload.competencies),
     SECTION_EXPERIENCE: escapeHtml(sectionTitles.experience),

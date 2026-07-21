@@ -67,24 +67,49 @@
     margin-bottom: 10px;
   }
 
-  .contact-line {
+  /* The contact block is emitted as one .contact-row by build-cv-html.mjs, with
+     its items joined by "|" separators. This layout stacks them one per line and
+     drops the separators. `order: -1` lifts the location (the only non-separator
+     <span>; every other item is an <a>) back to the top line. */
+  .contact-row {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
     font-size: 10pt;
     line-height: 1.5;
     color: #000000;
   }
 
-  .contact-line a {
+  .contact-row .separator { display: none; }
+
+  .contact-row > span:not(.separator) { order: -1; }
+
+  .contact-row a {
     color: #1155cc;
     text-decoration: underline;
   }
 
+  /* Email and phone read as plain text rather than links: the builder always
+     wraps them in mailto:/tel: anchors, but styling them as links puts two more
+     blue underlines in the header than the design wants. */
+  .contact-row a[href^="mailto:"],
+  .contact-row a[href^="tel:"] {
+    color: #000000;
+    text-decoration: none;
+  }
+
   /* === OPENING SUMMARY (no heading) === */
-  .summary {
+  .summary-text {
     text-align: justify;
     font-size: 10.5pt;
     line-height: 1.5;
     color: #000000;
     margin-bottom: 18px;
+  }
+
+  .summary-text strong {
+    font-weight: 700;
+    color: #000000;
   }
 
   /* === SECTION HEADINGS === */
@@ -106,14 +131,18 @@
     page-break-after: avoid;
   }
 
-  /* === BULLET LISTS WITH BOLD LEAD-INS === */
-  .bullet-list {
+  /* === BULLET LISTS WITH BOLD LEAD-INS ===
+     Applies to the key-achievements list, role bullets, and the bare <ul> the
+     flat (single-role) experience shape emits. */
+  .bullet-list,
+  .job ul {
     list-style: none;
     padding-left: 0;
     margin: 0;
   }
 
-  .bullet-list li {
+  .bullet-list li,
+  .job ul li {
     position: relative;
     padding-left: 18px;
     margin-bottom: 5px;
@@ -122,7 +151,8 @@
     line-height: 1.5;
   }
 
-  .bullet-list li::before {
+  .bullet-list li::before,
+  .job ul li::before {
     content: "●";
     position: absolute;
     left: 2px;
@@ -131,7 +161,8 @@
     color: #1a1a1a;
   }
 
-  .bullet-list li strong {
+  .bullet-list li strong,
+  .job ul li strong {
     font-weight: 700;
     color: #000000;
   }
@@ -139,7 +170,6 @@
   /* === EXPERIENCE === */
   .job {
     margin-bottom: 14px;
-    page-break-inside: avoid;
   }
 
   .job-header {
@@ -175,7 +205,10 @@
     font-style: italic;
   }
 
-  .role-header {
+  /* .role-header is the grouped (promotion-arc) shape; .job-role is the flat
+     one-role-per-entry shape. Both read as the same line. */
+  .role-header,
+  .job-role {
     font-size: 11pt;
     font-weight: 700;
     color: #1a1a1a;
@@ -200,41 +233,145 @@
     text-align: justify;
   }
 
-  .job .bullet-list {
+  .job-location {
+    font-size: 10pt;
+    color: #555;
+    margin-bottom: 2px;
+  }
+
+  .job .bullet-list,
+  .job ul {
     margin-top: 2px;
     margin-bottom: 6px;
   }
 
   /* === EDUCATION === */
-  .edu-degree {
+  .edu-item {
+    margin-bottom: 6px;
+  }
+
+  .edu-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+
+  .edu-title {
     font-weight: 700;
     font-size: 10.5pt;
     color: #1a1a1a;
   }
 
-  .edu-school {
+  .edu-org {
+    font-weight: 400;
+  }
+
+  .edu-year {
+    font-size: 10pt;
+    color: #555;
+    white-space: nowrap;
+  }
+
+  .edu-desc {
     font-size: 10.5pt;
     color: #1a1a1a;
     margin-top: 2px;
   }
 
+  /* === AREAS OF EXPERTISE (competencies) ===
+     Rendered as bullet lines rather than chips: entries here are full phrases
+     with a bold lead-in, not one-word tags. */
+  .competencies-grid {
+    display: block;
+  }
+
+  .competency-tag {
+    display: block;
+    position: relative;
+    padding-left: 18px;
+    margin-bottom: 5px;
+    text-align: justify;
+    font-size: 10.5pt;
+    line-height: 1.5;
+    color: #1a1a1a;
+  }
+
+  .competency-tag::before {
+    content: "●";
+    position: absolute;
+    left: 2px;
+    top: 0;
+    font-size: 8pt;
+    color: #1a1a1a;
+  }
+
+  .competency-tag strong {
+    font-weight: 700;
+    color: #000000;
+  }
+
+  /* === TECHNICAL PROFICIENCIES (skills) === */
+  .skills-grid {
+    display: block;
+  }
+
+  .skill-item {
+    position: relative;
+    padding-left: 18px;
+    margin-bottom: 5px;
+    text-align: justify;
+    font-size: 10.5pt;
+    line-height: 1.5;
+    color: #1a1a1a;
+  }
+
+  .skill-item::before {
+    content: "●";
+    position: absolute;
+    left: 2px;
+    top: 0;
+    font-size: 8pt;
+    color: #1a1a1a;
+  }
+
+  .skill-category {
+    font-weight: 700;
+    color: #000000;
+  }
+
+  /* === PROJECTS (kept for parity; the block strips itself when empty) === */
+  .project {
+    margin-bottom: 8px;
+  }
+
+  .project-title {
+    font-weight: 700;
+    font-size: 10.5pt;
+    color: #1a1a1a;
+  }
+
+  .project-badge {
+    font-weight: 400;
+    font-size: 9.5pt;
+    color: #777;
+    font-style: italic;
+  }
+
+  .project-desc,
+  .project-tech {
+    font-size: 10.5pt;
+    line-height: 1.5;
+    color: #1a1a1a;
+  }
+
   /* === LINKS NEVER BREAK === */
   a { white-space: nowrap; }
-
-  /* === PRINT === */
-  @media print {
-    body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-    .page { padding: 0; }
-    .role-header { break-after: avoid; page-break-after: avoid; }
-    .role-summary { break-before: avoid; page-break-before: avoid; }
-  }
 
   /* === OPTIONAL PROFILE PHOTO (opt-in, DACH/European markets — #264) ===
      Off by default: with no candidate.photo the {{PHOTO}} slot is empty, no
      <img> is emitted, and the layout is byte-identical to a photoless CV.
-     When opted in (candidate.photo in config/profile.yml) the photo floats into
-     the top corner and the header/summary text wraps beside it. Photos are
-     penalized by US/UK/many-market ATS, so this is never on by default. */
+     Photos are penalized by US/UK/many-market ATS, so this is never on by
+     default. */
   .cv-photo {
     float: right;
     width: 80px;
@@ -257,19 +394,17 @@
   /* === CJK (Japanese) font fallback === */
   /* The bundled webfonts are Latin-only (see #951). Without a CJK fallback,
      Japanese text renders as tofu (□) in headless Chromium on any system
-     without a CJK system font (Linux/CI, minimal containers). The Latin brand
-     fonts are kept first so ASCII still uses Space Grotesk / DM Sans, then the
-     browser's per-glyph fallback picks the first installed CJK face for kana
-     and kanji. Mirrors the lang="ar" precedent above. */
+     without a CJK system font (Linux/CI, minimal containers). Mirrors the
+     lang="ar" precedent above. */
   html[lang="ja"] body {
     font-family: 'Liberation Sans', 'Helvetica Neue', Arial, 'Hiragino Sans', 'Hiragino Kaku Gothic ProN',
       'Yu Gothic', 'YuGothic', 'Noto Sans CJK JP', 'Noto Sans JP',
       Meiryo, 'MS PGothic', sans-serif;
   }
 
-  html[lang="ja"] .header h1,
+  html[lang="ja"] .header-name,
   html[lang="ja"] .section-title,
-  html[lang="ja"] .job-company,
+  html[lang="ja"] .job-header,
   html[lang="ja"] .project-title,
   html[lang="ja"] .competency-tag,
   html[lang="ja"] .skill-category {
@@ -299,21 +434,23 @@
   html[lang="zh-CN"] .job-company,
   html[lang="zh-CN"] .project-title,
   html[lang="zh-CN"] .contact-row,
-  html[lang="zh-CN"] .contact-line,
+  html[lang="zh-CN"] .competency-tag,
+  html[lang="zh-CN"] .skill-category,
   html[lang="zh"] .header-name,
   html[lang="zh"] .header-title,
   html[lang="zh"] .section-title,
   html[lang="zh"] .job-company,
   html[lang="zh"] .project-title,
   html[lang="zh"] .contact-row,
-  html[lang="zh"] .contact-line {
+  html[lang="zh"] .competency-tag,
+  html[lang="zh"] .skill-category {
     font-family: 'Liberation Sans', 'Helvetica Neue', Arial, 'PingFang SC',
       'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC',
       'Noto Sans SC', 'Source Han Sans SC', sans-serif;
   }
 
-  html[lang="zh-CN"] .summary,
-  html[lang="zh"] .summary,
+  html[lang="zh-CN"] .summary-text,
+  html[lang="zh"] .summary-text,
   html[lang="zh-CN"] .bullet-list li,
   html[lang="zh"] .bullet-list li {
     line-height: 1.7;
@@ -322,6 +459,49 @@
   html[lang="zh-CN"] .section-title,
   html[lang="zh"] .section-title {
     letter-spacing: 0.03em;
+  }
+
+  /* === PRINT === */
+  @media print {
+    body {
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+
+    /* Keep a small right gutter for the print box. Right-aligned content
+       (job periods, education years) right-aligns to the content-box edge,
+       and the rightmost glyph's side bearing can spill ~1px past it and get
+       clipped by Chromium's print clip. See #1341. */
+    .page {
+      padding: 0 0.18in 0 0;
+    }
+
+    .role-header,
+    .job-role { break-after: avoid; page-break-after: avoid; }
+    .role-summary { break-before: avoid; page-break-before: avoid; }
+  }
+
+  /* === PAGE BREAK CONTROL === */
+  /* Only avoid breaking small atomic units. Sections and multi-bullet roles are
+     allowed to flow across a page boundary so content packs tight instead of
+     jumping wholesale and leaving large bottom gaps. */
+  .header,
+  .edu-item,
+  .competency-tag,
+  .skill-item {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* Keep a heading attached to the content that follows it, so headings are not
+     orphaned at the bottom of a page. */
+  .section-title,
+  .job-company,
+  .job-role,
+  .job-location,
+  .project-title {
+    break-after: avoid;
+    page-break-after: avoid;
   }
 </style>
 </head>
@@ -332,49 +512,63 @@
   <!-- HEADER -->
   <div class="header">
     <div class="header-name">{{NAME}}</div>
-    <div class="header-title">{{TARGET_TITLE}}</div>
-    <div class="contact-line">{{LOCATION}}</div>
-    <div class="contact-line">{{EMAIL}}</div>
-    <div class="contact-line"><a href="{{LINKEDIN_URL}}">{{LINKEDIN_DISPLAY}}</a></div>
+    {{TARGET_TITLE}}
+    <div class="contact-row">
+      <a href="tel:{{PHONE}}">{{PHONE}}</a>
+      <span class="separator">|</span>
+      <a href="mailto:{{EMAIL}}">{{EMAIL}}</a>
+      <span class="separator">|</span>
+      <a href="{{LINKEDIN_URL}}">{{LINKEDIN_DISPLAY}}</a>
+      <span class="separator">|</span>
+      <a href="{{PORTFOLIO_URL}}">{{PORTFOLIO_DISPLAY}}</a>
+      <span class="separator">|</span>
+      <span>{{LOCATION}}</span>
+    </div>
   </div>
 
-  <!-- OPENING SUMMARY (no section heading) -->
-  <div class="summary">{{SUMMARY_TEXT}}</div>
+  <!-- PROFESSIONAL SUMMARY -->
+  <div class="summary-text">{{SUMMARY_TEXT}}</div>
 
   <!-- KEY ACHIEVEMENTS -->
+  <!-- Forced break: page 1 is the pitch (headline, summary, achievements);
+       experience starts clean on page 2. -->
   <div class="section" style="page-break-after: always; break-after: page;">
     <div class="section-title">{{SECTION_KEY_ACHIEVEMENTS}}</div>
     <ul class="bullet-list">
-      {{KEY_ACHIEVEMENTS}}
+{{KEY_ACHIEVEMENTS}}
     </ul>
   </div>
 
-  <!-- PROFESSIONAL EXPERIENCE -->
+  <!-- WORK EXPERIENCE -->
   <div class="section">
     <div class="section-title">{{SECTION_EXPERIENCE}}</div>
     {{EXPERIENCE}}
   </div>
 
-  <!-- AREAS OF EXPERTISE -->
+  <!-- PROJECTS -->
   <div class="section">
-    <div class="section-title">{{SECTION_EXPERTISE}}</div>
-    <ul class="bullet-list">
-      {{EXPERTISE}}
-    </ul>
-  </div>
-
-  <!-- TECHNICAL PROFICIENCIES -->
-  <div class="section">
-    <div class="section-title">{{SECTION_SKILLS}}</div>
-    <ul class="bullet-list">
-      {{SKILLS}}
-    </ul>
+    <div class="section-title">{{SECTION_PROJECTS}}</div>
+    {{PROJECTS}}
   </div>
 
   <!-- EDUCATION -->
   <div class="section">
     <div class="section-title">{{SECTION_EDUCATION}}</div>
     {{EDUCATION}}
+  </div>
+
+  <!-- CORE COMPETENCIES -->
+  <div class="section">
+    <div class="section-title">{{SECTION_COMPETENCIES}}</div>
+    <div class="competencies-grid">
+      {{COMPETENCIES}}
+    </div>
+  </div>
+
+  <!-- SKILLS -->
+  <div class="section">
+    <div class="section-title">{{SECTION_SKILLS}}</div>
+    {{SKILLS}}
   </div>
 
 </div>
