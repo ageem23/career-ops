@@ -4,6 +4,16 @@
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (compatible; career-ops/1.3)';
 
+/**
+ * Browser-like User-Agent for providers that must clear WAF/CDN bot
+ * management blocking the default career-ops UA outright (seen live:
+ * Glints' firewall, Geico's Cloudflare-gated Workday tenant). Shared so
+ * every provider working around such a block bumps one constant instead
+ * of drifting Chrome versions independently per file.
+ */
+export const BROWSER_LIKE_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
 // String-only check — no DNS resolution. The scanner runs against public job
 // boards on the user's own machine; we cover the obvious SSRF abuses
 // (loopback, link-local, RFC1918, ULA) and accept that a sophisticated

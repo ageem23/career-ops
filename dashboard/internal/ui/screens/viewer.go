@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/santifer/career-ops/dashboard/internal/data"
+	"github.com/santifer/career-ops/dashboard/internal/i18n"
 	"github.com/santifer/career-ops/dashboard/internal/model"
 	"github.com/santifer/career-ops/dashboard/internal/theme"
 )
@@ -29,6 +30,19 @@ type ViewerOpenTasksMsg struct {
 
 // ViewerOpenCoverLetterMsg is emitted when the user requests to open the cover letter PDF.
 type ViewerOpenCoverLetterMsg struct{ Path string }
+
+// ViewerUpdateStatusMsg is emitted when a status update is requested from the
+// viewer. main.go routes it through the same Hired / discard-reason flows the
+// pipeline screen uses, so both entry points behave identically.
+type ViewerUpdateStatusMsg struct {
+	App       model.CareerApplication
+	NewStatus string
+}
+
+// UpdateAppStatus updates the status of the current application inside the viewer model.
+func (m *ViewerModel) UpdateAppStatus(newStatus string) {
+	m.app.Status = newStatus
+}
 
 // ViewerModel implements an integrated file viewer screen.
 //
@@ -239,8 +253,11 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				m.statusPicker = true
 				m.statusCursor = 0
 				currentNorm := data.NormalizeStatus(m.app.Status)
-				for idx, opt := range statusOptions {
-					if data.NormalizeStatus(opt.label) == currentNorm {
+				// Compare through NormalizeStatus: it returns the lowercase
+				// canonical form, so matching pair.Canonical ("Hired") raw
+				// would never hit and the picker would open unpositioned.
+				for idx, pair := range getStatusPairs() {
+					if data.NormalizeStatus(pair.Canonical) == currentNorm {
 						m.statusCursor = idx
 						break
 					}
@@ -339,8 +356,8 @@ func (m ViewerModel) handleStatusPicker(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
 
 	case "down", "j":
 		m.statusCursor++
-		if m.statusCursor >= len(statusOptions) {
-			m.statusCursor = len(statusOptions) - 1
+		if m.statusCursor >= len(getStatusPairs()) {
+			m.statusCursor = len(getStatusPairs()) - 1
 		}
 
 	case "up", "k":
@@ -351,32 +368,28 @@ func (m ViewerModel) handleStatusPicker(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
 
 	case "enter":
 		m.statusPicker = false
-		newStatus := statusOptions[m.statusCursor].label
+		newStatus := getStatusPairs()[m.statusCursor].Canonical
 		app := m.app
-		path := m.careerOpsPath
 		return m, func() tea.Msg {
-			return PipelineUpdateStatusMsg{
-				CareerOpsPath: path,
-				App:           app,
-				NewStatus:     newStatus,
+			return ViewerUpdateStatusMsg{
+				App:       app,
+				NewStatus: newStatus,
 			}
 		}
 
 	default:
 		key := strings.ToLower(msg.String())
 		if len(key) == 1 {
-			for i, opt := range statusOptions {
-				if opt.shortcut == key {
+			for i, pair := range getStatusPairs() {
+				if pair.Shortcut == key {
 					m.statusCursor = i
 					m.statusPicker = false
-					newStatus := opt.label
+					newStatus := pair.Canonical
 					app := m.app
-					path := m.careerOpsPath
 					return m, func() tea.Msg {
-						return PipelineUpdateStatusMsg{
-							CareerOpsPath: path,
-							App:           app,
-							NewStatus:     newStatus,
+						return ViewerUpdateStatusMsg{
+							App:       app,
+							NewStatus: newStatus,
 						}
 					}
 				}
@@ -416,7 +429,7 @@ func (m ViewerModel) overlayAddTaskPrompt(body string) string {
 func (m ViewerModel) bodyHeight() int {
 	h := m.height - 4 // header + footer + padding
 	if m.statusPicker {
-		h -= (len(statusOptions) + 1)
+		h -= (len(getStatusPairs()) + 1)
 	}
 	if h < 3 {
 		h = 3
@@ -452,9 +465,9 @@ func (m ViewerModel) overlayStatusPicker(body string) string {
 		Bold(true)
 
 	var picker []string
-	picker = append(picker, padStyle.Render(borderStyle.Render("Change status:")))
+	picker = append(picker, padStyle.Render(borderStyle.Render(i18n.Current.PickerChangeStatus)))
 
-	for i, opt := range statusOptions {
+	for i, pair := range getStatusPairs() {
 		style := lipgloss.NewStyle().Foreground(m.theme.Text).Width(pickerWidth)
 		if i == m.statusCursor {
 			style = style.Background(m.theme.Overlay).Bold(true)
@@ -463,7 +476,7 @@ func (m ViewerModel) overlayStatusPicker(body string) string {
 		if i == m.statusCursor {
 			prefix = "> "
 		}
-		label := fmt.Sprintf("%s (%s)", opt.label, strings.ToUpper(opt.shortcut))
+		label := fmt.Sprintf("%s (%s)", pair.Display, strings.ToUpper(pair.Shortcut))
 		picker = append(picker, padStyle.Render(style.Render(prefix+label)))
 	}
 
@@ -987,14 +1000,24 @@ func (m ViewerModel) renderFooter() string {
 				keyStyle.Render("Esc") + descStyle.Render(" cancel"))
 	}
 
-	parts := keyStyle.Render("↑↓") + descStyle.Render(" scroll  ") +
-		keyStyle.Render("PgUp/Dn") + descStyle.Render(" page  ") +
-		keyStyle.Render("g/G") + descStyle.Render(" top/end  ")
+	// While the status picker is open, the scroll hints below don't apply.
+	if m.statusPicker {
+		return style.Render(
+			keyStyle.Render("↑/↓/j/k") + descStyle.Render(i18n.Current.HelpNav) +
+				keyStyle.Render("Enter") + descStyle.Render(i18n.Current.HelpConfirm) +
+				keyStyle.Render("Esc/q") + descStyle.Render(i18n.Current.HelpCancel))
+	}
+
+	// `t` opens the tasks screen, not a language switch — language is resolved
+	// once at startup from --lang/$LANG (see main.go).
+	parts := keyStyle.Render("↑↓") + descStyle.Render(i18n.Current.HelpScroll) +
+		keyStyle.Render("PgUp/Dn") + descStyle.Render(i18n.Current.HelpPage) +
+		keyStyle.Render("g/G") + descStyle.Render(i18n.Current.HelpTopEnd)
 	if m.hasApp {
-		parts += keyStyle.Render("c") + descStyle.Render(" change status  ")
+		parts += keyStyle.Render("c") + descStyle.Render(i18n.Current.HelpChange)
 	}
 	if m.app.JobURL != "" {
-		parts += keyStyle.Render("o") + descStyle.Render(" open URL  ")
+		parts += keyStyle.Render("o") + descStyle.Render(i18n.Current.HelpOpenURL)
 	}
 	if m.app.Number > 0 {
 		parts += keyStyle.Render("n") + descStyle.Render(" new task  ") +

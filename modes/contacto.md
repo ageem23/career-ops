@@ -1,4 +1,4 @@
-# Mode: contacto -- LinkedIn Power Move
+# Mode: contacto -- Outreach messages
 
 > Apply `voice-dna.md` (if present) to every generated message — full guardrail, conversational voice included (Tier 1 + Tier 2). See `_shared.md` → Voice DNA.
 
@@ -21,6 +21,8 @@ This skill has **two execution modes**. You MUST decide which one is active **be
 |---------------|------------|
 | `prompt` | Go to **"## MODE A — Prompt output"** below. **DO NOT** read or execute MODE B. Stop at the end of Mode A. |
 | `inline` | Skip MODE A entirely. Execute **"## MODE B — Inline workflow"**. |
+
+**Greeting short-circuit (overrides both modes):** when the user says "greeting" / "打招呼" / "cold opener", names a chat-style platform (e.g. BOSS Zhipin), or asks for a very short first-touch message, skip MODE A and MODE B entirely and run **"## Greeting variant"** at the end of this file. It shares the same persona engine (recruiter → hard requirements; hiring manager → impact/vision) but does no contact discovery, so the name-verification protocol does not apply.
 
 If you find yourself drafting a `Sending to:` line, opening WebSearch tabs, or composing a LinkedIn message body — and you have NOT confirmed mode = `inline` — you are in the wrong mode. Stop, re-read this section, and resolve.
 
@@ -231,6 +233,19 @@ If the agent has Bash access (Claude Code), additionally offer to run the block 
 
 ## Message rules
 
+**Contact channel preference:** Read `contact_preferences.preferred_channel` from
+`config/profile.yml`. If it is absent or set to `"either"`, write the CTA
+sentence exactly as specified above — no change. If it is set to `"email"` or
+`"phone"`, steer the CTA toward that channel instead of the generic default
+(e.g. Recruiter's CTA becomes "Happy to share my CV over email if this aligns
+with what you're looking for" rather than defaulting to a call; Hiring
+Manager's CTA leans on "happy to continue this over email" instead of
+proposing a call). Keep the same
+3-sentence structure and per-persona emphasis -- only the channel named in the
+CTA changes. If `contact_preferences.note` is set, you may fold its intent into
+the CTA phrasing (e.g. "screens unknown numbers" → prefer email wording) but do
+not quote the note verbatim in a public-facing message.
+
 - Maximum 300 characters (LinkedIn connection request limit)
 - NO corporate-speak
 - NO "I'm passionate about..."
@@ -253,3 +268,49 @@ Before showing the final message, run this checklist explicitly in your response
    Then the message body. The **Sending to:** line is pre-send verification metadata — it is **not** part of the outgoing message and does not count against the 300-character InMail limit. The user should be able to scan the salutation and the "Sending to:" line side-by-side without having to search.
 
 If any check fails or you have any doubt, STOP and ask the user to confirm before continuing. A wrong name in a cold message is unrecoverable — better to ask than to send.
+
+---
+
+## Greeting variant
+
+A single, punchy first-touch message for platforms where the opener has a hard
+character budget — BOSS Zhipin's 打招呼, job-board chat boxes, or the first line
+of a cold email. Reuses the persona engine above; the difference is brevity, and
+that there is **no contact discovery**.
+
+1. **Skip target identification.** There is no WebSearch/contact-finding step —
+   the message goes to whoever the platform connects you with (usually the poster
+   or the recruiter). Do not fabricate a named recipient.
+
+2. **Classify the recipient's persona** from context (default to **Recruiter** if
+   unknown) and set the emphasis exactly as above:
+   - **Recruiter** → hard requirements met (role, years, stack, location, availability)
+   - **Hiring Manager / Founder** → impact and vision (a result that maps to their goal)
+
+3. **Synthesize the top 3 match points** between the JD and `cv.md` (same JD↔profile
+   fit logic the LinkedIn flow uses). These are the raw material — you will surface
+   only the strongest one or two that fit the budget.
+
+4. **Compose ONE message within the character budget.**
+   - **Budget:** read `outreach.greeting_max_chars` from `config/profile.yml`.
+     **Default 150** when the key is absent. The message MUST fit — count and trim.
+   - **Lead with a specific value proposition** (the single strongest match point),
+     not an introduction. Punchy sentences, not paragraphs.
+   - **Language:** match the JD / platform language (e.g. Simplified Chinese for
+     BOSS Zhipin). Character count applies to the output language.
+
+5. **No-fluff policy (hard):** remove filler and replace it with a concrete value
+   prop. Ban phrases like "I'm looking for a job", "I'm passionate about",
+   "I hope to have the opportunity", generic self-description. Every clause must
+   earn its characters.
+
+6. **Output:** the greeting, its character count vs the budget, and a one-line note
+   of which match point(s) it used. Offer a shorter fallback if it's near the limit.
+
+**Greeting rules:**
+- Platform-agnostic — never assume LinkedIn; works for any chat/opener surface.
+- Within `outreach.greeting_max_chars` (default 150). Never exceed it.
+- Same non-fabrication rule as the rest of career-ops: reformulate real experience
+  from `cv.md`, never invent a skill, metric, or claim.
+- NO corporate-speak, NO "I'm passionate about...", NEVER share a phone number.
+- Persona changes the EMPHASIS, not the structure.

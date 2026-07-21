@@ -17,6 +17,7 @@ Interactive mode for when the candidate is filling out an application form in Ch
 3. SEARCH      → Match against existing reports in reports/
 4. LOAD        → Read full report + Section H / Application Answers (if they exist)
 5. PREFLIGHT   → Confirm posting liveness + company/role match before drafting
+5b. PRE-SCAN   → Scan page for knock-out questions (degree, experience, work authorization/visa, sponsorship, salary floors)
 6. ANALYZE     → Identify ALL visible form questions
 7. GENERATE    → For each question, generate a personalized response
 8. PRESENT     → Show formatted responses for copy-paste
@@ -26,6 +27,20 @@ Interactive mode for when the candidate is filling out an application form in Ch
 ## Step 5 — Preflight gate
 
 Before generating any application answers, verify that the form still points to the intended active job. This gate runs after the page has been detected, the company/role has been identified, and the matching report has been loaded.
+
+**Blacklist check (#1742):** before any form filling starts, if `data/blacklist.md` exists, check the visible company against it (case- and punctuation-insensitive). The file is the candidate's own do-not-apply list — on a hit, STOP and surface their own recorded decision: "{Company} is on your blacklist (since {Since}): *{Reason}*. Do you still want to apply?" Require an explicit yes before generating or filling anything — never silently refuse, never silently proceed; the candidate's call always wins. Absent file = skip this check.
+
+**Cross-channel check (#1596):** before drafting — and ALWAYS before the user authorizes an agency to submit on their behalf — check `data/applications.md` for an existing row with the same company+role under a different Via (agency vs direct, or two agencies). A double submission burns the candidate with both the agency and the employer. If found, stop and ask the user which channel owns the candidacy. If the end employer is still unknown (Company `?`), the check still runs in degraded form — it is never silently skipped:
+
+1. Ask the user (or the recruiter, via the user) for the client company name first — the reveal is the cheapest fix and unlocks the full check.
+2. If the name is not available, check the tracker for `?` rows with the same Via + a similar role (the same agency re-blasting one listing) and for similar-role rows at plausible-match companies; surface anything close.
+3. Then STOP and require explicit user acknowledgment before the agency is authorized: "The end employer is unknown, so I cannot verify you haven't already applied to this company directly. Authorize anyway?" Never proceed on silence — the reveal-time check only catches damage after the fact.
+
+**Repeat-application ATS profile check (#1920):** count the visible company's rows in `data/applications.md` (the same company-name match Step 2 already uses to search `reports/`). If this submission would be the 2nd or later application to that company, surface a reminder before drafting — this is separate from the Ashby email-dedup quirk below (that one is about the *current* submission getting silently merged; this one is about *older* submissions, possibly predating the candidate's current resume-generation workflow, resurfacing and contradicting the current materials):
+
+> "You've applied to {Company} {N} times before. Some ATS platforms (Workday in particular) retain and cross-reference a candidate's full application history. Before submitting, consider checking your candidate profile/application history in their portal for consistency with your current materials — especially if any earlier applications predate your current resume-generation workflow."
+
+This is a reminder, not a gate — surface it and continue drafting immediately; do not wait for the candidate to acknowledge it first. The candidate can review their ATS profile/application history manually before they submit. Never scrape or log into the employer's ATS portal on the candidate's behalf; this check only counts rows already in the candidate's own tracker.
 
 1. Read the visible URL, page title, company, role, and any closed/expired signals.
 2. If a URL is available, verify liveness with Playwright:
@@ -38,6 +53,23 @@ Before generating any application answers, verify that the form still points to 
 6. If liveness cannot be verified because the candidate only pasted questions or a screenshot, state that limitation and ask the candidate to confirm the company, role, and active posting before drafting.
 
 Do not continue to Step 6 until this preflight is resolved.
+
+## Step 5b — Pre-scan for knock-out questions
+
+Read the entire page/form to scan for knock-out questions BEFORE generating full responses. These are questions designed to automatically disqualify candidates who do not meet critical criteria.
+
+1. Common knock-out question areas to target:
+   - **Minimum years of experience** (e.g., "Do you have at least 5 years of professional software engineering experience?")
+   - **Degree requirements** (e.g., "Do you have a Bachelor's degree in Computer Science or a related field?")
+   - **Work authorization/Visa sponsorship** (e.g., "Will you now or in the future require visa sponsorship to work in the United States?")
+   - **Salary floors/expectations** (e.g., "What is your target salary / expectation?")
+2. Check these questions against the candidate's `config/profile.yml` or `cv.md` parameters.
+3. If a knock-out question is detected where the candidate's profile represents a potential mismatch (e.g., candidate needs sponsorship and the form automatically filters out sponsorship-needy applicants, or candidate's salary expectations mismatch the visible JD/form floors):
+   - Highlight the specific knock-out question to the candidate immediately.
+   - Present a clear warning block:
+     `⚠️ KNOCK-OUT WARNING: The form asks "[question text]". Based on your profile/CV, answering "[profile answer]" may trigger immediate automatic rejection by the ATS. How would you like to answer this, or do you want to skip applying?`
+   - Stop and wait for the candidate's confirmation before drafting any further answers.
+4. If no knock-out questions are found, or the candidate resolves the warning, proceed to Step 6.
 
 **Applying to several roles in one sitting?** This preflight verifies the single form in front of you. Before a multi-role session — especially against scanner entries marked `**Verification:** unconfirmed (batch mode)` — run the `pipeline` mode **Liveness sweep** first (`node check-liveness.mjs --file <urls>`). It drops the dead postings from `data/pipeline.md` in one batch so you never open a tab on an expired role.
 
@@ -148,9 +180,16 @@ node application-answers.mjs --report reports/NNN-company-role-date.md --input a
 ## Step 9 — Post-apply (optional)
 
 If the candidate confirms that they submitted the application:
-1. Update status in `applications.md` from "Evaluated" to "Applied"
-2. Refresh the report's `## Application Answers` section with the final field values and `**State:** submitted`
-3. Suggest next step: run the `contacto` mode (`/career-ops contacto` where available) for LinkedIn outreach
+1. Update status to Applied via the canonical CLI: `node set-status.mjs <report#> Applied` (never hand-edit the table)
+2. Seed the follow-up schedule: run `node followup-seed.mjs {num} --json` (where `{num}` is the tracker row number). If the candidate applied on a different day than today, pass `--date YYYY-MM-DD` with the actual submission date. It's idempotent, so re-running is safe.
+3. Refresh the report's `## Application Answers` section with the final field values and `**State:** submitted`
+4. Suggest next step: run the `contacto` mode (`/career-ops contacto` where available) for LinkedIn outreach
+
+**Confirmed resume-verification failure at this vendor? Check the rest of the pipeline (#1870).** If the candidate confirms the ATS silently dropped or altered resume content that they had submitted (see the SuccessFactors-family quirk below), don't treat it as a one-off. Tracker rows in `data/applications.md` don't carry a canonical ATS-vendor field, so don't grep the tracker text for a vendor name — it will miss rows silently. Instead, resolve the vendor per row from its linked report's `**URL:**` field:
+- For clean-fingerprint vendors (Greenhouse, Lever, Ashby, Workday), match the URL's hostname the same way `detectVendor()` in `analyze-patterns.mjs` does — reuse that function/pattern rather than re-deriving it, so the two stay in sync.
+- White-labeled ATS (SuccessFactors, iCIMS, UKG, Dayforce, and similar) are **not** detectable from the URL alone — the very vendor family this quirk was confirmed on falls in this bucket. For those, don't guess from the domain: ask the candidate directly which other in-flight rows (`Applied`, `Responded`, `Interview`) went through the same portal, since neither the tracker nor the URL structurally exposes it.
+
+Once the same-vendor rows are identified (by URL match or candidate confirmation), surface that list and prompt the candidate to spot-check each one via that portal's preview/profile step if one exists. One confirmed silent-truncation case at a vendor raises the prior that it happened elsewhere in-flight through the same vendor too.
 
 ## Scroll handling
 
@@ -192,3 +231,21 @@ Field-tested across ~12 Playwright-driven applications (Ashby, Greenhouse, Lever
 - **Symptom:** Country, university, or field-of-study dropdowns contain thousands of `<option>` entries. Snapshotting them floods context and stalls the agent.
 - **Agent:** Use `select_option` directly by value or visible label. Never snapshot the full option list. If the exact label is unknown, ask the candidate for the value instead of dumping options into context.
 - **Candidate:** Provides the correct label when the agent cannot infer it from `config/profile.yml`.
+
+### Job-board host ≠ application host — re-check the URL after "Apply"
+
+- **Symptom:** The posting is discovered on one ATS, but clicking **Apply** hands off to a *different* ATS for the actual form. Enterprise career sites (commonly Phenom-, iCIMS-, or Radancy-hosted) frequently redirect into a Workday, Greenhouse, or SmartRecruiters application flow. Choosing fill tactics from the *board* URL applies the wrong quirks.
+- **Agent:** After the Step 5 preflight, follow the Apply button/redirect and read the URL of the page that actually renders the form fields. Match your fill tactics to *that* host — not the board the job was discovered on. A `myworkdayjobs.com` handoff in particular means the Workday quirk below applies.
+- **Candidate:** Confirms the destination page looks like the right company/role before the agent starts filling.
+
+### Workday — set-value doesn't register on React fields
+
+- **Symptom:** Setting a Workday text field's value programmatically (without real keystrokes) leaves it visually filled but empty to Workday's validation — the React `onChange` never fires, so Save throws "required" on a visibly-filled field. Yes/No dropdowns also vary their option order per question, so a positional click can select the wrong answer (e.g. "No" on *are you authorized to work?*).
+- **Agent:** For required text fields, **type** real keystrokes (focus → select-all → type), or verify each value registered before Save. Survey the whole step top-to-bottom first (the address block is often below the fold) and fill from the candidate's saved profile (`config/profile.yml` / `cv.md`) proactively, rather than discovering fields via validation errors. For dropdowns, use **type-ahead** (open → type the option text → confirm the highlight) instead of positional clicks, and verify each selection.
+- **Candidate:** Reviews the filled step — especially work-authorization/sponsorship dropdowns and any EEO/legal attestations — before Save/Submit.
+
+### SuccessFactors-family — uploaded resume can silently diverge from the stored profile (#1870)
+
+- **Symptom:** Some ATS portals (SuccessFactors-family confirmed; likely others) parse and store an uploaded resume once and don't reliably re-parse it on a later re-upload or profile edit. The portal's internal record can silently drift from the file the candidate believes they submitted — especially for work-history entries added *after* the initial profile was created. There is no error, no warning, and no diff shown to the candidate; the loss surfaces only if someone downstream (a recruiter reading the stored profile back on a call, for example) notices the gap. This is distinct from #1560 (career-ops reading a careers board) and #1741 (recovering a stuck pipeline) — this is the employer's own system corrupting what was submitted.
+- **Agent:** After a submission through one of these portals, if the portal exposes any "preview my profile," "view submitted resume," or "review application" step, surface it to the candidate as a **required check** before closing out the apply flow — don't stop at confirming the upload succeeded. If the candidate later confirms a truncation or mismatch at a given vendor, flag it in the report and prompt them to spot-check other still-active applications through that same vendor (see the apply-mode checklist below) — one confirmed case raises the prior for the rest of that vendor's in-flight applications.
+- **Candidate:** If a profile/resume preview step exists, use it and compare against your actual work history before considering the application done. If no preview step exists, there is currently no way to verify what the portal actually stored — treat this as a known blind spot rather than assuming silence means success.
