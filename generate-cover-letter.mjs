@@ -49,21 +49,20 @@ function asUrl(value) {
 }
 
 function buildContactLine(candidate) {
-  const parts = [];
-  if (candidate.location) parts.push(escapeHtml(candidate.location));
-  if (candidate.email) {
-    const email = escapeHtml(candidate.email);
-    parts.push(`<a href="mailto:${email}">${email}</a>`);
-  }
-  if (candidate.phone) parts.push(escapeHtml(candidate.phone));
+  // Stacked, centered lines that mirror the resume header (location / email / LinkedIn).
+  const lines = [];
+  if (candidate.location) lines.push(escapeHtml(candidate.location));
+  if (candidate.email) lines.push(escapeHtml(candidate.email));
+  if (candidate.phone) lines.push(escapeHtml(candidate.phone));
   if (candidate.linkedin) {
-    parts.push(`<a href="${escapeHtml(asUrl(candidate.linkedin))}">LinkedIn</a>`);
+    const display = candidate.linkedin.replace(/^https?:\/\//, "");
+    lines.push(`<a href="${escapeHtml(asUrl(candidate.linkedin))}">${escapeHtml(display)}</a>`);
   }
   if (candidate.github) {
     const display = candidate.github.replace(/^https?:\/\//, "");
-    parts.push(`<a href="${escapeHtml(asUrl(candidate.github))}">${escapeHtml(display)}</a>`);
+    lines.push(`<a href="${escapeHtml(asUrl(candidate.github))}">${escapeHtml(display)}</a>`);
   }
-  return parts.join(" &nbsp;|&nbsp; ");
+  return lines.map(l => `<div class="contact-line">${l}</div>`).join("\n  ");
 }
 
 function buildCredentialsBlock(candidate) {
@@ -152,6 +151,7 @@ async function main() {
     options: {
       payload: { type: "string" },
       out:     { type: "string" },
+      format:  { type: "string" },
       help:    { type: "boolean", short: "h" },
     },
     strict: false,
@@ -160,10 +160,11 @@ async function main() {
   if (args.help || !args.payload) {
     console.log(`
 Usage:
-  node generate-cover-letter.mjs --payload payload.json [--out output/path.pdf]
+  node generate-cover-letter.mjs --payload payload.json [--out output/path.pdf] [--format a4|letter]
 
   --payload   Path to the JSON payload file (required)
   --out       Override output path from payload (optional)
+  --format    Page size: a4 (default) or letter. May also be set as "format" in the payload.
 `);
     process.exit(args.help ? 0 : 1);
   }
@@ -190,13 +191,23 @@ Usage:
 
   if (!existsSync(OUTPUT_ROOT)) mkdirSync(OUTPUT_ROOT, { recursive: true });
 
+  // Page size: --format flag wins, then a "format" key in the payload, else a4.
+  // Keeping this here (not in the payload) lets a US-role cover letter match a
+  // letter-sized CV without editing the JSON.
+  const VALID_FORMATS = ["a4", "letter"];
+  const format = (args.format || payload.format || "a4").toLowerCase();
+  if (!VALID_FORMATS.includes(format)) {
+    console.error(`ERROR: invalid format "${format}". Use: ${VALID_FORMATS.join(", ")}`);
+    process.exit(1);
+  }
+
   // Imported lazily so buildHtml can be used (and tested) without Playwright.
   const { renderHtmlToPdf } = await import("./generate-pdf.mjs");
 
   try {
     const html = buildHtml(payload);
     const outputPath = resolve(payload.output_path);
-    await renderHtmlToPdf(html, outputPath, { format: "a4" });
+    await renderHtmlToPdf(html, outputPath, { format });
     console.log(`\nCover letter PDF: ${payload.output_path}`);
   } catch (err) {
     console.error("ERROR generating cover letter PDF:");
