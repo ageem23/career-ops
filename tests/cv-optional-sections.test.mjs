@@ -15,11 +15,12 @@ console.log('\ncv-sections-core.mjs — optional sections leave no bare header')
 
 // FULL must populate every entry in OPTIONAL_SECTIONS, otherwise the
 // "populated payload is a no-op" check strips whichever one it forgot.
-const EMPTY = { projects: [], education: [], key_achievements: [] };
+const EMPTY = { projects: [], education: [], key_achievements: [], competencies: [] };
 const FULL = {
   projects: [{ name: 'P' }],
   education: [{ degree: 'D' }],
   key_achievements: ['A'],
+  competencies: ['C'],
 };
 
 function check(label, actual, expected) {
@@ -48,6 +49,12 @@ for (const { file, format, after } of TEMPLATES) {
 
   check(`${name}: empty payload removes the projects block`, stripped.includes(projectsMarker), false);
   check(`${name}: empty payload removes the education block`, stripped.includes(educationMarker), false);
+  // The competencies strip is HTML-only: the tex templates carry no such
+  // banner, so its pattern never matches there and the section is a no-op.
+  if (format === 'html') {
+    check(`${name}: empty payload removes the competencies block`,
+      stripped.includes('<!-- CORE COMPETENCIES -->'), false);
+  }
   check(`${name}: the section after education survives`, stripped.includes(after), true);
   check(`${name}: {{EXPERIENCE}} is untouched`, stripped.includes('{{EXPERIENCE}}'), true);
 

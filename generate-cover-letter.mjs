@@ -77,11 +77,30 @@ function buildDateline(letter) {
   return parts.join(" &nbsp;&nbsp; ");
 }
 
+// Each achievement is {lead, impact} and renders as a bold lead-in followed by
+// the detail. A plain string is accepted too and renders as an unadorned bullet
+// — without that branch a string payload silently produced `<li><b>,</b> </li>`,
+// i.e. every achievement vanished from the letter while generation reported
+// success. Anything carrying no text at all is a malformed payload and throws,
+// matching build-cv-html.mjs: fail loudly rather than ship a hollow document.
 function buildAchievementsBlock(achievements) {
   if (!achievements || !achievements.length) return "";
-  const items = achievements.map(ach => {
-    const lead = escapeHtml(ach.lead || "");
-    const impact = escapeHtml(ach.impact || "");
+  const items = achievements.map((ach, i) => {
+    if (typeof ach === "string") {
+      const text = escapeHtml(ach.trim());
+      if (!text) throw new Error(`letter.achievements[${i}] is empty`);
+      return `    <li>${text}</li>`;
+    }
+    const lead = escapeHtml((ach?.lead || "").replace(/,\s*$/, "").trim());
+    const impact = escapeHtml((ach?.impact || "").trim());
+    if (!lead && !impact) {
+      throw new Error(
+        `letter.achievements[${i}] has neither "lead" nor "impact" — expected ` +
+        `{lead, impact} or a plain string, got ${JSON.stringify(ach)}`
+      );
+    }
+    if (!lead) return `    <li>${impact}</li>`;
+    if (!impact) return `    <li><b>${lead}</b></li>`;
     return `    <li><b>${lead},</b> ${impact}</li>`;
   }).join("\n");
   return `<ul class="achievements">\n${items}\n  </ul>`;

@@ -34,11 +34,13 @@ const PATTERNS = {
     projects: new RegExp(String.raw`<!--\s+PROJECTS\s+-->[\s\S]*?` + HTML_BOUNDARY),
     education: new RegExp(String.raw`<!--\s+EDUCATION\s+-->[\s\S]*?` + HTML_BOUNDARY),
     key_achievements: new RegExp(String.raw`<!--\s+KEY ACHIEVEMENTS\s+-->[\s\S]*?` + HTML_BOUNDARY),
+    competencies: new RegExp(String.raw`<!--\s+CORE COMPETENCIES\s+-->[\s\S]*?` + HTML_BOUNDARY),
   },
   tex: {
     projects: new RegExp(String.raw`%{4,}\s+PROJECTS\s+%{4,}[\s\S]*?` + TEX_BOUNDARY),
     education: new RegExp(String.raw`%{4,}\s+Education\s+%{4,}[\s\S]*?` + TEX_BOUNDARY),
     key_achievements: new RegExp(String.raw`%{4,}\s+Key Achievements\s+%{4,}[\s\S]*?` + TEX_BOUNDARY),
+    competencies: new RegExp(String.raw`%{4,}\s+Core Competencies\s+%{4,}[\s\S]*?` + TEX_BOUNDARY),
   },
 };
 
@@ -47,7 +49,13 @@ const PATTERNS = {
 // no entries must not leave the header stranded. Every format needs an entry
 // here — `String.replace(undefined, '')` would replace the literal text
 // "undefined" rather than no-op.
-export const OPTIONAL_SECTIONS = ['projects', 'education', 'key_achievements'];
+// competencies joins them for the same reason: the keyword strip duplicates
+// content already carried by Key Achievements and the experience bullets, so a
+// candidate may legitimately drop it — and an empty list must not strand the
+// "Core Competencies" header. The tex templates carry no such banner today; the
+// pattern simply never matches there, which is why every format still needs an
+// entry (see the String.replace(undefined, '') note above).
+export const OPTIONAL_SECTIONS = ['projects', 'education', 'key_achievements', 'competencies'];
 
 export function isEmptySection(payload, section) {
   const entries = payload?.[section];

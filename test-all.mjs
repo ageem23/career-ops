@@ -6907,6 +6907,38 @@ try {
     fail('Single-pass substitution left a known token unreplaced');
   }
 
+  // achievements are {lead, impact}. A plain-string payload used to render
+  // `<li><b>,</b> </li>` per entry — every achievement silently dropped from
+  // the letter while generation still reported success. Strings now render as
+  // plain bullets, and a textless entry throws instead of shipping a hollow
+  // document (same contract as build-cv-html.mjs).
+  const achHtml = (achievements) => buildHtml({
+    candidate: { name: 'Jane Doe' },
+    letter: { role_title: 'Engineer', opening: 'O.', profile_intro: 'I.', achievements },
+  });
+
+  const objForm = achHtml([{ lead: 'Led the rollout', impact: 'to daily use.' }]);
+  if (objForm.includes('<li><b>Led the rollout,</b> to daily use.</li>')) {
+    pass('Cover letter {lead, impact} achievement renders a bold lead-in');
+  } else {
+    fail('Cover letter {lead, impact} achievement did not render its bold lead-in');
+  }
+
+  const strForm = achHtml(['A plain achievement line.']);
+  if (strForm.includes('<li>A plain achievement line.</li>') && !strForm.includes('<b>,</b>')) {
+    pass('Cover letter string achievement renders its text (never a bare bold comma)');
+  } else {
+    fail(`Cover letter string achievement was dropped: ${strForm.slice(strForm.indexOf('<ul class="achievements"'), strForm.indexOf('<ul class="achievements"') + 90)}`);
+  }
+
+  let threw = false;
+  try { achHtml([{}]); } catch { threw = true; }
+  if (threw) {
+    pass('Cover letter achievement with no lead/impact throws instead of emitting an empty bullet');
+  } else {
+    fail('Cover letter achievement with no lead/impact silently emitted an empty bullet');
+  }
+
   // CLI arguments: --help prints custom --format and --report usage guidelines
   const usageOut = execFileSync(process.execPath, [join(ROOT, 'generate-cover-letter.mjs'), '--help'], { encoding: 'utf-8' });
   if (usageOut.includes('--format') && usageOut.includes('--report') && usageOut.includes('[--format letter|a4]')) {
