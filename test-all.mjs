@@ -2111,6 +2111,64 @@ try {
   fail(`scan.mjs normalizeUrlForDedup test crashed: ${err.message}`);
 }
 
+// The test above reimplements the dedupUrl pattern inline, so it stayed green
+// while the real tryAccept() compared raw job.url against a normalized seenUrls
+// set — a merge dropped half of #2079 and every ?gh_src=/?lever-origin= posting
+// was re-added on every scan. tryAccept is a closure inside main() and can't be
+// imported, so assert on its source: neither seenUrls.has nor seenUrls.add may
+// be handed a raw URL.
+try {
+  const scanSrc = readFileSync(join(ROOT, 'scan.mjs'), 'utf8');
+  const body = scanSrc.slice(scanSrc.indexOf('function tryAccept('));
+  const tryAcceptBody = body.slice(0, body.indexOf('\n  }\n'));
+  const raw = [...tryAcceptBody.matchAll(/seenUrls\.(has|add)\(([^)]*)\)/g)]
+    .filter(([, , arg]) => arg.trim() !== 'dedupUrl');
+  if (tryAcceptBody.includes('normalizeUrlForDedup(job.url)') && raw.length === 0) {
+    pass('scan.mjs tryAccept normalizes the URL on both the has() and add() side (#2079)');
+  } else {
+    fail(`scan.mjs tryAccept uses a raw URL against the normalized seenUrls set: ${raw.map(m => m[0]).join(', ') || 'normalizeUrlForDedup(job.url) missing'}`);
+  }
+} catch (err) {
+  fail(`scan.mjs tryAccept dedup-key test crashed: ${err.message}`);
+}
+
+// A merge left two title-filter counters alive: the local classify() branch
+// increments totalFilteredNegative while the scan-runs.tsv writer still read
+// upstream's totalFilteredTitle, which nothing incremented — so filtered_title
+// persisted as 0 and stats.mjs under-reported lifetime filter efficiency.
+try {
+  const scanSrc = readFileSync(join(ROOT, 'scan.mjs'), 'utf8');
+  const declared = [...scanSrc.matchAll(/let\s+(totalFiltered\w+)\s*=/g)].map(m => m[1]);
+  const orphans = declared.filter(v => {
+    const uses = [...scanSrc.matchAll(new RegExp(`\\b${v}\\b`, 'g'))].length;
+    const bumped = new RegExp(`\\b${v}\\+\\+`).test(scanSrc);
+    return uses > 1 && !bumped;
+  });
+  if (orphans.length === 0) {
+    pass('scan.mjs has no title-filter counter that is read but never incremented');
+  } else {
+    fail(`scan.mjs counters read but never incremented (merge orphans): ${orphans.join(', ')}`);
+  }
+} catch (err) {
+  fail(`scan.mjs counter-orphan test crashed: ${err.message}`);
+}
+
+// #1906: dotenv's startup banner goes to stdout, which --json reserves for a
+// single JSON object. A merge kept both sides' dotenv bootstraps and the
+// non-quiet one ran first, defeating the fix under dotenv 17.x.
+try {
+  const scanSrc = readFileSync(join(ROOT, 'scan.mjs'), 'utf8');
+  const configCalls = [...scanSrc.matchAll(/\bconfig\(([^)]*)\)/g)].map(m => m[1].trim());
+  const nonQuiet = configCalls.filter(a => !a.includes('quiet'));
+  if (configCalls.length === 1 && nonQuiet.length === 0) {
+    pass('scan.mjs bootstraps dotenv exactly once, with quiet: true (#1906)');
+  } else {
+    fail(`scan.mjs dotenv bootstrap wrong: ${configCalls.length} config() call(s), ${nonQuiet.length} without quiet`);
+  }
+} catch (err) {
+  fail(`scan.mjs dotenv bootstrap test crashed: ${err.message}`);
+}
+
 // Company blacklist (#1742): data/blacklist.md is the user's do-not-apply
 // list. parseBlacklist keys rows by the shared normalizeCompany() so matching
 // is case- and punctuation-insensitive; loadBlacklist on an absent file is a

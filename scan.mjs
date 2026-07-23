@@ -37,14 +37,6 @@ import { pathToFileURL, fileURLToPath } from 'url';
 import path from 'path';
 import yaml from 'js-yaml';
 
-// Load .env so providers can read API tokens (e.g. APIFY_TOKEN).
-// dotenv is already declared in package.json; wrap in try/catch so a
-// minimal install still works for users who only use the free providers.
-try {
-  const { config } = await import('dotenv');
-  config();
-} catch {}
-
 import { makeHttpCtx } from './providers/_http.mjs';
 import { makeBrowserCtx, closeBrowser } from './providers/_browser.mjs';
 import { normalizeCompany, normalizeRole, roleTokens, roleMatchTokens } from './dedup-utils.mjs';
@@ -60,6 +52,7 @@ import { resolveColumns, parseTrackerRow } from './tracker-parse.mjs';
 // suffixes and sorts tokens to catch near-duplicate postings.
 import { normalizeCompany as normalizeBlacklistCompany } from './tracker-utils.mjs';
 
+// Load .env so providers can read API tokens (e.g. APIFY_TOKEN).
 try {
   const { config } = await import('dotenv');
   // quiet: dotenv's startup banner goes to stdout, which --json reserves for a
@@ -1987,7 +1980,6 @@ async function main() {
   const cooldownOffers = [];
   let totalFound = 0;
   let totalFilteredNegative = 0;
-  let totalFilteredTitle = 0;
   let totalFilteredTier = 0;
   let totalFilteredLocation = 0;
   let totalAcceptedLiteral = 0;
@@ -2009,7 +2001,11 @@ async function main() {
   // Uses the shared fuzzy company+role dedup (dedup-utils.mjs) honoring the
   // --strict-dedup flag for opt-out.
   function tryAccept(job, source, extra = {}) {
-    if (seenUrls.has(job.url)) { totalDupes++; return false; }
+    // seenUrls is keyed on the normalized URL (#2079) — cosmetic variants like
+    // ?gh_src=/?lever-origin=/utm_*, trailing slashes and #fragments must not
+    // read as a new posting. Normalize on both the check and the add side.
+    const dedupUrl = normalizeUrlForDedup(job.url);
+    if (seenUrls.has(dedupUrl)) { totalDupes++; return false; }
     // Exact key first (cheap, and the only index that knows scan-history and
     // company aliases), then the fuzzy near-duplicate matcher.
     if (seenCompanyRoles.has(companyRoleDedupKey(job.company, job.title, canonicalizeCompany))) {
@@ -2020,7 +2016,7 @@ async function main() {
       totalDupes++;
       return false;
     }
-    seenUrls.add(job.url);
+    seenUrls.add(dedupUrl);
     seenCompanyRoles.add(companyRoleDedupKey(job.company, job.title, canonicalizeCompany));
     addSeenCompanyRole(seenRolesFuzzy, job.company, job.title);
     newOffers.push({ ...job, source, ...extra });
@@ -2624,7 +2620,7 @@ async function main() {
     appendScanRunSummary({
       timestamp: new Date().toISOString(), status: 'completed',
       companies: summaryCompanies, boards: summaryBoards, found: totalFound,
-      filteredTitle: totalFilteredTitle, filteredTier: totalFilteredTier,
+      filteredTitle: totalFilteredNegative, filteredTier: totalFilteredTier,
       filteredLocation: totalFilteredLocation, filteredPostingAge: totalFilteredPostingAge,
       filteredSalary: totalFilteredSalary,
       filteredContent: totalFilteredContent, filteredCooldown: totalFilteredCooldown,

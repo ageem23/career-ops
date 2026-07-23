@@ -446,9 +446,6 @@ func (m ViewerModel) View() string {
 	footer := m.renderFooter()
 
 	view := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
-	if m.statusPicker {
-		view = m.overlayStatusPicker(view)
-	}
 	if m.addTask.active() {
 		view = m.overlayAddTaskPrompt(view)
 	}

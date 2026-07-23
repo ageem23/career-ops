@@ -6,6 +6,7 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/santifer/career-ops/dashboard/internal/i18n"
 	"github.com/santifer/career-ops/dashboard/internal/theme"
 )
 
@@ -26,6 +27,31 @@ func TestViewerRebuildRenderClampsScrollOffset(t *testing.T) {
 	}
 	if m.scrollOffset > maxScroll {
 		t.Fatalf("expected scrollOffset <= %d after rebuild, got %d", maxScroll, m.scrollOffset)
+	}
+}
+
+// The status picker used to be overlaid twice — once onto the body and again
+// onto the joined view — after two branches each added their own render call.
+func TestViewerStatusPickerRendersOnce(t *testing.T) {
+	m := ViewerModel{
+		lines:        []string{"body line"},
+		statusPicker: true,
+		width:        80,
+		height:       30,
+		theme:        theme.NewTheme("catppuccin-mocha"),
+	}
+	m.rebuildRender()
+
+	view := ansi.Strip(m.View())
+
+	if got := strings.Count(view, i18n.Current.PickerChangeStatus); got != 1 {
+		t.Fatalf("expected picker heading once, got %d", got)
+	}
+	for _, pair := range getStatusPairs() {
+		label := pair.Display + " (" + strings.ToUpper(pair.Shortcut) + ")"
+		if got := strings.Count(view, label); got != 1 {
+			t.Fatalf("expected status option %q once, got %d", label, got)
+		}
 	}
 }
 

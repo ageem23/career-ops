@@ -88,16 +88,6 @@ func (m appModel) Init() tea.Cmd {
 
 // Update manages global app state and routes incoming messages to active screens.
 func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if keyMsg, ok := msg.(tea.KeyMsg); ok {
-		switch keyMsg.String() {
-		case "t", "T":
-			// Toggle language globally, unless the user is actively typing in a text input field
-			if !(m.state == viewPipeline && m.pipeline.IsTextInputActive()) {
-				i18n.ToggleLang()
-			}
-		}
-	}
-
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.pipeline.Resize(msg.Width, msg.Height)
@@ -204,8 +194,13 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if normalized == "discarded" || normalized == "skip" {
 			m.state = viewPipeline
-			m.pipeline, _ = m.pipeline.StartDiscardReasonFlow(msg.App, msg.NewStatus)
+			// Reload BEFORE opening the picker: reloadPipelineData rebuilds the
+			// model via NewPipelineModel and carries over only a whitelist of
+			// fields, so starting the flow first would wipe discardPicker and
+			// the status change would be silently lost — this path relies on
+			// the picker to commit PipelineUpdateStatusAndNotesMsg.
 			m.reloadPipelineData()
+			m.pipeline, _ = m.pipeline.StartDiscardReasonFlow(msg.App, msg.NewStatus)
 			return m, nil
 		}
 
