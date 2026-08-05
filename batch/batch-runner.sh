@@ -48,6 +48,11 @@ RETRY_FAILED=false
 RESUME_PAUSED=false
 START_FROM=0
 MAX_RETRIES=2
+# Wall-clock cap per worker, passed to `timeout`. A normal evaluation runs
+# 3-5 minutes, so 30m is generous headroom for a slow one while still killing a
+# genuine hang the same night instead of jamming the run until someone notices.
+# Override with --worker-timeout or the WORKER_TIMEOUT env var; "0" disables.
+WORKER_TIMEOUT="${WORKER_TIMEOUT:-30m}"
 MIN_SCORE=0
 SKIP_PDF=false
 MODEL=""  # explicit override; otherwise resolved from config/profile.yml spend_tier
@@ -79,6 +84,10 @@ Options:
   --start-from N       Start from offer ID N (skip earlier IDs)
   --limit N            Max number of offers to process in this run
   --max-retries N      Max retry attempts per offer (default: 2)
+  --worker-timeout T   Wall-clock cap per worker, any `timeout` duration
+                       (default: 30m; "0" disables). A worker that exceeds it
+                       is killed and counted as a failed attempt, so one hung
+                       worker cannot jam the whole run.
   --min-score N        Skip PDF/tracker for offers scoring below N (default: 0 = off)
   --skip-pdf           Skip PDF generation entirely (write ❌ in tracker PDF column)
   --rate-limit-sleep N Seconds to wait before retrying a rate-limited worker
@@ -122,6 +131,10 @@ while [[ $# -gt 0 ]]; do
     --start-from) START_FROM="$2"; shift 2 ;;
     --limit) LIMIT="$2"; shift 2 ;;
     --max-retries) MAX_RETRIES="$2"; shift 2 ;;
+    --worker-timeout)
+      [[ $# -ge 2 ]] || { echo "ERROR: --worker-timeout requires an argument"; exit 1; }
+      WORKER_TIMEOUT="$2"; shift 2
+      ;;
     --min-score) MIN_SCORE="$2"; shift 2 ;;
     --skip-pdf) SKIP_PDF=true; shift ;;
     --rate-limit-sleep)
@@ -515,6 +528,82 @@ reserve_report_num() {
   run_with_state_lock reserve_report_num_unlocked "$@"
 }
 
+# Resolve the report number and score the worker ACTUALLY produced.
+#
+# The runner reserves a report number up front and hands it to the worker, but
+# nothing verified the worker used it. When it wrote a different report (for
+# example updating an existing report for the same company), the state row kept
+# the reserved number, so `report_num` pointed at a file that either did not
+# exist or belonged to a different offer. That single gap produced three
+# related defects: rows whose score stayed "-" though the report carried one,
+# report_num values that disagreed with the file on disk, and a report->JD
+# mapping built from state that silently resolved to the wrong posting.
+#
+# The old score regex compounded it: `"score":[[:space:]]*([0-9.]+)` matched
+# only a bare number, so `"score": null` or a quoted value yielded nothing and
+# the row silently landed as "-" even when the report said 2.0/5. It also took
+# head -1, the FIRST match anywhere in the log, rather than the worker's final
+# result line.
+#
+# Resolution order, most authoritative first:
+#   1. the "report" path in the worker's own result JSON
+#   2. the report whose "**Batch ID:** <id>" stamp matches this offer
+#   3. the reserved number (previous behaviour)
+#
+# Score prefers the JSON (last match, i.e. the final result line, and tolerating
+# quotes) and falls back to "**Score:** X.X/5" in the resolved report.
+#
+# Echoes "<report_num>\t<score>"; score is "-" when genuinely unavailable.
+resolve_worker_result() {
+  local log_file="$1" reserved="$2" offer_id="$3"
+  local rnum="" score="" rpath="" rfile=""
+
+  if [[ -f "$log_file" ]]; then
+    rpath=$(sed -nE 's@.*"report"[[:space:]]*:[[:space:]]*"([^"]+\.md)".*@\1@p' "$log_file" 2>/dev/null | tail -1 || true)
+    score=$(sed -nE 's/.*"score"[[:space:]]*:[[:space:]]*"?([0-9]+(\.[0-9]+)?)"?.*/\1/p' "$log_file" 2>/dev/null | tail -1 || true)
+  fi
+
+  # 1. the path the worker said it wrote
+  if [[ -n "$rpath" ]]; then
+    local cand="$rpath"
+    [[ "$cand" != /* ]] && cand="$PROJECT_DIR/${rpath#./}"
+    [[ -f "$cand" ]] && rfile="$cand"
+  fi
+
+  # 2. the report stamped with this batch id — but ONLY when that stamp is
+  #    unambiguous. batch-input.tsv has been regenerated several times, so low
+  #    ids are reused: id 1 currently matches 21 different reports going back to
+  #    May. Taking the first match would silently bind a 2026-08 offer to a
+  #    2026-05 report. A single match is trustworthy; anything else is not, and
+  #    we fall through to the reserved number rather than guess.
+  if [[ -z "$rfile" && -n "$offer_id" ]]; then
+    local bid_matches bid_count
+    bid_matches=$(grep -l -- "^\*\*Batch ID:\*\* ${offer_id}\$" "$REPORTS_DIR"/*.md 2>/dev/null || true)
+    bid_count=$(printf '%s' "$bid_matches" | grep -c . || true)
+    if [[ "${bid_count:-0}" -eq 1 ]]; then
+      rfile="$bid_matches"
+    elif [[ "${bid_count:-0}" -gt 1 ]]; then
+      echo "    ⚠️  #$offer_id: Batch ID stamp matches $bid_count reports (ids are reused across batch-input generations) — using the reserved number instead." >&2
+    fi
+  fi
+
+  # 3. whatever carries the reserved number
+  if [[ -z "$rfile" && -n "$reserved" && "$reserved" != "-" ]]; then
+    rfile=$(ls "$REPORTS_DIR/${reserved}"-*.md 2>/dev/null | head -1 || true)
+  fi
+
+  if [[ -n "$rfile" && -f "$rfile" ]]; then
+    rnum=$(basename "$rfile" | sed -nE 's/^([0-9]+)-.*/\1/p')
+    if ! is_decimal_number "${score:-}"; then
+      score=$(sed -nE 's@^\*\*Score:\*\*[[:space:]]*([0-9]+(\.[0-9]+)?)/5.*@\1@p' "$rfile" 2>/dev/null | head -1 || true)
+    fi
+  fi
+
+  [[ -n "$rnum" ]] || rnum="$reserved"
+  is_decimal_number "${score:-}" || score="-"
+  printf '%s\t%s\n' "$rnum" "$score"
+}
+
 # Process a single offer
 process_offer() {
   local id="$1" url="$2" source="$3" notes="$4"
@@ -557,6 +646,45 @@ process_offer() {
   local jd_file
   jd_file="$(mktemp "${TMPDIR:-/tmp}/batch-jd-${id}.XXXXXX")"
 
+  # Resolve the URL that goes into the report header.
+  #
+  # For a `local:jds/foo.md` input the raw value is a filesystem path, and
+  # substituting it into {{URL}} put that path in the report's **URL:** header,
+  # where the dashboard expects a clickable posting link. The real URL lives in
+  # the JD's YAML frontmatter (`url: "https://..."`), so recover it here.
+  #
+  # We also copy the JD body into the temp file. The worker prompt says to fall
+  # back to WebFetch on {{URL}} when the JD file is empty; once {{URL}} is the
+  # real posting link that fallback would hit a login wall (LinkedIn) instead of
+  # reading the JD we already have on disk. Feeding the content in keeps the
+  # worker off the network. The copy is deliberate: the temp file stays
+  # disposable, so nothing downstream can touch the original in jds/.
+  local report_url="$url"
+  if [[ "$url" == local:* ]]; then
+    local local_jd="$PROJECT_DIR/${url#local:}"
+    if [[ -f "$local_jd" ]]; then
+      cat "$local_jd" > "$jd_file" 2>/dev/null || true
+      local fm_url
+      fm_url=$(awk '
+        NR==1 && $0 !~ /^---/ { exit }
+        NR>1 && /^---/ { exit }
+        NR>1 && /^url:/ {
+          line = $0
+          sub(/^url:[ \t]*/, "", line)
+          gsub(/"/, "", line)
+          gsub(/'"'"'/, "", line)
+          if (length(line)) { print line; exit }
+        }' "$local_jd")
+      # Only override when the frontmatter actually carries a URL; otherwise
+      # keep the local: path rather than writing an empty header field.
+      if [[ -n "$fm_url" ]]; then
+        report_url="$fm_url"
+      else
+        echo "    ⚠️  #$id: no url in JD frontmatter — report URL stays as the local path"
+      fi
+    fi
+  fi
+
   echo "--- Processing offer #$id: $url (report $report_num, attempt $((retries + 1)))"
 
   # Build the prompt with placeholders replaced
@@ -567,7 +695,7 @@ process_offer() {
   else
     prompt="Process this job offer. Run the full pipeline: A-G evaluation + report .md + optional PDF + tracker line."
   fi
-  prompt="$prompt URL: $url"
+  prompt="$prompt URL: $report_url"
   prompt="$prompt JD file: $jd_file"
   prompt="$prompt Report number: $report_num"
   prompt="$prompt Date: $date"
@@ -579,7 +707,7 @@ process_offer() {
   local resolved_prompt="$BATCH_DIR/.resolved-prompt-${id}.md"
   # Escape sed delimiter characters in variables to prevent substitution breakage
   local esc_url esc_jd_file esc_report_num esc_date esc_id
-  esc_url="${url//\\/\\\\}"
+  esc_url="${report_url//\\/\\\\}"
   esc_url="${esc_url//|/\\|}"
   esc_jd_file="${jd_file//\\/\\\\}"
   esc_jd_file="${esc_jd_file//|/\\|}"
@@ -627,7 +755,24 @@ process_offer() {
   local max_shim_retries=4
   while true; do
     exit_code=0
-    claude "${claude_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+    # Hard wall-clock cap on the worker.
+    #
+    # Without it a `claude -p` that hangs without exiting blocks this loop
+    # forever, and because the loop holds the run open, one stuck worker jams
+    # the whole nightly job: no summary is written, the tracker merge never
+    # runs, and the next scheduled job refuses to start on the PID guard. That
+    # happened on 2026-08-04, where a worker hung at 22:38 and was still alive
+    # 15 hours later with a 0-byte log.
+    #
+    # `timeout` exits 124 on expiry, which falls through to the normal failure
+    # path below: the offer is marked failed, retried within MAX_RETRIES, and
+    # the run continues. A jam becomes one bad offer.
+    timeout "${WORKER_TIMEOUT}" claude "${claude_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+
+    if [[ $exit_code -eq 124 ]]; then
+      echo "    ⏱️  Worker exceeded ${WORKER_TIMEOUT} with no output — killed. Treating as a failed attempt."
+      printf '\n[batch-runner] worker killed after %s (timeout)\n' "$WORKER_TIMEOUT" >> "$log_file"
+    fi
 
     if [[ $exit_code -eq 0 ]]; then
       break
@@ -674,12 +819,23 @@ process_offer() {
   completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
   if [[ $exit_code -eq 0 ]]; then
-    # Try to extract score from worker output
+    # Resolve what the worker ACTUALLY produced, rather than trusting the
+    # reserved number and a single loose regex (see resolve_worker_result).
     local score="-"
-    local score_match
-   score_match=$(sed -nE 's/.*"score":[[:space:]]*([0-9.]+).*/\1/p' "$log_file" 2>/dev/null | head -1 || true)
-    if [[ -n "$score_match" ]]; then
-      score="$score_match"
+    local actual_report_num="$report_num"
+    local _resolved
+    _resolved=$(resolve_worker_result "$log_file" "$report_num" "$id")
+    actual_report_num="${_resolved%%$'\t'*}"
+    score="${_resolved##*$'\t'}"
+    [[ -n "$actual_report_num" ]] || actual_report_num="$report_num"
+    [[ -n "$score" ]] || score="-"
+
+    if [[ "$actual_report_num" != "$report_num" ]]; then
+      echo "    ⚠️  #$id: worker wrote report $actual_report_num, not the reserved $report_num — recording the actual one."
+      report_num="$actual_report_num"
+    fi
+    if [[ "$score" == "-" ]]; then
+      echo "    ⚠️  #$id: completed but no score could be resolved from the log or report $report_num."
     fi
 
     # Check min-score gate

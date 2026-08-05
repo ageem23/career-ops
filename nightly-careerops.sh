@@ -3,6 +3,11 @@
 # batch-evaluates them. Registered in Windows Task Scheduler:
 #   - "career-ops-scan"         → 18:00 daily (--scan-only: portal scan, no eval)
 #   - "career-ops-nightly"      → 22:00 daily (--no-scan --cap=40: import + eval)
+#   - "career-ops-hibernate"    → 00:00 daily (nightly-hibernate.cmd: forces
+#                                 Hibernate so the 04:00 task wakes via the RTC
+#                                 wake-alarm path instead of unreliable Modern
+#                                 Standby wake; requires standby-timeout-ac=0
+#                                 so the machine is still awake at midnight)
 #   - "career-ops-nightly-late" → 04:00 daily (--no-scan --cap=40: leftovers + eval)
 # Each run logs to tmp/nightly-{date}[-late].log and writes a morning summary
 # to tmp/nightly-latest-summary.txt.
@@ -80,47 +85,57 @@ echo "================================================"
 echo "  Nightly career-ops run — $TS"
 echo "================================================"
 
+# --- Network readiness: wait + pre-flight probe (ALL paths) ---
+# This block deliberately runs before the --no-scan branch, not inside the scan
+# branch where it used to live. Both evaluation jobs (22:00 / 04:00) pass
+# --no-scan, and the 04:00 one fires immediately after wake-from-hibernate, so
+# it used to launch `claude -p` workers with no network-readiness guarantee at
+# all. When the OAuth access token needs refreshing and the network isn't up
+# yet, every worker dies with "Not logged in · Please run /login" — a whole
+# run's offers burn their retry budget in seconds. The probe already hits
+# api.anthropic.com, so it covers the auth path too.
+if [[ "$WAIT_SECS" -gt 0 ]]; then
+  echo ""
+  echo "Sleeping ${WAIT_SECS}s for VPN/network to come up..."
+  sleep "$WAIT_SECS"
+fi
+# Pre-flight network probe: confirm we can reach a few representative hosts
+# before doing any real work. Logs per-host transport success so the morning
+# diagnosis isn't "the run failed; was the network up?"
+if ! $NO_PREFLIGHT; then
+  echo ""
+  echo "Pre-flight network probe..."
+  # GET (not HEAD): api.anthropic.com rejects HEAD with no body, so HEAD
+  # gives a false negative. GET to a known endpoint returns a code (200/
+  # 301/401) which means transport succeeded — that's what we want to know.
+  PROBE_HOSTS=("https://api.anthropic.com/v1/models" "https://www.linkedin.com" "https://boards-api.greenhouse.io")
+  attempt=1
+  while :; do
+    ok=true
+    for h in "${PROBE_HOSTS[@]}"; do
+      if curl --silent --connect-timeout 5 --max-time 8 -o /dev/null "$h"; then
+        echo "  ok   $h"
+      else
+        echo "  fail $h"
+        ok=false
+      fi
+    done
+    $ok && break
+    if [[ $attempt -ge 3 ]]; then
+      echo "  WARN: pre-flight still failing after $attempt attempts — continuing anyway"
+      break
+    fi
+    echo "  retry in 20s (attempt $attempt/3)..."
+    sleep 20
+    ((attempt++))
+  done
+fi
+
 # --- Step 1: portal scan (zero-token) ---
 if $NO_SCAN; then
   echo ""
   echo "--- Step 1/3: portal scan — SKIPPED (--no-scan, processing leftovers) ---"
 else
-  if [[ "$WAIT_SECS" -gt 0 ]]; then
-    echo ""
-    echo "Sleeping ${WAIT_SECS}s for VPN/network to come up before scan..."
-    sleep "$WAIT_SECS"
-  fi
-  # Pre-flight network probe: confirm we can reach a few representative hosts
-  # before the scan starts. Logs per-host transport success so the morning
-  # diagnosis isn't "scan failed; was the network up?"
-  if ! $NO_PREFLIGHT; then
-    echo ""
-    echo "Pre-flight network probe..."
-    # GET (not HEAD): api.anthropic.com rejects HEAD with no body, so HEAD
-    # gives a false negative. GET to a known endpoint returns a code (200/
-    # 301/401) which means transport succeeded — that's what we want to know.
-    PROBE_HOSTS=("https://api.anthropic.com/v1/models" "https://www.linkedin.com" "https://boards-api.greenhouse.io")
-    attempt=1
-    while :; do
-      ok=true
-      for h in "${PROBE_HOSTS[@]}"; do
-        if curl --silent --connect-timeout 5 --max-time 8 -o /dev/null "$h"; then
-          echo "  ok   $h"
-        else
-          echo "  fail $h"
-          ok=false
-        fi
-      done
-      $ok && break
-      if [[ $attempt -ge 3 ]]; then
-        echo "  WARN: pre-flight still failing after $attempt attempts — running scan anyway"
-        break
-      fi
-      echo "  retry in 20s (attempt $attempt/3)..."
-      sleep 20
-      ((attempt++))
-    done
-  fi
   echo ""
   echo "--- Step 1/3: portal scan ---"
   node scan.mjs
@@ -224,20 +239,31 @@ if [[ "$FIRST_NEW_ID" == "none" || -z "$FIRST_NEW_ID" ]]; then
   # this, the "no new offers" early-exit skips Step 3 entirely, so a bad night
   # (e.g. an auth blip that 401s every worker) strands those offers until someone
   # runs batch-runner.sh --retry-failed by hand. A plain run reprocesses orphaned
-  # "processing"; --retry-failed clears failed-at-cap. The runner picks only one
+  # "processing"; --retry-failed selects failed rows. The runner picks only one
   # category per invocation, so run each mode that has work (sequential — no lock
   # contention; each invocation self-merges + verifies).
+  #
+  # --retry-failed does NOT bypass the retry cap: batch-runner.sh still applies
+  # `retries >= MAX_RETRIES` to the rows it selected, so a failed row already at
+  # the default cap of 2 is skipped and the "recovery" silently does nothing
+  # (exit 0, "No offers to process"). Raise the cap above the highest retry
+  # count actually recorded so those rows become eligible again. Computed, not
+  # hardcoded, so this keeps working once rows sit at 3, 4, ...
   STATE_FILE="batch/batch-state.tsv"
-  STUCK_PROC=0; STUCK_FAIL=0
+  STUCK_PROC=0; STUCK_FAIL=0; MAX_SEEN_RETRIES=0
   if [[ -f "$STATE_FILE" ]]; then
     STUCK_PROC=$(awk -F'\t' 'NR>1 && $3=="processing"{n++} END{print n+0}' "$STATE_FILE")
     STUCK_FAIL=$(awk -F'\t' 'NR>1 && $3=="failed"{n++} END{print n+0}' "$STATE_FILE")
+    # column 9 = retries
+    MAX_SEEN_RETRIES=$(awk -F'\t' 'NR>1 && $3=="failed" && $9+0>m{m=$9+0} END{print m+0}' "$STATE_FILE")
   fi
+  RETRY_CAP=$((MAX_SEEN_RETRIES + 1))
   STUCK_TOTAL=$((STUCK_PROC + STUCK_FAIL))
   if [[ "$STUCK_TOTAL" -gt 0 ]]; then
     echo "No new offers, but $STUCK_TOTAL stuck offer(s) from a prior run (processing=$STUCK_PROC failed=$STUCK_FAIL) — running recovery pass."
     [[ "$STUCK_PROC" -gt 0 ]] && bash batch/batch-runner.sh --parallel 3
-    [[ "$STUCK_FAIL" -gt 0 ]] && bash batch/batch-runner.sh --parallel 3 --retry-failed
+    [[ "$STUCK_FAIL" -gt 0 ]] && echo "  retrying failed offers with --max-retries $RETRY_CAP (highest recorded retry count: $MAX_SEEN_RETRIES)"
+    [[ "$STUCK_FAIL" -gt 0 ]] && bash batch/batch-runner.sh --parallel 3 --retry-failed --max-retries "$RETRY_CAP"
     RECOVERED_NOTE="No new offers; ran recovery on $STUCK_TOTAL stuck offer(s) (processing=$STUCK_PROC failed=$STUCK_FAIL) — see applications.md / batch logs."
     if [[ -n "$SUMMARY_APPEND" ]]; then
       { echo ""; echo "--- late run — $TS ---"; [[ -n "$SCAN_BANNER" ]] && echo "$SCAN_BANNER"; echo "$RECOVERED_NOTE"; } >> "$SUMMARY"
