@@ -171,3 +171,89 @@ func TestKebabCase(t *testing.T) {
 		}
 	}
 }
+
+// --- current {company}-{date}-{cv|cover} naming scheme -----------------------
+
+func TestResolvePDFsMatchesCurrentNamingScheme(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "output/anthropic-2026-06-01-cv.pdf", "pdf")
+	writeFixture(t, root, "output/anthropic-2026-06-05-cv.pdf", "pdf")
+	writeFixture(t, root, "output/anthropic-2026-06-05-cover.pdf", "pdf")
+	writeFixture(t, root, "output/netflix-2026-06-05-cv.pdf", "pdf")
+
+	app := model.CareerApplication{Company: "Anthropic", ReportNumber: "099"}
+	got := ResolvePDFs(root, app, LoadPDFManifest(root))
+	if len(got) != 2 {
+		t.Fatalf("expected 2 anthropic CV matches (cover excluded), got %v", got)
+	}
+	// Date is no longer trailing; sorting must still order newest first.
+	if got[0] != "output/anthropic-2026-06-05-cv.pdf" {
+		t.Fatalf("expected newest first, got %v", got)
+	}
+	for _, p := range got {
+		if p == "output/anthropic-2026-06-05-cover.pdf" {
+			t.Fatalf("cover letter must not be returned as a CV: %v", got)
+		}
+	}
+}
+
+func TestResolvePDFsMixedLegacyAndCurrentSchemes(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "output/cv-jane-doe-anthropic-2026-06-01.pdf", "pdf")
+	writeFixture(t, root, "output/anthropic-2026-06-09-cv.pdf", "pdf")
+
+	app := model.CareerApplication{Company: "Anthropic", ReportNumber: "099"}
+	got := ResolvePDFs(root, app, LoadPDFManifest(root))
+	if len(got) != 2 {
+		t.Fatalf("expected both schemes resolved, got %v", got)
+	}
+	if got[0] != "output/anthropic-2026-06-09-cv.pdf" {
+		t.Fatalf("expected the newer current-scheme file first, got %v", got)
+	}
+}
+
+func TestResolveHTMLCurrentSchemeDerivesExistingPDFPath(t *testing.T) {
+	root := t.TempDir()
+	// The company segment is the kebab-cased tracker company verbatim
+	// ("Toast, Inc." -> "toast-inc"). Shortening it to "toast" would make
+	// matchesCompanySlug fail, because the slug it searches for is derived
+	// from the tracker value, not from the filename.
+	writeFixture(t, root, "output/toast-inc-2026-08-04-cv.html", "<html></html>")
+
+	app := model.CareerApplication{Company: "Toast, Inc."}
+	html, pdf := ResolveHTML(root, app)
+	if html != "output/toast-inc-2026-08-04-cv.html" {
+		t.Fatalf("unexpected html: %q", html)
+	}
+	// Under the current scheme HTML and PDF share a base, so the derived
+	// path is the one generate-pdf.mjs actually writes. Under the legacy
+	// scheme the HTML had no date and this derived a nonexistent file.
+	if pdf != "output/toast-inc-2026-08-04-cv.pdf" {
+		t.Fatalf("unexpected derived pdf: %q", pdf)
+	}
+}
+
+// Guards the slug rule that makes the scheme work: a filename built from a
+// shortened company name is unreachable, because the lookup slug comes from
+// the tracker. This is why legacy files like cv-mathieu-agee-toast.html were
+// never resolvable for the tracker company "Toast, Inc.".
+func TestResolveHTMLShortenedCompanySlugIsNotFound(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "output/toast-2026-08-04-cv.html", "<html></html>")
+
+	app := model.CareerApplication{Company: "Toast, Inc."}
+	if html, _ := ResolveHTML(root, app); html != "" {
+		t.Fatalf("shortened slug should not resolve, got %q", html)
+	}
+}
+
+func TestResolveHTMLIgnoresCoverLetters(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "output/toast-2026-08-04-cover.html", "<html></html>")
+
+	app := model.CareerApplication{Company: "Toast, Inc."}
+	html, _ := ResolveHTML(root, app)
+	if html != "" {
+		t.Fatalf("cover letter must not resolve as a CV, got %q", html)
+	}
+}

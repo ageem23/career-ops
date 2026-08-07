@@ -659,10 +659,23 @@ process_offer() {
   # reading the JD we already have on disk. Feeding the content in keeps the
   # worker off the network. The copy is deliberate: the temp file stays
   # disposable, so nothing downstream can touch the original in jds/.
+  # Path handed to the worker for the JD. For a local: input this is the
+  # repo-relative path (e.g. jds/foo.md), NOT the mktemp path.
+  #
+  # The mktemp path is a POSIX string like /tmp/batch-jd-1289.cdYICD embedded in
+  # the prompt prose. MSYS only rewrites paths passed as command arguments, so
+  # the worker receives it untranslated and resolves it however its tooling
+  # happens to: through the Bash tool it works, through the Read tool it lands
+  # on C:\tmp\... and misses. Same offer, same input, different outcome per run.
+  # On 2026-08-06 that cost two evaluations (#1289, #1291) while three sibling
+  # offers with identical inputs succeeded. A repo-relative path resolves
+  # identically for every tool, since the worker runs with the project as cwd.
+  local worker_jd_path="$jd_file"
   local report_url="$url"
   if [[ "$url" == local:* ]]; then
     local local_jd="$PROJECT_DIR/${url#local:}"
     if [[ -f "$local_jd" ]]; then
+      worker_jd_path="${url#local:}"
       cat "$local_jd" > "$jd_file" 2>/dev/null || true
       local fm_url
       fm_url=$(awk '
@@ -696,7 +709,7 @@ process_offer() {
     prompt="Process this job offer. Run the full pipeline: A-G evaluation + report .md + optional PDF + tracker line."
   fi
   prompt="$prompt URL: $report_url"
-  prompt="$prompt JD file: $jd_file"
+  prompt="$prompt JD file: $worker_jd_path"
   prompt="$prompt Report number: $report_num"
   prompt="$prompt Date: $date"
   prompt="$prompt Batch ID: $id"
@@ -833,6 +846,37 @@ process_offer() {
     if [[ "$actual_report_num" != "$report_num" ]]; then
       echo "    ⚠️  #$id: worker wrote report $actual_report_num, not the reserved $report_num — recording the actual one."
       report_num="$actual_report_num"
+    fi
+
+    # A zero exit code only means the CLI ran, not that the evaluation
+    # succeeded. A worker that cannot obtain the JD writes
+    # {"status":"failed", ..., "report":null} and exits 0; branching on the
+    # exit code alone recorded that as "completed" with no score and no report
+    # on disk, so the offer was never retried and the row lied about it. That
+    # happened to #1289 and #1291 on 2026-08-06.
+    #
+    # Treat it as a failure when the worker says so, or when no report exists
+    # for the resolved number. Both go down the normal failure path, so the
+    # offer keeps its retry budget and comes back on the next run.
+    local worker_status produced_report=false
+    worker_status=$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([a-zA-Z_]+)".*/\1/p' "$log_file" 2>/dev/null | tail -1 || true)
+    if [[ -n "$report_num" && "$report_num" != "-" ]] \
+      && compgen -G "$REPORTS_DIR/${report_num}-*.md" >/dev/null 2>&1; then
+      produced_report=true
+    fi
+
+    if [[ "$worker_status" == "failed" ]] || ! $produced_report; then
+      local why="no report was written"
+      [[ "$worker_status" == "failed" ]] && why="worker reported status=failed"
+      local reason
+      reason=$(sed -nE 's/.*"error"[[:space:]]*:[[:space:]]*"([^"]{1,160})".*/\1/p' "$log_file" 2>/dev/null | tail -1 || true)
+      [[ -n "$reason" ]] && why="$why: $reason"
+      echo "    ❌ #$id: exited 0 but $why — recording as failed, not completed."
+      if (( retries < MAX_RETRIES )); then
+        retries=$((retries + 1))
+      fi
+      update_state "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$why" "$retries"
+      return 0
     fi
     if [[ "$score" == "-" ]]; then
       echo "    ⚠️  #$id: completed but no score could be resolved from the log or report $report_num."
@@ -1155,6 +1199,24 @@ main() {
   fi
   echo "Input: $total_input offers"
   echo ""
+
+  # Sweep orphans BEFORE selecting work, not just during and after the run.
+  #
+  # A row left as "processing" by a previous run (worker finished, state write
+  # lost to a lock timeout, or the run was killed mid-flight) is selected as
+  # pending here and re-evaluated from scratch — even though its report was
+  # already written. That produced a genuine duplicate on 2026-08-06: offer
+  # #1277 wrote report 3122 at 22:00, the row stayed "processing", and the
+  # 04:00 recovery re-ran the same offer into report 3128. Two reports, two
+  # evaluations paid for, one of them orphaned with no tracker row.
+  #
+  # sweep_orphans only promotes rows whose worker log JSON shows completion, so
+  # running it first converts exactly those rows to "completed" and drops them
+  # out of the pending set. Genuinely incomplete rows (empty or partial log)
+  # are left alone and still get re-processed below, which is what we want.
+  if [[ "$DRY_RUN" != "true" ]]; then
+    sweep_orphans "startup"
+  fi
 
   # Build list of offers to process
   local -a pending_ids=()

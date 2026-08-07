@@ -163,7 +163,12 @@ func LoadPDFManifest(careerOpsPath string) PDFManifest {
 
 // rePDFDate extracts the trailing YYYY-MM-DD stamp from generated CV
 // filenames (cv-{candidate}-{slug}-{date}.pdf).
-var rePDFDate = regexp.MustCompile(`(\d{4}-\d{2}-\d{2})\.pdf$`)
+// Matches both naming schemes:
+//   legacy:  cv-mathieu-agee-toast-2026-08-04.pdf   (date trailing)
+//   current: toast-2026-08-04-cv.pdf                (date followed by kind)
+// Without the optional kind suffix the current scheme would never match and
+// every candidate would silently fall back to mtime ordering.
+var rePDFDate = regexp.MustCompile(`(\d{4}-\d{2}-\d{2})(?:-(?:cv|cover))?\.pdf$`)
 
 // ResolvePDFs returns candidate PDF paths (relative to careerOpsPath) for an
 // application, best match first.
@@ -171,11 +176,15 @@ var rePDFDate = regexp.MustCompile(`(\d{4}-\d{2}-\d{2})\.pdf$`)
 // Precedence:
 //  1. Manifest entry for the application's report number, when the file
 //     still exists. This is exact — generate-pdf.mjs recorded the linkage.
-//  2. Filename match: output/cv-*.pdf whose name contains the kebab-cased
-//     company. This covers every PDF generated before the manifest existed.
+//  2. Filename match: a CV PDF whose name contains the kebab-cased company.
+//     This covers every PDF generated before the manifest existed.
 //     Multiple matches are all returned (newest first) so the caller can
 //     offer a picker instead of guessing — one company can have several
 //     role-variant CVs from the same day.
+//
+// Two filename schemes are recognised: the current {company}-{date}-cv.pdf
+// and the legacy cv-{candidate}-{company}-{date}.pdf. Cover letters are
+// deliberately excluded — this resolves the CV.
 func ResolvePDFs(careerOpsPath string, app model.CareerApplication, manifest PDFManifest) []string {
 	if entry, ok := manifest.Lookup(app); ok {
 		if _, err := os.Stat(filepath.Join(careerOpsPath, filepath.FromSlash(entry.PDFPath))); err == nil {
@@ -188,7 +197,7 @@ func ResolvePDFs(careerOpsPath string, app model.CareerApplication, manifest PDF
 		return nil
 	}
 
-	globbed, err := filepath.Glob(filepath.Join(careerOpsPath, "output", "cv-*.pdf"))
+	globbed, err := globCVFiles(careerOpsPath, "pdf")
 	if err != nil {
 		return nil
 	}
@@ -264,16 +273,50 @@ func kebabCase(s string) string {
 	return strings.TrimRight(b.String(), "-")
 }
 
-// ResolveHTML returns the newest output/cv-*{companySlug}*.html for app and
+// globCVFiles returns every CV artefact in output/ with the given extension,
+// across both naming schemes:
+//
+//	current: {company}-{date}-cv.{ext}
+//	legacy:  cv-{candidate}-{company}-{date}.{ext}
+//
+// Cover letters ({company}-{date}-cover.*) are excluded by construction: the
+// current pattern requires a "-cv" suffix and the legacy one a "cv-" prefix.
+func globCVFiles(careerOpsPath, ext string) ([]string, error) {
+	current, err := filepath.Glob(filepath.Join(careerOpsPath, "output", "*-cv."+ext))
+	if err != nil {
+		return nil, err
+	}
+	legacy, err := filepath.Glob(filepath.Join(careerOpsPath, "output", "cv-*."+ext))
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(current)+len(legacy))
+	out := make([]string, 0, len(current)+len(legacy))
+	for _, p := range append(current, legacy...) {
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// ResolveHTML returns the newest CV HTML in output/ matching the company, and
 // a companion PDF path derived from it (same base, .pdf extension). Returns
 // ("","") when no matching HTML file is found. Used by the D handler to allow
 // PDF generation for entries that have a tailored CV HTML but no prior PDF.
+//
+// Under the current scheme the HTML and PDF share a base ({company}-{date}-cv),
+// so the derived path resolves to a real file. Under the legacy scheme it did
+// not: the HTML carried no date while the PDF did, so the derived path pointed
+// at a file that never existed and regeneration wrote to a dateless name.
 func ResolveHTML(careerOpsPath string, app model.CareerApplication) (htmlPath, pdfPath string) {
 	slug := kebabCase(app.Company)
 	if slug == "" {
 		return "", ""
 	}
-	globbed, err := filepath.Glob(filepath.Join(careerOpsPath, "output", "cv-*.html"))
+	globbed, err := globCVFiles(careerOpsPath, "html")
 	if err != nil {
 		return "", ""
 	}
