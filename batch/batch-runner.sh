@@ -27,6 +27,10 @@ PAUSE_FILE="$BATCH_DIR/batch-runner.paused"
 STATE_LOCK_DIR="$BATCH_DIR/.batch-state.lock"
 STATE_LOCK_PID_FILE="$STATE_LOCK_DIR/pid"
 STATE_LOCK_TIMEOUT_SECONDS=60
+# Persisted high-water mark for report numbers. Reconciled once per run against
+# the reports directory and batch-state.tsv; read/incremented per reservation so
+# the hot path never touches the (OneDrive-backed, ~3,000 file) reports dir.
+REPORT_COUNTER_FILE="$BATCH_DIR/.report-high-water"
 # How many times process_offer retries reserving its state row before giving
 # up. acquire_state_lock can lose the mkdir race or time out under a parallel
 # burst; if the initial "processing" row never lands, the worker would run
@@ -401,31 +405,118 @@ log_discard() {
 
 # Calculate next report number.
 # Caller must hold STATE_LOCK_DIR while this runs.
-next_report_num_unlocked() {
-  local max_num=0
+# Highest report number present on disk.
+#
+# Deliberately NOT called while holding the state lock. This scan is O(reports)
+# and the directory has ~3,000 files; the state-file check in
+# next_report_num_unlocked is what actually needs serializing.
+#
+# The `${f##*/}` expansion replaces a `basename` subprocess that used to run
+# once per file. On Windows/MSYS a process spawn costs milliseconds, so at 2,959
+# reports that loop measured 167 SECONDS against a 60-second lock timeout: the
+# first worker held the lock for nearly three minutes while workers 2 and 3
+# timed out and orphaned their rows. Pure expansion measures 0.2s, an ~800x
+# reduction, and it is the root cause behind every orphaned "processing" row and
+# both duplicate evaluations this week.
+scan_reports_max() {
+  local max_num=0 num
   if [[ -d "$REPORTS_DIR" ]]; then
     for f in "$REPORTS_DIR"/*.md; do
       [[ -f "$f" ]] || continue
-      local basename
-      basename=$(basename "$f")
-      local num="${basename%%-*}"
-      num=$((10#$num)) # Remove leading zeros for arithmetic
-      if (( num > max_num )); then
-        max_num=$num
-      fi
+      num="${f##*/}"        # strip directory, no subprocess
+      num="${num%%-*}"      # leading numeric segment
+      # `case` rather than a `=~` regex: bash regex costs ~4x more per
+      # iteration, which is material across ~3,000 files. This also absorbs the
+      # unmatched-glob case, where $f is the literal "*.md".
+      case "$num" in ''|*[!0-9]*) continue ;; esac
+      num=$((10#$num))      # tolerate leading zeros
+      (( num > max_num )) && max_num=$num
     done
   fi
-  # Also check state file for assigned report numbers
+  printf '%s\n' "$max_num"
+}
+
+# Next free report number. Takes the on-disk maximum as an argument so the
+# expensive directory scan happens outside the lock; only the state-file read
+# below needs to be serialized against concurrent reservations.
+#
+# Computing the disk max before acquiring is safe: reports only appear on disk
+# after a worker has already reserved its number, so the disk max can only lag,
+# never over-allocate. The state-file pass inside the lock is the authority on
+# numbers reserved by in-flight workers.
+# Highest report number recorded in batch-state.tsv.
+state_reports_max() {
+  local max_num=0 n
   if [[ -f "$STATE_FILE" ]]; then
     while IFS=$'\t' read -r _ _ _ _ _ rnum _ _ _; do
       [[ "$rnum" == "report_num" || "$rnum" == "-" || -z "$rnum" ]] && continue
-      local n=$((10#$rnum))
-      if (( n > max_num )); then
-        max_num=$n
-      fi
+      case "$rnum" in ''|*[!0-9]*) continue ;; esac
+      n=$((10#$rnum))
+      (( n > max_num )) && max_num=$n
     done < "$STATE_FILE"
   fi
-  printf '%03d' $((max_num + 1))
+  printf '%s\n' "$max_num"
+}
+
+# Rebuild the persisted high-water mark from the authoritative sources.
+#
+# Called ONCE per run, from main(), never from the per-offer path. This is the
+# only place the reports directory is scanned.
+#
+# Why the counter exists: reports/ lives inside a OneDrive-synced tree with
+# ~3,000 files, and a full directory read there measured anywhere from 3 to 47
+# SECONDS across runs. Doing that per reservation is what produced the
+# 60-second lock timeouts, and even after removing the per-file subprocess the
+# reservation path still measured 5-24s on 2026-08-17. Reading a single integer
+# from a file is constant-time and independent of report count, which is the
+# property that matters as the corpus keeps growing.
+reconcile_report_high_water() {
+  local fs_max state_max stored=0 best
+  fs_max=$(scan_reports_max)
+  state_max=$(state_reports_max)
+  if [[ -f "$REPORT_COUNTER_FILE" ]]; then
+    stored=$(< "$REPORT_COUNTER_FILE")
+    case "$stored" in ''|*[!0-9]*) stored=0 ;; esac
+  fi
+  best="$fs_max"
+  (( state_max > best )) && best="$state_max"
+  (( stored > best )) && best="$stored"
+  printf '%s\n' "$best" > "$REPORT_COUNTER_FILE"
+  echo "Report high-water mark: $best (disk=$fs_max state=$state_max stored=$stored)"
+}
+
+# Allocate the next report number from the persisted counter.
+#
+# Constant-time: read an integer, increment, write it back. The caller holds the
+# state lock, so the read-modify-write is atomic against sibling workers.
+#
+# The collision check is a safety net, not the primary mechanism. Other tools
+# (reserve-report-num.mjs, hand-written reports) can create reports without
+# touching the counter; a stale counter would otherwise overwrite one. A
+# single-prefix glob costs ~0.4s against ~3-47s for a full scan, so the net is
+# still an order of magnitude cheaper than what it replaces. Startup
+# reconciliation catches anything this misses on the next run.
+next_report_num_unlocked() {
+  local cur=0 n attempts=0
+  if [[ -f "$REPORT_COUNTER_FILE" ]]; then
+    cur=$(< "$REPORT_COUNTER_FILE")
+    case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+  fi
+  # A missing or zeroed counter means the startup reconcile never ran (e.g. a
+  # direct call in a test). Rebuild rather than allocate from 1 and collide.
+  if (( cur == 0 )); then
+    cur=$(scan_reports_max)
+    local sm; sm=$(state_reports_max)
+    (( sm > cur )) && cur="$sm"
+  fi
+  n=$((cur + 1))
+  while (( attempts < 50 )) && compgen -G "$REPORTS_DIR/${n}-*.md" >/dev/null 2>&1; do
+    echo "    ⚠️  report number $n already exists on disk — counter was stale, skipping ahead." >&2
+    n=$((n + 1))
+    attempts=$((attempts + 1))
+  done
+  printf '%s\n' "$n" > "$REPORT_COUNTER_FILE"
+  printf '%03d' "$n"
 }
 
 # Update or insert state for an offer.
@@ -524,8 +615,34 @@ reserve_report_num_unlocked() {
   printf '%s\n' "$report_num"
 }
 
+# Threshold above which the reservation path is considered pathologically slow.
+# The whole path should now run in well under a second; anything approaching the
+# lock timeout means an O(n) operation has crept back into the critical section,
+# which is exactly how the 167-second regression went unnoticed for a week.
+RESERVE_SLOW_WARN_SECONDS="${RESERVE_SLOW_WARN_SECONDS:-5}"
+
 reserve_report_num() {
-  run_with_state_lock reserve_report_num_unlocked "$@"
+  # No directory scan here. The number comes from the persisted high-water
+  # counter, reconciled once per run in main().
+  local started_ns elapsed
+  started_ns=$(date +%s%N 2>/dev/null || echo 0)
+
+  local out rc=0
+  out=$(run_with_state_lock reserve_report_num_unlocked "$1" "$2" "$3" "$4") || rc=$?
+
+  if [[ "$started_ns" != "0" ]]; then
+    local now_ns
+    now_ns=$(date +%s%N 2>/dev/null || echo 0)
+    if [[ "$now_ns" != "0" ]]; then
+      elapsed=$(( (now_ns - started_ns) / 1000000000 ))
+      if (( elapsed >= RESERVE_SLOW_WARN_SECONDS )); then
+        echo "    ⚠️  reservation for #$1 took ${elapsed}s (warn threshold ${RESERVE_SLOW_WARN_SECONDS}s) — something O(n) may be inside the state lock again." >&2
+      fi
+    fi
+  fi
+
+  printf '%s\n' "$out"
+  return "$rc"
 }
 
 # Resolve the report number and score the worker ACTUALLY produced.
@@ -605,6 +722,23 @@ resolve_worker_result() {
 }
 
 # Process a single offer
+# Return the path of the report already written for this offer, if there is
+# exactly one. Empty when none exists or the Batch ID stamp is ambiguous.
+#
+# The uniqueness requirement is not optional: batch-input.tsv has been
+# regenerated repeatedly, so low ids are reused and id 1 currently matches 21
+# reports going back to May. Accepting the first match would bind a current
+# offer to an unrelated historical report.
+find_existing_report_for_offer() {
+  local offer_id="$1"
+  [[ -n "$offer_id" ]] || return 0
+  local matches count
+  matches=$(grep -l -- "^\*\*Batch ID:\*\* ${offer_id}\$" "$REPORTS_DIR"/*.md 2>/dev/null || true)
+  count=$(printf '%s' "$matches" | grep -c . || true)
+  [[ "${count:-0}" -eq 1 ]] && printf '%s\n' "$matches"
+  return 0
+}
+
 process_offer() {
   local id="$1" url="$2" source="$3" notes="$4"
 
@@ -612,6 +746,35 @@ process_offer() {
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   local retries
   retries=$(get_retries "$id")
+
+  # Pre-flight duplicate guard: never spend a worker on an offer that already
+  # has a report on disk.
+  #
+  # Every duplicate evaluation so far has come through this hole. A state write
+  # is lost to lock contention, the row stays "processing", sweep_orphans
+  # cannot promote it because the worker log has no parsable JSON, and the next
+  # run evaluates the offer from scratch. Bankjoy (#1341) went that way on
+  # 2026-08-11: report 3193 already existed, the 04:00 resolver even identified
+  # it, and 22:00 still produced report 3210. Codal went the same way on
+  # 2026-08-07 (2578 -> 3148).
+  #
+  # Checking the filesystem is authoritative in a way the log is not: if a
+  # report carrying this offer's Batch ID exists, the evaluation happened,
+  # regardless of what any log does or does not say. Recording it as completed
+  # both stops the re-run and repairs the state row to point at the real report.
+  local existing_report
+  existing_report=$(find_existing_report_for_offer "$id")
+  if [[ -n "$existing_report" && -f "$existing_report" ]]; then
+    local existing_num existing_score
+    existing_num=$(basename "$existing_report" | sed -nE 's/^([0-9]+)-.*/\1/p')
+    existing_score=$(sed -nE 's@^\*\*Score:\*\*[[:space:]]*([0-9]+(\.[0-9]+)?)/5.*@\1@p' "$existing_report" 2>/dev/null | head -1 || true)
+    is_decimal_number "${existing_score:-}" || existing_score="-"
+    echo "--- Skipping offer #$id: already evaluated as report $existing_num ($(basename "$existing_report"))"
+    update_state "$id" "$url" "completed" "$started_at" \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$existing_num" "$existing_score" \
+      "pre-flight: report already on disk, no re-evaluation" "$retries"
+    return 0
+  fi
   # Reserve a report number AND persist the "processing" state row before doing
   # any expensive work. reserve_report_num can come back empty (lock-acquire
   # timeout) or the row can fail to land under a parallel burst; treat the
@@ -947,7 +1110,20 @@ sweep_orphans() {
     # Only recover if the worker JSON shows completion. Empty / partial logs
     # (silent worker death) stay as "processing" so the human can decide
     # whether to mark them failed and retry.
-    grep -q '"status": "completed"' "$log" || continue
+    # Completion signal, most reliable first:
+    #   1. a report on disk carrying this offer's Batch ID — authoritative,
+    #      and survives a worker log that never captured its JSON (which is
+    #      exactly what stranded Bankjoy #1341 on 2026-08-11)
+    #   2. the worker's own JSON status, matched whitespace-tolerantly.
+    #      The old check was the literal '"status": "completed"' with exactly
+    #      one space, so a worker emitting '"status":"completed"' was silently
+    #      skipped and its offer re-evaluated.
+    local swept_report
+    swept_report=$(find_existing_report_for_offer "$id")
+    if [[ -z "$swept_report" ]] \
+      && ! grep -qE '"status"[[:space:]]*:[[:space:]]*"completed"' "$log"; then
+      continue
+    fi
 
     # Freshness check: skip rows where the worker MAY still be holding/queuing
     # for the state lock. Skipped entirely at end-of-batch (all workers reaped).
@@ -961,8 +1137,19 @@ sweep_orphans() {
     fi
 
     local recovered_score recovered_report recovered_ts
-    recovered_score=$(grep '"score":' "$log" | head -1 | sed -E 's/.*"score": ([0-9.]+).*/\1/')
-    recovered_report=$(grep '"report_num":' "$log" | head -1 | sed -E 's/.*"report_num": "?([0-9]+)"?.*/\1/')
+    # Whitespace-tolerant, and falling back to the report on disk when the log
+    # carried no usable JSON. Without the fallback a promoted row could land
+    # with an empty report number and score.
+    recovered_score=$(sed -nE 's/.*"score"[[:space:]]*:[[:space:]]*"?([0-9]+(\.[0-9]+)?)"?.*/\1/p' "$log" | tail -1)
+    recovered_report=$(sed -nE 's/.*"report_num"[[:space:]]*:[[:space:]]*"?([0-9]+)"?.*/\1/p' "$log" | tail -1)
+    if [[ -n "$swept_report" && -f "$swept_report" ]]; then
+      [[ -n "$recovered_report" ]] || recovered_report=$(basename "$swept_report" | sed -nE 's/^([0-9]+)-.*/\1/p')
+      if ! is_decimal_number "${recovered_score:-}"; then
+        recovered_score=$(sed -nE 's@^\*\*Score:\*\*[[:space:]]*([0-9]+(\.[0-9]+)?)/5.*@\1@p' "$swept_report" | head -1)
+      fi
+    fi
+    is_decimal_number "${recovered_score:-}" || recovered_score="-"
+    [[ -n "$recovered_report" ]] || recovered_report="-"
     recovered_ts=$(date -u -r "$log" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
 
     # Preserve started_at + url + retries from the existing row
@@ -1216,6 +1403,9 @@ main() {
   # are left alone and still get re-processed below, which is what we want.
   if [[ "$DRY_RUN" != "true" ]]; then
     sweep_orphans "startup"
+    # Rebuild the report-number counter once, here, so no per-offer reservation
+    # has to scan the reports directory.
+    reconcile_report_high_water
   fi
 
   # Build list of offers to process
