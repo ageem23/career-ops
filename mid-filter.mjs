@@ -31,7 +31,7 @@ import { readFileSync, writeFileSync, copyFileSync, unlinkSync, mkdirSync, exist
 import path from 'path';
 import os from 'os';
 import { createHash } from 'crypto';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 
 // Load .env so ANTHROPIC_API_KEY is visible — without this, hasSemanticBackend()
 // falls through to the CLI path even when the user has the key configured.

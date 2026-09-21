@@ -7,8 +7,18 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/santifer/career-ops/dashboard/internal/i18n"
+	"github.com/santifer/career-ops/dashboard/internal/model"
 	"github.com/santifer/career-ops/dashboard/internal/theme"
 )
+
+func TestViewerCurrentStatusPairsLeadsWithRowStatus(t *testing.T) {
+	m := ViewerModel{app: model.CareerApplication{Status: "Interview"}}
+
+	pairs := m.currentStatusPairs()
+	if len(pairs) == 0 || pairs[0].Canonical != "Interview" {
+		t.Fatalf("currentStatusPairs()[0] = %+v, want Interview leading", pairs[0])
+	}
+}
 
 func TestViewerRebuildRenderClampsScrollOffset(t *testing.T) {
 	m := ViewerModel{
@@ -47,7 +57,7 @@ func TestViewerStatusPickerRendersOnce(t *testing.T) {
 	if got := strings.Count(view, i18n.Current.PickerChangeStatus); got != 1 {
 		t.Fatalf("expected picker heading once, got %d", got)
 	}
-	for _, pair := range getStatusPairs() {
+	for _, pair := range getStatusPairs("") {
 		label := pair.Display + " (" + strings.ToUpper(pair.Shortcut) + ")"
 		if got := strings.Count(view, label); got != 1 {
 			t.Fatalf("expected status option %q once, got %d", label, got)

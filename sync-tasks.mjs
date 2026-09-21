@@ -21,9 +21,10 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
-const TASKS_FILE = join(CAREER_OPS, 'data/tasks.md');
+const TASKS_FILE = join(getCareerOpsRoot(), 'data/tasks.md');
 const CADENCE_SCRIPT = join(CAREER_OPS, 'followup-cadence.mjs');
 
 const args = process.argv.slice(2);

@@ -7,7 +7,10 @@
  * newly introduced system paths without touching user data.
  */
 
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync, rmSync } from 'fs';
+import { execFileSync, spawnSync } from 'child_process';
+import { dirname, join } from 'path';
+import { createReexecMarker, consumeReexecMarker } from './update-system.mjs';
 
 let passed = 0;
 let failed = 0;
@@ -22,6 +25,11 @@ function fail(message) {
   failed++;
 }
 
+function applyFailure(result) {
+  const stderr = String(result?.stderr ?? '').trim().replace(/\s+/g, ' ');
+  return `status=${String(result?.status)}${stderr ? ` stderr=${stderr.slice(0, 240)}` : ''}`;
+}
+
 let source = '';
 try {
   source = readFileSync('update-system.mjs', 'utf-8');
@@ -29,6 +37,51 @@ try {
 } catch (error) {
   fail(`update-system.mjs is readable: ${error.message}`);
   process.exit(1);
+}
+
+// test-all runs this suite from a throwaway copy nested inside the real
+// checkout. Give that copy its own tiny repository so update-system's
+// production guard can distinguish a valid fixture from an install whose git
+// operations would escape into an enclosing repository.
+//
+// That repository is scaffolding for this suite alone, so it is removed again
+// on exit. test-all runs every smoke script from the SAME shared copy, and a
+// `.git` left behind makes that copy a checkout of its own for every script
+// after this one: `update-system.mjs check` then passes its nested-install
+// guard and fetches upstream main into the empty fixture repository - a full
+// clone over the network inside the smoke matrix, killed at the shared 30s
+// budget on any connection slow enough (`exit null, signal SIGTERM`).
+//
+// Removal is keyed on whether `.git` existed BEFORE this script ran, never on
+// the toplevel comparison below. That comparison is unreliable (#3732: on
+// Windows it never matches, so the init branch runs inside the real checkout),
+// and a cleanup keyed on it could delete a real repository. A `.git` this
+// script did not create is never touched, a linked worktree's `.git` file
+// included. The handler is registered before `git init` so a setup that fails
+// halfway still leaves the copy as it found it.
+try {
+  const cwd = process.cwd();
+  const toplevel = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8' }).trim();
+  if (toplevel !== cwd) {
+    const fixtureGitDir = join(cwd, '.git');
+    if (!existsSync(fixtureGitDir)) {
+      process.on('exit', () => {
+        try {
+          rmSync(fixtureGitDir, { recursive: true, force: true });
+        } catch (error) {
+          console.error(`FAIL migration fixture cleanup: ${error.message}`);
+          process.exitCode = 1;
+        }
+      });
+    }
+    execFileSync('git', ['init', '-q'], { cwd });
+    execFileSync('git', ['config', 'user.email', 'tests@example.invalid'], { cwd });
+    execFileSync('git', ['config', 'user.name', 'career-ops tests'], { cwd });
+    execFileSync('git', ['add', 'update-system.mjs', 'updater-migration-tests.mjs', 'AGENTS.md'], { cwd });
+    execFileSync('git', ['commit', '-qm', 'test fixture'], { cwd });
+  }
+} catch (error) {
+  fail(`migration fixture git setup: ${error.message}`);
 }
 
 function extractArray(name) {
@@ -44,6 +97,144 @@ function extractArray(name) {
 const systemPaths = extractArray('SYSTEM_PATHS');
 const userPaths = extractArray('USER_PATHS');
 const bootstrapPaths = extractArray('BOOTSTRAP_PATHS');
+
+if (/const updateConfirmed = process\.argv\.includes\('--confirm'\)[\s\S]{0,160}isReexec/.test(source) &&
+    /Installation requires explicit confirmation/.test(source) &&
+    /'apply',\s*'--confirm'/.test(source) &&
+    /CAREER_OPS_UPDATE_REEXEC_MARKER/.test(source) &&
+    /function isLegacyReexec/.test(source)) {
+  pass('apply requires explicit confirmation and carries it through authenticated and legacy self-reexec');
+} else {
+  fail('apply does not require explicit confirmation or propagate it safely through self-reexec');
+}
+
+function runApplyWithEnv(env, args = ['apply']) {
+  // The migration suite runs from a throwaway copy, which may inherit a stale
+  // lock from another fixture or an interrupted prior run. Each initial
+  // invocation must start from the same lock-free state so the assertions
+  // below test the child, not test-order residue.
+  rmSync('.update-lock', { force: true, recursive: true });
+  return spawnSync(process.execPath, ['update-system.mjs', ...args], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      CAREER_OPS_UPDATE_CONFIRM: '',
+      CAREER_OPS_UPDATE_FORCE: '',
+      CAREER_OPS_UPDATE_REEXEC: '',
+      CAREER_OPS_UPDATE_BACKUP_BRANCH: '',
+      CAREER_OPS_UPDATE_REEXEC_MARKER: '',
+      CAREER_OPS_UPDATE_REEXEC_TOKEN: '',
+      ...env,
+    },
+  });
+}
+
+const envOnlyConfirmation = runApplyWithEnv({
+  CAREER_OPS_UPDATE_CONFIRM: '1',
+  CAREER_OPS_UPDATE_REEXEC: '',
+});
+if (envOnlyConfirmation.status !== 0 &&
+    /Installation requires explicit confirmation/.test(envOnlyConfirmation.stderr)) {
+  pass('environment-only confirmation cannot authorize initial apply');
+} else {
+  fail(`environment-only confirmation can authorize initial apply (${applyFailure(envOnlyConfirmation)})`);
+}
+
+const envOnlyForce = runApplyWithEnv({
+  CAREER_OPS_UPDATE_FORCE: '1',
+  CAREER_OPS_UPDATE_REEXEC: '',
+});
+if (envOnlyForce.status !== 0 &&
+    /Installation requires explicit confirmation/.test(envOnlyForce.stderr)) {
+  pass('environment-only force cannot authorize initial apply');
+} else {
+  fail(`environment-only force can authorize initial apply (${applyFailure(envOnlyForce)})`);
+}
+
+const forceWithoutConfirmation = runApplyWithEnv({}, ['apply', '--force']);
+if (forceWithoutConfirmation.status !== 0 &&
+    /Installation requires explicit confirmation/.test(forceWithoutConfirmation.stderr)) {
+  pass('force without confirmation cannot authorize initial apply');
+} else {
+  fail(`force without confirmation can authorize initial apply (${applyFailure(forceWithoutConfirmation)})`);
+}
+
+const forgedReexec = runApplyWithEnv({
+  CAREER_OPS_UPDATE_REEXEC_MARKER: '/tmp/career-ops-reexec-forged/marker',
+  CAREER_OPS_UPDATE_REEXEC_TOKEN: 'forged',
+  CAREER_OPS_UPDATE_CONFIRM: '1',
+});
+if (forgedReexec.status !== 0 &&
+    /Installation requires explicit confirmation/.test(forgedReexec.stderr)) {
+  pass('forged reexec marker cannot authorize initial apply');
+} else {
+  fail(`forged reexec marker can authorize initial apply (${applyFailure(forgedReexec)})`);
+}
+
+const legacyBranch = `backup-pre-update-99.99.99-${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')}`;
+const createdLegacyBranch = spawnSync('git', ['branch', legacyBranch, 'HEAD'], { encoding: 'utf8' });
+const forgedLegacyReexec = runApplyWithEnv({
+  CAREER_OPS_UPDATE_REEXEC: '1',
+  CAREER_OPS_UPDATE_BACKUP_BRANCH: legacyBranch,
+  CAREER_OPS_UPDATE_CONFIRM: '1',
+});
+if (createdLegacyBranch.status !== 0) {
+  fail(`could not create the matching backup branch fixture: ${createdLegacyBranch.stderr}`);
+} else if (forgedLegacyReexec.status !== 0 &&
+    /Installation requires explicit confirmation/.test(forgedLegacyReexec.stderr)) {
+  pass('legacy reexec with a matching backup branch still needs an active parent lock');
+} else {
+  fail(`legacy reexec with a matching backup branch can authorize initial apply without an active parent lock (${applyFailure(forgedLegacyReexec)})`);
+}
+if (createdLegacyBranch.status === 0) {
+  spawnSync('git', ['branch', '-D', legacyBranch], { encoding: 'utf8' });
+}
+
+const marker = createReexecMarker();
+const previousMarkerPath = process.env.CAREER_OPS_UPDATE_REEXEC_MARKER;
+const previousMarkerToken = process.env.CAREER_OPS_UPDATE_REEXEC_TOKEN;
+try {
+  process.env.CAREER_OPS_UPDATE_REEXEC_MARKER = marker.path;
+  process.env.CAREER_OPS_UPDATE_REEXEC_TOKEN = marker.token;
+  const firstConsume = consumeReexecMarker();
+  const secondConsume = consumeReexecMarker();
+  if (firstConsume && !secondConsume && !existsSync(marker.path)) {
+    pass('created reexec marker authorizes exactly once');
+  } else {
+    fail('created reexec marker does not authorize exactly once');
+  }
+} finally {
+  if (previousMarkerPath === undefined) delete process.env.CAREER_OPS_UPDATE_REEXEC_MARKER;
+  else process.env.CAREER_OPS_UPDATE_REEXEC_MARKER = previousMarkerPath;
+  if (previousMarkerToken === undefined) delete process.env.CAREER_OPS_UPDATE_REEXEC_TOKEN;
+  else process.env.CAREER_OPS_UPDATE_REEXEC_TOKEN = previousMarkerToken;
+  rmSync(dirname(marker.path), { recursive: true, force: true });
+}
+
+// Every concrete (non-directory) manifest entry (SYSTEM_PATHS or
+// BOOTSTRAP_PATHS) must exist in the working tree. A path deleted upstream
+// but left in the manifest survives as a permanent `error: pathspec ...` in
+// every user's upgrade output (#2002). Directory entries (trailing '/') are
+// exempt: git checkout of a directory pathspec tolerates content drift
+// inside it. Add an entry to ALLOWED_MISSING_ENTRIES only with a comment
+// justifying why it may legitimately be absent.
+const ALLOWED_MISSING_ENTRIES = new Set([
+  // Kept in SYSTEM_PATHS for one release so staleSystemFiles() prunes the
+  // retired suite during upgrades after it moved into tests/.
+  'lib/context-budget.test.mjs',
+]);
+for (const [listName, entries] of [['SYSTEM_PATHS', systemPaths], ['BOOTSTRAP_PATHS', bootstrapPaths]]) {
+  for (const entry of entries) {
+    if (entry.endsWith('/')) continue;
+    if (ALLOWED_MISSING_ENTRIES.has(entry)) continue;
+    if (existsSync(entry)) {
+      pass(`${listName} entry exists on disk: ${entry}`);
+    } else {
+      fail(`${listName} entry missing from tree (stale manifest entry, #2002): ${entry}`);
+    }
+  }
+}
 
 const requiredSystemPaths = [
   'modes/email.md',
@@ -64,6 +255,7 @@ const requiredSystemPaths = [
   '.qwen/',
   '.antigravitycli/skills/',
   '.grok/skills/',
+  '.cursor/skills/',
   'tracker-columns-tests.mjs',
   'updater-migration-tests.mjs',
   'README.ar.md',
@@ -81,6 +273,7 @@ const requiredSystemPaths = [
 
 const requiredBootstrapPaths = [
   '.agents/',
+  '.cursor/skills/',
   '.opencode/skills/',
   '.antigravitycli/skills/',
   '.grok/skills/',
@@ -122,7 +315,7 @@ const twoPassManifestChecks = [
   },
   {
     name: 'apply re-execs through the current Node binary',
-    pattern: /execFileSync\(process\.execPath,\s*\[\s*'update-system\.mjs',\s*'apply'\s*\]/,
+    pattern: /execFileSync\(process\.execPath,\s*\[[\s\S]*?'update-system\.mjs',\s*'apply',\s*'--confirm'/,
   },
   {
     name: 'apply carries the original backup branch across re-exec',
@@ -146,19 +339,111 @@ const twoPassManifestChecks = [
   },
   {
     name: 'revertPaths uses git checkout HEAD (not just --) to reset index+worktree (#915)',
-    pattern: /git\('checkout',\s*'HEAD',\s*'--'/,
+    pattern: /\b(?:git|runGit)\('checkout',\s*'HEAD',\s*'--'/,
   },
   {
-    name: 'apply commit is scoped to update paths, not bare commit (#915)',
-    pattern: /git\('commit',\s*'-m',[^)]+'--',\s*\.\.\.pathsToStage\)/,
+    name: 'apply commit is scoped to expanded update files, not directories (#3504)',
+    pattern: /git\('commit',\s*'-m',[^)]+'--',\s*\.\.\.expandedPathsToStage\)/,
   },
   {
-    name: 'rollback commit is scoped to rollback paths, not bare commit (#915)',
-    pattern: /git\('commit',\s*'-m',[^)]+'--',\s*\.\.\.rollbackPaths\)/,
+    name: 'rollback commit is scoped to expanded backup files, not directories (#3504)',
+    pattern: /git\('commit',\s*'-m',[^)]+'--',\s*\.\.\.expandedRollbackPaths\)/,
   },
   {
     name: 'apply captures uncommitted work via git stash create before branching (#915)',
     pattern: /git\('stash',\s*'create'\)/,
+  },
+  {
+    // A client whose manifest predates the target checks out only its own
+    // paths, so everything added upstream since is silently absent and apply
+    // still printed "Update complete" (#1998).
+    name: 'apply verifies the target manifest materialized before claiming success (#1998)',
+    pattern: /missingFromTargetManifest\(remoteSystemPaths\)/,
+  },
+  {
+    name: 'an incomplete apply exits non-zero instead of reporting success (#1998)',
+    pattern: /Update incomplete[\s\S]{0,600}?process\.exit\(1\)/,
+  },
+  {
+    // execFileSync inherits stderr, so an expected per-path skip printed git's
+    // raw pathspec error right before the success banner (#1998).
+    // The trailing spread is the #2337 preserve-exclusions; the property this
+    // pins is the runner (gitQuiet, not git) and the ref, not the arity.
+    name: 'per-path checkout pipes stderr so expected skips stay quiet (#1998)',
+    pattern: /gitQuiet\('checkout',\s*'FETCH_HEAD',\s*'--',\s*path(?:,\s*\.\.\.\w+)?\)/,
+  },
+  {
+    // #2337: a system file this install edited must be listed and backed up
+    // before the checkout, not overwritten in silence.
+    name: 'locally edited system files are detected before checkout (#2337)',
+    pattern: /const atRisk = locallyModifiedSystemFiles\(updatePaths, 'FETCH_HEAD'\)/,
+  },
+  {
+    name: 'the local copy is saved as .bak before any overwrite (#2337)',
+    // backupSystemFiles owns the byte copy for both the normal update and the
+    // earlier self-bootstrap overwrite (#3207); pin the normal call site here.
+    pattern: /backupSystemFiles\(atRisk\)/,
+  },
+  {
+    name: 'overwriting a locally edited system file requires --force (#2337)',
+    pattern: /updateForce[\s\S]{0,400}?preservedPaths\.push\(\.\.\.atRisk\)/,
+  },
+  {
+    // Excluded paths must stay out of the scoped commit too, or the
+    // "auto-update" commit records the very edit the user kept (#2337).
+    name: 'preserved paths are excluded from the update commit (#2337)',
+    pattern: /pathsToStage = \[\.\.\.updated, \.\.\.preserveSpecs\]/,
+  },
+  {
+    name: 'skipped upstream-absent paths are summarized explicitly (#1998)',
+    pattern: /Skipped \$\{skippedPaths\.length\} path\(s\) absent upstream/,
+  },
+  {
+    // existsSync on a pre-existing directory (docs/) would call it materialized
+    // even when the target added files under it — the verification must recurse
+    // into directory entries against FETCH_HEAD (#1998 CodeRabbit review).
+    name: 'manifest verification recurses into directory entries via ls-tree (#1998)',
+    pattern: /ls-tree', '-r', '--name-only', 'FETCH_HEAD'[\s\S]{0,400}?treeFiles\.some\(f => !existsSync/,
+  },
+  {
+    // A checkout failure is only an expected skip when the path is truly absent
+    // from FETCH_HEAD; timeouts/permission errors must rethrow, not report
+    // success (#1998 CodeRabbit review).
+    name: 'a checkout failure only skips when the path is absent upstream, else rethrows (#1998)',
+    pattern: /catch \{ absentUpstream = true; \}\s*if \(!absentUpstream\) throw err;/,
+  },
+  {
+    // `git checkout HEAD -- docs/` restores tracked content but never removes
+    // paths HEAD lacks, so files the update introduced under a directory
+    // pathspec survived the rollback as staged additions (#2015).
+    name: 'revertPaths clears additions HEAD lacks under a directory pathspec (#2015)',
+    pattern: /removeAdditionsNotInHead\(p, protectedPaths, ctx\)/,
+  },
+  {
+    name: 'removeAdditionsNotInHead only targets additions, never modifications (#2015)',
+    pattern: /'--diff-filter=A'/,
+  },
+  {
+    // The cleanup must not delete a file the user already had staged before the
+    // update ran, only additions the update itself introduced (#2015 review).
+    name: 'rollback cleanup skips pre-update staged paths (protectedPaths) (#2015)',
+    pattern: /if \(protectedPaths\.has\(file\)\) continue;/,
+  },
+  {
+    name: 'revertPaths receives the pre-update snapshot at its call sites (#2015)',
+    pattern: /revertPaths\(updated, initialStatusPaths\)/,
+  },
+  {
+    // -z output is NUL-delimited/unquoted, so a path with spaces or newlines is
+    // not mangled by split('\n').trim() (#2015 review).
+    name: 'rollback cleanup parses NUL-delimited git output (#2015)',
+    pattern: /'--cached', '-z', '--name-only', '--diff-filter=A'[\s\S]*?added\.split\('\\0'\)\.filter/,
+  },
+  {
+    // The worktree file is deleted only after git rm succeeds, so a failed
+    // index removal never strands a staged addition with no file (#2015).
+    name: 'rollback deletes the worktree copy only after a successful git rm (#2015)',
+    pattern: /removed = true;[\s\S]{0,400}?if \(removed\) \{[\s\S]{0,80}?rmSync/,
   },
 ];
 
@@ -191,6 +476,10 @@ const allowedSystemUserOverlap = new Set([
   // the updater ships these two, but never the real session files alongside them.
   'interview-prep/sessions/.gitkeep',
   'interview-prep/sessions/README.md',
+  // Same pattern for the user-layer documents/ intake dir (#1723): the
+  // updater ships the scaffold, never the user's source documents.
+  'documents/.gitkeep',
+  'documents/README.md',
 ]);
 let hasSystemUserCollision = false;
 for (const systemPath of systemPaths) {

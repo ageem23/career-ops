@@ -27,12 +27,16 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
-const TASKS_FILE = join(CAREER_OPS, 'data/tasks.md');
-const APPS_FILE = existsSync(join(CAREER_OPS, 'data/applications.md'))
-  ? join(CAREER_OPS, 'data/applications.md')
-  : join(CAREER_OPS, 'applications.md');
+// User data resolves from the data root (CAREER_OPS_ROOT when set), not the
+// code checkout — the same rule every upstream writer follows.
+const DATA_ROOT = getCareerOpsRoot();
+const TASKS_FILE = join(DATA_ROOT, 'data/tasks.md');
+const APPS_FILE = existsSync(join(DATA_ROOT, 'data/applications.md'))
+  ? join(DATA_ROOT, 'data/applications.md')
+  : join(DATA_ROOT, 'applications.md');
 
 const ALLOWED_TYPES = new Set(['followup', 'contact', 'interview', 'manual']);
 

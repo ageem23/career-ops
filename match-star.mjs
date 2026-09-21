@@ -15,7 +15,7 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
-import { fileURLToPath } from 'url';
+import { isMainModule } from './lib/is-main-module.mjs';
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -95,7 +95,16 @@ function parseStories(content) {
  * @returns {string[]}
  */
 function tokenize(text) {
-  return text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+  // Letters, marks and digits of ANY script. The previous `[^a-z0-9\s]` class
+  // deleted every non-Latin character, so a story bank written in Russian,
+  // Hindi, Greek or Ukrainian tokenized to [] and scored 0 against a question
+  // in the same language — the matcher was inert, not degraded, for anyone whose
+  // `language.output` is not English (#2847).
+  //
+  // \p{M} is included deliberately: without it Devanagari matras become spaces
+  // and shatter a word into fragments that match nothing (the mistake caught in
+  // #2781's review of the sibling role tokenizer).
+  return text.toLowerCase().replace(/[^\p{L}\p{M}\p{N}\s]/gu, ' ').split(/\s+/).filter(Boolean);
 }
 
 const STOPWORDS = new Set([
@@ -117,10 +126,12 @@ function score(story, queryTokens, jdTokens) {
   const signal = queryTokens.filter(t => !STOPWORDS.has(t));
   let s = 0;
 
-  // Tag match: highest weight (tags are explicit "best for" labels)
-  const tagText = story.tags.join(' ');
+  // Tag match: highest weight (tags are explicit "best for" labels).
+  // Tokenized exact membership (mirrors the JD-boost path below) so short query
+  // tokens (ai, ml, go, qa…) can't spuriously collide inside longer tag words.
+  const tagTokens = new Set(story.tags.flatMap(tokenize));
   for (const token of signal) {
-    if (tagText.includes(token)) s += 3;
+    if (tagTokens.has(token)) s += 3;
   }
 
   // Title/theme match
@@ -188,7 +199,7 @@ export { parseStories, tokenize, score, STOPWORDS };
 
 // ── Main ─────────────────────────────────────────────────────────────
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isMainModule(import.meta.url)) {
 if (!existsSync(STORY_BANK_PATH)) {
   console.error(`Error: ${STORY_BANK_PATH} not found.`);
   console.error('Run /career-ops interview-prep on a role first to populate your story bank.');

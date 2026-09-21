@@ -256,7 +256,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				// Compare through NormalizeStatus: it returns the lowercase
 				// canonical form, so matching pair.Canonical ("Hired") raw
 				// would never hit and the picker would open unpositioned.
-				for idx, pair := range getStatusPairs() {
+				for idx, pair := range m.currentStatusPairs() {
 					if data.NormalizeStatus(pair.Canonical) == currentNorm {
 						m.statusCursor = idx
 						break
@@ -356,8 +356,8 @@ func (m ViewerModel) handleStatusPicker(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
 
 	case "down", "j":
 		m.statusCursor++
-		if m.statusCursor >= len(getStatusPairs()) {
-			m.statusCursor = len(getStatusPairs()) - 1
+		if m.statusCursor >= len(m.currentStatusPairs()) {
+			m.statusCursor = len(m.currentStatusPairs()) - 1
 		}
 
 	case "up", "k":
@@ -368,7 +368,7 @@ func (m ViewerModel) handleStatusPicker(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
 
 	case "enter":
 		m.statusPicker = false
-		newStatus := getStatusPairs()[m.statusCursor].Canonical
+		newStatus := m.currentStatusPairs()[m.statusCursor].Canonical
 		app := m.app
 		return m, func() tea.Msg {
 			return ViewerUpdateStatusMsg{
@@ -380,7 +380,7 @@ func (m ViewerModel) handleStatusPicker(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
 	default:
 		key := strings.ToLower(msg.String())
 		if len(key) == 1 {
-			for i, pair := range getStatusPairs() {
+			for i, pair := range m.currentStatusPairs() {
 				if pair.Shortcut == key {
 					m.statusCursor = i
 					m.statusPicker = false
@@ -429,7 +429,7 @@ func (m ViewerModel) overlayAddTaskPrompt(body string) string {
 func (m ViewerModel) bodyHeight() int {
 	h := m.height - 4 // header + footer + padding
 	if m.statusPicker {
-		h -= (len(getStatusPairs()) + 1)
+		h -= (len(m.currentStatusPairs()) + 1)
 	}
 	if h < 3 {
 		h = 3
@@ -464,7 +464,7 @@ func (m ViewerModel) overlayStatusPicker(body string) string {
 	var picker []string
 	picker = append(picker, padStyle.Render(borderStyle.Render(i18n.Current.PickerChangeStatus)))
 
-	for i, pair := range getStatusPairs() {
+	for i, pair := range m.currentStatusPairs() {
 		style := lipgloss.NewStyle().Foreground(m.theme.Text).Width(pickerWidth)
 		if i == m.statusCursor {
 			style = style.Background(m.theme.Overlay).Bold(true)
@@ -1057,4 +1057,11 @@ func wordWrap(text string, width int) []string {
 		lines = append(lines, current.String())
 	}
 	return lines
+}
+
+// currentStatusPairs resolves the status-change picker options for the
+// application currently open in the viewer, so the picker leads with this
+// row's own status (see getStatusPairs).
+func (m ViewerModel) currentStatusPairs() []StatusPair {
+	return getStatusPairs(data.NormalizeStatus(m.app.Status))
 }

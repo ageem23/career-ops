@@ -4,6 +4,20 @@
 <meta charset="UTF-8">
 <title>Cover Letter — {{NAME}}</title>
 <style>
+  /* Themeable tokens (#1837): overridable via config/profile.yml `style:`, which
+     the PDF pipeline injects as a later :root block. Defaults reproduce the
+     original hardcoded values, so a profile without a `style:` block is unchanged. */
+  :root {
+    --accent-color: #1A56A0;
+    --font-family: "Helvetica", Arial, sans-serif;
+    --font-size: 10pt;
+    /* Matches generate-pdf.mjs's PDF_PAGE_MARGIN — the actual PDF page margin
+       comes from the later @page rule injectPrintPageCss appends (which reads
+       this same variable), so this default must match it exactly. */
+    --page-margin: 0.6in;
+  }
+  @page { margin: var(--page-margin); }
+
   * {
     margin: 0;
     padding: 0;
@@ -23,8 +37,8 @@
   }
 
   body {
-    font-family: Helvetica, Arial, sans-serif;
-    font-size: 10pt;
+    font-family: var(--font-family);
+    font-size: var(--font-size);
     line-height: 1.4;
     color: #1a1a1a;
     background: #ffffff;
@@ -33,56 +47,35 @@
     font-feature-settings: "liga" 0, "clig" 0, "dlig" 0;
   }
 
-  /* === HEADER (mirrors the resume header) === */
-  .header {
-    text-align: center;
-    margin-bottom: 14px;
-  }
-
   .name {
-    font-family: Helvetica, Arial, sans-serif;
-    font-size: 28pt;
     font-weight: 700;
-    letter-spacing: 0.04em;
-    color: #000000;
-    text-transform: uppercase;
-    line-height: 1.1;
-    margin-bottom: 4px;
+    font-size: 14pt;
+    margin-bottom: 3pt;
   }
 
-  .header-title {
-    font-family: Helvetica, Arial, sans-serif;
-    font-size: 13pt;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    color: #0000FF;
-    text-transform: uppercase;
-    line-height: 1.2;
-    margin-bottom: 10px;
+  .contact, .credentials {
+    font-size: 9pt;
+    color: #666666;
+    line-height: 1.3;
+    margin-bottom: 2pt;
   }
 
-  .contact-line {
-    font-size: 10pt;
-    line-height: 1.5;
-    color: #000000;
-  }
-
-  .contact-line a, .credentials a, .footnotes a {
-    color: #1155cc;
-    text-decoration: underline;
-  }
-
-  .credentials {
-    font-size: 10pt;
-    line-height: 1.5;
-    color: #000000;
-    margin-top: 2pt;
+  .contact a, .credentials a, .footnotes a {
+    color: var(--accent-color);
+    text-decoration: none;
   }
 
   .divider {
     border: none;
     border-top: 0.5pt solid #cccccc;
     margin: 6pt 0 8pt;
+  }
+
+  .role-title {
+    font-weight: 700;
+    font-size: 11pt;
+    margin-top: 10pt;
+    margin-bottom: 2pt;
   }
 
   .dateline {
@@ -122,6 +115,11 @@
     margin-bottom: 8pt;
   }
 
+  .signature {
+    margin-top: 12pt;
+    margin-bottom: 8pt;
+  }
+
   .footnotes {
     margin-top: 10pt;
     padding-top: 4pt;
@@ -137,14 +135,12 @@
 </style>
 </head>
 <body>
-  <div class="header">
-    <div class="name">{{NAME}}</div>
-    <div class="header-title">{{ROLE_TITLE}}</div>
-    {{CONTACT_LINE}}
-    {{CREDENTIALS_BLOCK}}
-  </div>
+  <div class="name">{{NAME}}</div>
+  <div class="contact">{{CONTACT_LINE}}</div>
+  {{CREDENTIALS_BLOCK}}
   <hr class="divider">
 
+  <div class="role-title">Cover Letter: {{ROLE_TITLE}}</div>
   <div class="dateline">{{DATELINE}}</div>
 
   {{GREETING_BLOCK}}
@@ -156,6 +152,7 @@
   {{PROBLEMS_BLOCK}}
   {{CLOSING_BLOCK}}
   {{LANGUAGE_CLOSING_BLOCK}}
+  {{SIGNATURE_BLOCK}}
   {{FOOTNOTES_BLOCK}}
 </body>
 </html>

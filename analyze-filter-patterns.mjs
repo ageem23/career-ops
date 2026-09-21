@@ -35,6 +35,7 @@
 
 import { readFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './lib/is-main-module.mjs';
 
 const LOG_PATH = 'data/scan-semantic-log.tsv';
 
@@ -318,5 +319,4 @@ function main() {
   console.log('positive will let through noise; a bad negative will silently drop matches.');
 }
 
-const isCli = process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url);
-if (isCli) main();
+if (isMainModule(import.meta.url)) main();

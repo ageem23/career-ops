@@ -49,18 +49,45 @@ func resolveReportPath(careerOpsPath, trackerPath, link string) string {
 	return link
 }
 
+func getRepoRoot() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	current := cwd
+	for {
+		if _, err := os.Stat(filepath.Join(current, "path-resolver.mjs")); err == nil {
+			return current
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
+	}
+	return cwd
+}
+
+func resolveTrackerPath(careerOpsPath string) string {
+	if envTracker := strings.TrimSpace(os.Getenv("CAREER_OPS_TRACKER")); envTracker != "" {
+		if filepath.IsAbs(envTracker) {
+			return filepath.Clean(envTracker)
+		}
+		return filepath.Clean(filepath.Join(getRepoRoot(), envTracker))
+	}
+	dataPath := filepath.Clean(filepath.Join(careerOpsPath, "data", "applications.md"))
+	if _, err := os.Stat(dataPath); err == nil {
+		return dataPath
+	}
+	return filepath.Clean(filepath.Join(careerOpsPath, "applications.md"))
+}
+
 // ParseApplications reads applications.md and returns parsed applications.
-// It tries both {path}/applications.md and {path}/data/applications.md for compatibility.
 func ParseApplications(careerOpsPath string) []model.CareerApplication {
-	filePath := filepath.Join(careerOpsPath, "applications.md")
+	filePath := resolveTrackerPath(careerOpsPath)
 	content, err := os.ReadFile(filePath)
 	if err != nil {
-		// Fallback: try data/ subdirectory
-		filePath = filepath.Join(careerOpsPath, "data", "applications.md")
-		content, err = os.ReadFile(filePath)
-		if err != nil {
-			return nil
-		}
+		return nil
 	}
 
 	lines := strings.Split(string(content), "\n")
@@ -104,6 +131,7 @@ func ParseApplications(careerOpsPath string) []model.CareerApplication {
 			Date:    at("date"),
 			Company: at("company"),
 			Role:    at("role"),
+			JobURL:  at("url"),
 			Status:  at("status"),
 			HasPDF:  strings.Contains(at("pdf"), "\u2705"),
 		}
@@ -134,7 +162,9 @@ func ParseApplications(careerOpsPath string) []model.CareerApplication {
 		apps = append(apps, app)
 	}
 
-	// Enrich with job URLs using 5-tier strategy:
+	// Enrich with job URLs using the tracker URL as tier zero, followed by the
+	// legacy 5-tier strategy for trackers that predate the URL column:
+	// 0. URL column in the tracker
 	// 1. **URL:** field in report header (newest reports)
 	// 2. **Batch ID:** in report -> batch-input.tsv URL lookup
 	// 3. report_num -> batch-state completed mapping (legacy)
@@ -144,6 +174,9 @@ func ParseApplications(careerOpsPath string) []model.CareerApplication {
 	reportNumURLs := loadJobURLs(careerOpsPath)
 
 	for i := range apps {
+		if apps[i].JobURL != "" {
+			continue
+		}
 		if apps[i].ReportPath == "" {
 			continue
 		}
@@ -602,7 +635,7 @@ var trackerHeaderAliases = map[string]string{
 	"company": "company", "empresa": "company",
 	"via": "via", "role": "role", "puesto": "role",
 	"location": "location", "score": "score", "status": "status",
-	"pdf": "pdf", "report": "report", "notes": "notes",
+	"pdf": "pdf", "report": "report", "notes": "notes", "url": "url",
 }
 
 // legacyTrackerColumns is the original fixed layout in splitTrackerRow field
@@ -656,7 +689,6 @@ func resolveTrackerColumns(lines []string) map[string]int {
 	return legacyTrackerColumns
 }
 
-// UpdateApplicationStatus updates the status of an application in applications.md.
 func UpdateApplicationStatus(careerOpsPath string, app model.CareerApplication, newStatus string) error {
 	return UpdateApplicationStatusAndNotes(careerOpsPath, app, newStatus, "")
 }
@@ -831,6 +863,13 @@ func replaceStatusInLine(line, oldStatus, newStatus string, statusField int) (st
 // that doesn't match — e.g. a custom tracker layout — it falls back to the first
 // cell that equals want exactly. Matching is whole-cell and case-insensitive,
 // never a substring, so a status word inside an earlier cell is never hit.
+//
+// Final fallback: when neither check matches (the in-memory status went stale —
+// e.g. set-status.mjs or merge-tracker.mjs rewrote the row while the dashboard
+// was open), trust canonicalIdx anyway *if* its current content normalizes to a
+// recognized canonical status. That keeps the #1180 guarantee (never rewrite a
+// non-status cell) while dropping the requirement that the UI's snapshot of the
+// old status still matches the file.
 // Returns -1 when nothing matches, so the caller leaves the row untouched rather
 // than corrupt a guess.
 func statusCellIndex(cells []string, canonicalIdx int, want string) int {
@@ -842,7 +881,21 @@ func statusCellIndex(cells []string, canonicalIdx int, want string) int {
 			return i
 		}
 	}
+	if canonicalIdx >= 0 && canonicalIdx < len(cells) && isCanonicalStatusValue(cells[canonicalIdx]) {
+		return canonicalIdx
+	}
 	return -1
+}
+
+// isCanonicalStatusValue reports whether a cell's content reads as one of the
+// known tracker statuses (in any accepted spelling/language), i.e. whether it
+// is safe to treat the cell as the Status column.
+func isCanonicalStatusValue(cell string) bool {
+	switch NormalizeStatus(cell) {
+	case "evaluated", "applied", "responded", "interview", "offer", "hired", "rejected", "discarded", "skip":
+		return true
+	}
+	return false
 }
 
 // spliceCellValue swaps a cell's inner value while preserving its surrounding
@@ -978,7 +1031,9 @@ func ComputeProgressMetrics(apps []model.CareerApplication) model.ProgressMetric
 			}
 		}
 
-		if norm == "offer" {
+		// A hire proves an offer was received and accepted, so it counts here
+		// too — same reasoning as everOffer in stats.mjs's computeFunnel().
+		if norm == "offer" || norm == "hired" {
 			pm.TotalOffers++
 		}
 		if norm != "skip" && norm != "rejected" && norm != "discarded" {
@@ -992,14 +1047,22 @@ func ComputeProgressMetrics(apps []model.CareerApplication) model.ProgressMetric
 
 	// Funnel: each stage counts all apps that reached at least that stage.
 	// An app in "interview" has passed through evaluated -> applied -> responded -> interview.
+	// "hired" is terminal success and proves every earlier stage (a landed job
+	// proves the offer, the interviews, the response, and the submission), so it
+	// counts into all four tiers — matching computeFunnel() in stats.mjs, the
+	// canonical funnel definition, whose docstring already describes this exact
+	// math as mirroring this function.
 	total := len(apps)
-	applied := statusCounts["applied"] + statusCounts["responded"] + statusCounts["interview"] + statusCounts["offer"] + statusCounts["rejected"]
-	responded := statusCounts["responded"] + statusCounts["interview"] + statusCounts["offer"]
-	interview := statusCounts["interview"] + statusCounts["offer"]
-	offer := statusCounts["offer"]
+	applied := statusCounts["applied"] + statusCounts["responded"] + statusCounts["interview"] + statusCounts["offer"] + statusCounts["hired"] + statusCounts["rejected"]
+	responded := statusCounts["responded"] + statusCounts["interview"] + statusCounts["offer"] + statusCounts["hired"]
+	interview := statusCounts["interview"] + statusCounts["offer"] + statusCounts["hired"]
+	offer := statusCounts["offer"] + statusCounts["hired"]
 
+	// Top stage counts every tracked row, including rows backfilled without a
+	// score (#1799) — hence "Tracked", not "Evaluated", which already means both
+	// a status value and the Stats screen's scored count.
 	pm.FunnelStages = []model.FunnelStage{
-		{Label: "Evaluated", Count: total, Pct: 100.0},
+		{Label: "Tracked", Count: total, Pct: 100.0},
 		{Label: "Applied", Count: applied, Pct: safePct(applied, total)},
 		{Label: "Responded", Count: responded, Pct: safePct(responded, applied)},
 		{Label: "Interview", Count: interview, Pct: safePct(interview, applied)},

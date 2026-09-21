@@ -25,7 +25,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 
 const PORTALS_PATH = 'portals.yml';
 const PROFILE_DIR = join(homedir(), '.career-ops-auth', 'linkedin', 'profile');
