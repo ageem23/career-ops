@@ -47,6 +47,12 @@ const JDS_DIR = 'jds';
 const FEED_URL = 'https://www.linkedin.com/feed/';
 const LOGIN_URL = 'https://www.linkedin.com/login';
 
+// /feed is a heavy authenticated page. 30s was too tight whenever the browser
+// launched cold behind a long-running earlier step (e.g. the semantic title
+// check over ~2,000 titles), producing `page.goto: Timeout 30000ms exceeded`
+// on a session that was perfectly valid — see the ensureSession() note below.
+const FEED_TIMEOUT_MS = 90_000;
+
 const SELECTORS = {
   // Card listing — `div[data-job-id]` is the canonical wrapper LinkedIn uses
   // for each job card on the search page. The previous "Dismiss button →
@@ -64,7 +70,12 @@ const SELECTORS = {
   panelJdContent: '#job-details, .jobs-description__container, .jobs-box__html-content',
   panelMoreButton: '.jobs-description__footer-button button, button.jobs-description__footer-button',
 
-  loggedIn: 'a[aria-label*="My Network"]',
+  // Logged-in probe. Anchored on the nav href, not its aria-label: LinkedIn
+  // renamed that item "My Network" -> "Network" around 2026-09-17, which made
+  // every session read as expired (scans died for days on a valid login).
+  // The href is stable and locale-independent; the aria-label variants stay as
+  // fallbacks in case the nav markup changes again.
+  loggedIn: 'a[href*="/mynetwork"], a[aria-label*="My Network"], a[aria-label^="Network"]',
   xpathCurrentPage: "//button[@aria-current='true'][starts-with(@aria-label, 'Page')]",
   xpathPageButton: "//button[starts-with(@aria-label, 'Page')]",
 };
@@ -129,8 +140,26 @@ async function closeContext() {
 // same promise and proceed once it resolves.
 
 let loginInProgress = null;
+let sessionCheck = null;
 
+// Concurrent LinkedIn entries all call ensureSession() before scanning. Each
+// used to open its own page and load /feed, so five configured searches meant
+// five simultaneous authenticated feed loads against one persistent context.
+// That routinely blew the navigation budget and failed *every* search with
+// `page.goto: Timeout` while the saved session was still valid — the whole
+// executive-level search channel going dark on an intermittent race.
+//
+// Verify once and share the result; a failure clears the singleton so the next
+// caller (or the next run) retries rather than caching a transient timeout.
 async function ensureSession() {
+  if (!sessionCheck) {
+    sessionCheck = verifySession()
+      .catch(err => { sessionCheck = null; throw err; });
+  }
+  return sessionCheck;
+}
+
+async function verifySession() {
   // Fast path — current persistent context already has a live session.
   let ctx = await getContext({ headless: true });
   let page = await ctx.newPage();
@@ -205,7 +234,7 @@ async function isLoggedIn(page) {
 }
 
 async function checkSession(page) {
-  await page.goto(FEED_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.goto(FEED_URL, { waitUntil: 'domcontentloaded', timeout: FEED_TIMEOUT_MS });
   await sleep(3000);
   return isLoggedIn(page);
 }
