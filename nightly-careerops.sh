@@ -8,9 +8,14 @@
 #                                 wake-alarm path instead of unreliable Modern
 #                                 Standby wake; requires standby-timeout-ac=0
 #                                 so the machine is still awake at midnight)
-#   - "career-ops-nightly-late" → 04:00 daily (--no-scan --cap=40: leftovers + eval)
-# Each run logs to tmp/nightly-{date}[-late].log and writes a morning summary
-# to tmp/nightly-latest-summary.txt.
+#   - "career-ops-nightly-late" → 04:00 daily (--no-scan --late --cap=40: leftovers + eval)
+# Each run logs to its own file — tmp/nightly-{date}.log (scan), -eval.log
+# (22:00), or -late.log (04:00, pass --late) — and writes a morning summary to
+# tmp/nightly-latest-summary.txt. Before #(log-split), the 22:00 and 04:00 runs
+# both wrote to -late.log (both pass --no-scan with nothing to tell them apart),
+# so a run that slipped past midnight was indistinguishable from one that never
+# ran at all. --late is the only thing that tells the 04:00 job apart from the
+# 22:00 one; without it a --no-scan invocation is assumed to be the 22:00 run.
 #
 # Steps:
 #   1. node scan.mjs                          — zero-token portal scan (skipped with --no-scan; --scan-only stops after this step)
@@ -34,12 +39,14 @@ set -uo pipefail
 NO_SCAN=false
 NO_PREFLIGHT=false
 SCAN_ONLY=false
+LATE_RUN=false  # distinguishes the 04:00 catch-up run's log from the 22:00 run's
 CAP=20          # max offers imported+evaluated per run; override with --cap=N
 WAIT_SECS=""  # empty → auto-detect below; explicit value overrides
 for arg in "$@"; do
   case "$arg" in
     --no-scan) NO_SCAN=true ;;
     --scan-only) SCAN_ONLY=true ;;
+    --late) LATE_RUN=true ;;
     --cap=*) CAP="${arg#--cap=}" ;;
     --no-wait) WAIT_SECS=0 ;;
     --wait=*) WAIT_SECS="${arg#--wait=}" ;;
@@ -73,11 +80,17 @@ export PATH="/c/Users/magee/scoop/shims:/c/Users/magee/.local/bin:/c/Program Fil
 TS=$(date +%Y-%m-%d_%H%M%S)
 DATE=$(date +%Y-%m-%d)
 mkdir -p tmp
-if $NO_SCAN; then
+if $LATE_RUN; then
   LOG="tmp/nightly-$DATE-late.log"
+  RUN_LABEL="04:00 late run"
+elif $NO_SCAN; then
+  LOG="tmp/nightly-$DATE-eval.log"
+  RUN_LABEL="22:00 run"
 else
   LOG="tmp/nightly-$DATE.log"
+  RUN_LABEL="18:00 scan"
 fi
+export RUN_LABEL
 SUMMARY="tmp/nightly-latest-summary.txt"
 exec > >(tee -a "$LOG") 2>&1
 
@@ -138,7 +151,14 @@ if $NO_SCAN; then
 else
   echo ""
   echo "--- Step 1/3: portal scan ---"
-  node scan.mjs
+  # stdin from /dev/null so an expired provider session (LinkedIn) fails fast
+  # instead of opening a login prompt that blocks forever. Task Scheduler runs
+  # this as "Interactive/Background", so stdin IS a TTY and providers/linkedin.mjs
+  # takes its interactive doInteractiveLogin() branch — on 2026-09-15 and
+  # 2026-09-17 that hung the whole scan (zero listings both nights, one process
+  # left running ~2 days). With no TTY, verifySession() throws, LinkedIn logs 5
+  # errors, and the other 45 companies still scan.
+  node scan.mjs < /dev/null
 fi
 
 # --- Build scan-error banner for the morning summary ---
@@ -266,7 +286,7 @@ if [[ "$FIRST_NEW_ID" == "none" || -z "$FIRST_NEW_ID" ]]; then
     [[ "$STUCK_FAIL" -gt 0 ]] && bash batch/batch-runner.sh --parallel 3 --retry-failed --max-retries "$RETRY_CAP"
     RECOVERED_NOTE="No new offers; ran recovery on $STUCK_TOTAL stuck offer(s) (processing=$STUCK_PROC failed=$STUCK_FAIL) — see applications.md / batch logs."
     if [[ -n "$SUMMARY_APPEND" ]]; then
-      { echo ""; echo "--- late run — $TS ---"; [[ -n "$SCAN_BANNER" ]] && echo "$SCAN_BANNER"; echo "$RECOVERED_NOTE"; } >> "$SUMMARY"
+      { echo ""; echo "--- $RUN_LABEL — $TS ---"; [[ -n "$SCAN_BANNER" ]] && echo "$SCAN_BANNER"; echo "$RECOVERED_NOTE"; } >> "$SUMMARY"
     else
       { echo "career-ops nightly summary — $TS"; [[ -n "$SCAN_BANNER" ]] && echo "$SCAN_BANNER"; echo ""; echo "$RECOVERED_NOTE"; } > "$SUMMARY"
     fi
@@ -278,7 +298,7 @@ if [[ "$FIRST_NEW_ID" == "none" || -z "$FIRST_NEW_ID" ]]; then
   if [[ -n "$SUMMARY_APPEND" ]]; then
     {
       echo ""
-      echo "--- late run — $TS ---"
+      echo "--- $RUN_LABEL — $TS ---"
       [[ -n "$SCAN_BANNER" ]] && echo "$SCAN_BANNER"
       echo "No new offers found."
     } >> "$SUMMARY"
@@ -349,7 +369,7 @@ node -e '
   const path = "tmp/nightly-latest-summary.txt";
   if (process.env.SUMMARY_APPEND) {
     const body = s.replace(/^career-ops nightly summary — [^\n]*\n/, "");
-    fs.appendFileSync(path, "\n--- late run — " + ts + " ---\n" + body);
+    fs.appendFileSync(path, "\n--- " + (process.env.RUN_LABEL || "late run") + " — " + ts + " ---\n" + body);
   } else {
     fs.writeFileSync(path, s);
   }
