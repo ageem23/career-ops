@@ -76,8 +76,6 @@ const SELECTORS = {
   // The href is stable and locale-independent; the aria-label variants stay as
   // fallbacks in case the nav markup changes again.
   loggedIn: 'a[href*="/mynetwork"], a[aria-label*="My Network"], a[aria-label^="Network"]',
-  xpathCurrentPage: "//button[@aria-current='true'][starts-with(@aria-label, 'Page')]",
-  xpathPageButton: "//button[starts-with(@aria-label, 'Page')]",
 };
 
 const NOISE_LABELS = new Set([
@@ -88,6 +86,8 @@ const NOISE_LABELS = new Set([
 const MIN_TITLE_LENGTH = 4;
 const DEFAULT_DELAY_PAGES = [3000, 8000];
 const DEFAULT_DELAY_SEARCHES = [5000, 15000];
+const PAGE_SIZE = 25;
+const DEFAULT_MAX_PAGES = 4;
 
 // ── Browser singleton ───────────────────────────────────────────────
 //
@@ -359,17 +359,50 @@ function buildSearchUrl(entry) {
 
 // ── Page interaction primitives ─────────────────────────────────────
 
+// The results list is its own scrollable pane, not the window, and LinkedIn
+// only mounts the first ~7 of a page's 25 cards until that pane scrolls.
+// Scrolling the window (the old behavior) left every search capped at 7 cards.
+// The pane's class names are obfuscated and churn, so find it structurally:
+// the nearest scrollable ancestor of a card. Scroll it in steps until the card
+// count stops growing, then return to the top so card clicks start clean.
 async function scrollToLoadResults(page) {
-  for (let i = 0; i < 5; i++) {
-    await page.mouse.wheel(0, randomDelay([300, 600]));
-    await sleep(randomDelay([500, 1200]));
+  let lastCount = -1;
+  let stable = 0;
+  for (let i = 0; i < 20 && stable < 2; i++) {
+    await page.evaluate(sel => {
+      let el = document.querySelector(sel)?.parentElement;
+      while (el && el !== document.body) {
+        const cs = getComputedStyle(el);
+        if (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) {
+          el.scrollBy(0, 600);
+          return;
+        }
+        el = el.parentElement;
+      }
+      window.scrollBy(0, 600);
+    }, SELECTORS.listingCard);
+    await sleep(randomDelay([500, 1000]));
+    const count = await getCardCount(page);
+    stable = count === lastCount ? stable + 1 : 0;
+    lastCount = count;
   }
-  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.evaluate(sel => {
+    let el = document.querySelector(sel)?.parentElement;
+    while (el && el !== document.body) {
+      if (el.scrollTop > 0) el.scrollTop = 0;
+      el = el.parentElement;
+    }
+    window.scrollTo(0, 0);
+  }, SELECTORS.listingCard);
   await sleep(1000);
 }
 
 async function getCardCount(page) {
   return page.evaluate(sel => document.querySelectorAll(sel).length, SELECTORS.listingCard);
+}
+
+async function getCardJobIds(page) {
+  return page.evaluate(sel => [...document.querySelectorAll(sel)].map(c => c.getAttribute('data-job-id')), SELECTORS.listingCard);
 }
 
 async function clickCard(page, index) {
@@ -420,37 +453,6 @@ async function extractDetailFromPanel(page) {
   }, { sel: SELECTORS, noiseLabels: [...NOISE_LABELS], minLen: MIN_TITLE_LENGTH });
 }
 
-async function getCurrentPageNumber(page) {
-  return page.evaluate(xpath => {
-    const r = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-    const btn = r.singleNodeValue;
-    if (!btn) return 0;
-    const m = (btn.getAttribute('aria-label') || '').match(/Page (\d+)/);
-    return m ? parseInt(m[1], 10) : 0;
-  }, SELECTORS.xpathCurrentPage);
-}
-
-async function goToNextPage(page) {
-  return page.evaluate(({ xpathCurrent, xpathAll }) => {
-    const curR = document.evaluate(xpathCurrent, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-    const curBtn = curR.singleNodeValue;
-    if (!curBtn) return false;
-    const curM = (curBtn.getAttribute('aria-label') || '').match(/Page (\d+)/);
-    if (!curM) return false;
-    const curNum = parseInt(curM[1], 10);
-
-    const allR = document.evaluate(xpathAll, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-    for (let i = 0; i < allR.snapshotLength; i++) {
-      const btn = allR.snapshotItem(i);
-      const m = (btn.getAttribute('aria-label') || '').match(/Page (\d+)/);
-      if (m && parseInt(m[1], 10) === curNum + 1) {
-        btn.click();
-        return true;
-      }
-    }
-    return false;
-  }, { xpathCurrent: SELECTORS.xpathCurrentPage, xpathAll: SELECTORS.xpathPageButton });
-}
 
 // ── JD file writer ──────────────────────────────────────────────────
 
@@ -495,31 +497,62 @@ ${detail.jdText}
 
 // ── Search execution ────────────────────────────────────────────────
 
+// Job IDs already opened during this process. The configured searches overlap
+// heavily (the same Director role surfaces under CTO, Director and VP
+// keywords), so skipping a card another search already opened saves a
+// click-and-wait per duplicate. Searches run concurrently; whichever claims an
+// ID first reports it.
+const seenJobIds = new Set();
+
 async function runSearch(page, entry) {
-  const max = entry.max_results || 25;
+  const max = entry.max_results || DEFAULT_MAX_PAGES * PAGE_SIZE;
+  const maxPages = entry.max_pages || DEFAULT_MAX_PAGES;
   const delayPages = normalizeDelayTuple(entry.delay_pages, DEFAULT_DELAY_PAGES);
   const url = buildSearchUrl(entry);
 
   log(`Search: ${entry.search}`);
 
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await sleep(randomDelay(delayPages));
-  await scrollToLoadResults(page);
-
   const accepted = [];
   const seenInSearch = new Set();
-  let hasNextPage = true;
 
-  while (hasNextPage && accepted.length < max) {
-    const currentPage = await getCurrentPageNumber(page);
-    log(`Page ${currentPage || 1}`);
-    await scrollToLoadResults(page);
+  // Paginate by URL (`start` offset) rather than clicking "Page N" buttons:
+  // those only render at the bottom of the scrolled list pane, so the old
+  // button-click pagination never found them and every search stopped at page 1.
+  for (let pageNum = 1; pageNum <= maxPages && accepted.length < max; pageNum++) {
+    const start = (pageNum - 1) * PAGE_SIZE;
+    const pageUrl = start ? `${url}&start=${start}` : url;
+    log(`Page ${pageNum}`);
+    // With five searches loading concurrently, a later page sometimes reports
+    // zero cards because the list hasn't mounted yet, which ended 4 of 5
+    // searches at page 2 on the first paginated run even though every search
+    // had 99-100+ results. Wait for a card explicitly and retry the page once
+    // before treating an empty list as the real end of results.
+    let jobIds = [];
+    for (let attempt = 1; attempt <= 2 && jobIds.length === 0; attempt++) {
+      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await sleep(randomDelay(delayPages));
+      await page.waitForSelector(SELECTORS.listingCard, { timeout: 15000 }).catch(() => {});
+      await scrollToLoadResults(page);
+      jobIds = await getCardJobIds(page);
+      if (jobIds.length === 0 && attempt === 1) warn(`  Page ${pageNum} empty, retrying once`);
+    }
 
-    const cardCount = await getCardCount(page);
+    const cardCount = jobIds.length;
     log(`Found ${cardCount} cards`);
+    // Past the last page LinkedIn renders an empty list (or repeats the final
+    // page), so stop once a page brings nothing new.
+    if (cardCount === 0 || jobIds.every(id => seenInSearch.has(id))) break;
 
     for (let i = 0; i < cardCount; i++) {
       if (accepted.length >= max) break;
+
+      const jobId = jobIds[i];
+      if (jobId) {
+        if (seenInSearch.has(jobId)) continue;
+        seenInSearch.add(jobId);
+        if (seenJobIds.has(jobId)) continue;
+        seenJobIds.add(jobId);
+      }
 
       if (!await clickCard(page, i)) {
         warn(`  ✗ Could not click card ${i}`);
@@ -538,10 +571,6 @@ async function runSearch(page, entry) {
       }
       detail.applicationUrl = unwrapRedirect(detail.applicationUrl);
 
-      // Within-search dedup (same role can appear on multiple pages)
-      if (seenInSearch.has(detail.url)) continue;
-      seenInSearch.add(detail.url);
-
       if (!detail.jdText) {
         warn(`  ✗ No JD text: ${detail.title}`);
         continue;
@@ -559,13 +588,6 @@ async function runSearch(page, entry) {
         _application_url: detail.applicationUrl,
       });
       log(`  ✓ ${detail.title} — ${detail.company}`);
-    }
-
-    if (accepted.length < max) {
-      hasNextPage = await goToNextPage(page);
-      if (hasNextPage) await sleep(randomDelay(delayPages));
-    } else {
-      hasNextPage = false;
     }
   }
 

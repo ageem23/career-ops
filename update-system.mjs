@@ -354,6 +354,7 @@ const USER_PATHS = [
   'plugins.lock',
   '.claude/settings.json',
   '.claude/hooks/',
+  'nightly-hibernate.cmd',
 ];
 
 function parseVersionFile(raw) {
