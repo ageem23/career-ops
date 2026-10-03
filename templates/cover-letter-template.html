@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cover Letter — {{NAME}}</title>
+<style>
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    /* Disable fi/fl/ffi ligatures. Headless Chromium substitutes these letter
+       pairs with the Unicode glyphs U+FB01/FB02/FB03 at PDF layout time, and PDF
+       text extractors (what ATS systems read) decode them back to those
+       codepoints, so "verification" becomes "veriﬁcation" and a literal keyword
+       search misses it. Required ligatures (rlig) stay on. */
+    font-variant-ligatures: none;
+    font-feature-settings: "liga" 0, "clig" 0, "dlig" 0;
+  }
+
+  html {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  body {
+    font-family: Helvetica, Arial, sans-serif;
+    font-size: 10pt;
+    line-height: 1.4;
+    color: #1a1a1a;
+    background: #ffffff;
+    /* Disable ligatures here as well; see the * rule above. */
+    font-variant-ligatures: none;
+    font-feature-settings: "liga" 0, "clig" 0, "dlig" 0;
+  }
+
+  /* === HEADER (mirrors the resume header) === */
+  .header {
+    text-align: center;
+    margin-bottom: 14px;
+  }
+
+  .name {
+    font-family: Helvetica, Arial, sans-serif;
+    font-size: 28pt;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: #000000;
+    text-transform: uppercase;
+    line-height: 1.1;
+    margin-bottom: 4px;
+  }
+
+  .header-title {
+    font-family: Helvetica, Arial, sans-serif;
+    font-size: 13pt;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: #0000FF;
+    text-transform: uppercase;
+    line-height: 1.2;
+    margin-bottom: 10px;
+  }
+
+  .contact-line {
+    font-size: 10pt;
+    line-height: 1.5;
+    color: #000000;
+  }
+
+  .contact-line a, .credentials a, .footnotes a {
+    color: #1155cc;
+    text-decoration: underline;
+  }
+
+  .credentials {
+    font-size: 10pt;
+    line-height: 1.5;
+    color: #000000;
+    margin-top: 2pt;
+  }
+
+  .divider {
+    border: none;
+    border-top: 0.5pt solid #cccccc;
+    margin: 6pt 0 8pt;
+  }
+
+  .dateline {
+    font-size: 9pt;
+    color: #666666;
+    margin-bottom: 12pt;
+  }
+
+  .greeting {
+    margin-bottom: 8pt;
+  }
+
+  p {
+    margin-bottom: 8pt;
+  }
+
+  .achievements {
+    list-style: none;
+    margin-bottom: 4pt;
+  }
+
+  .achievements li {
+    margin-bottom: 5pt;
+    padding-left: 14pt;
+    position: relative;
+  }
+
+  .achievements li::before {
+    content: "\2022";
+    position: absolute;
+    left: 0;
+  }
+
+  .language-closing {
+    font-style: italic;
+    margin-top: 4pt;
+    margin-bottom: 8pt;
+  }
+
+  .footnotes {
+    margin-top: 10pt;
+    padding-top: 4pt;
+    border-top: 0.5pt solid #cccccc;
+  }
+
+  .footnotes p {
+    font-size: 8pt;
+    color: #888888;
+    line-height: 1.3;
+    margin-bottom: 3pt;
+  }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="name">{{NAME}}</div>
+    <div class="header-title">{{ROLE_TITLE}}</div>
+    {{CONTACT_LINE}}
+    {{CREDENTIALS_BLOCK}}
+  </div>
+  <hr class="divider">
+
+  <div class="dateline">{{DATELINE}}</div>
+
+  {{GREETING_BLOCK}}
+  <p>{{OPENING}}</p>
+  <p>{{PROFILE_INTRO}}</p>
+
+  {{ACHIEVEMENTS_BLOCK}}
+
+  {{PROBLEMS_BLOCK}}
+  {{CLOSING_BLOCK}}
+  {{LANGUAGE_CLOSING_BLOCK}}
+  {{FOOTNOTES_BLOCK}}
+</body>
+</html>
