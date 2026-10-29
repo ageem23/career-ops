@@ -1026,8 +1026,20 @@ process_offer() {
       local why="no report was written"
       [[ "$worker_status" == "failed" ]] && why="worker reported status=failed"
       local reason
-      reason=$(sed -nE 's/.*"error"[[:space:]]*:[[:space:]]*"([^"]{1,160})".*/\1/p' "$log_file" 2>/dev/null | tail -1 || true)
-      [[ -n "$reason" ]] && why="$why: $reason"
+      reason=$(sed -nE 's/.*"error"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$log_file" 2>/dev/null | tail -1 || true)
+      # A posting that is gone (404/410, "closed"/"removed") will never come
+      # back, but "failed" kept it eligible for retry — and the nightly
+      # recovery pass raises the retry cap past every recorded count, so dead
+      # postings were re-run every night without end (#3483 hit attempt 8).
+      # Record it as terminal "skipped" instead. Matched against the worker's
+      # full error text, before truncation.
+      if [[ "$worker_status" == "failed" ]] \
+        && grep -qiE 'HTTP[[:space:]]*(404|410)|404 Not Found|410 Gone|posting (appears to be |is |was |likely |has been )?(closed|removed|expired)|no longer (accepting|available|open)' <<< "$reason"; then
+        update_state "$id" "$url" "skipped" "$started_at" "$completed_at" "$report_num" "-" "posting-closed: ${reason:0:160}" "$retries"
+        echo "    ⏭️  #$id: posting closed (${reason:0:120}) — recording as skipped, not retried."
+        return 0
+      fi
+      [[ -n "$reason" ]] && why="$why: ${reason:0:160}"
       echo "    ❌ #$id: exited 0 but $why — recording as failed, not completed."
       if (( retries < MAX_RETRIES )); then
         retries=$((retries + 1))

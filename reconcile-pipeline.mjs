@@ -89,16 +89,18 @@ if (!existsSync(PIPELINE_FILE)) {
 
 // ---- parse batch-state.tsv ----
 // columns: id  url  status  started_at  completed_at  report_num  score  error  retries
-const DONE = new Map(); // url -> { reportNum, score }
+const DONE = new Map(); // url -> { reportNum, score, closed }
 for (const line of readFileSync(STATE_FILE, 'utf-8').split(/\r?\n/)) {
   if (!line.trim() || line.startsWith('id\t')) continue;
   const c = line.split('\t');
   if (c.length < 7) continue;
-  const [, url, status, , , reportNum, score] = c;
+  const [, url, status, , , reportNum, score, error] = c;
   // "completed" and "skipped" (below --min-score) both produced a report.
+  // "skipped" with a posting-closed error did not — it is resolved as expired.
   if (status !== 'completed' && status !== 'skipped') continue;
   if (!url || !url.trim()) continue;
-  DONE.set(url.trim(), { reportNum: (reportNum || '').trim(), score: (score || '').trim() });
+  const closed = status === 'skipped' && /^posting-closed/.test((error || '').trim());
+  DONE.set(url.trim(), { reportNum: (reportNum || '').trim(), score: (score || '').trim(), closed });
 }
 
 if (DONE.size === 0) {
@@ -210,6 +212,17 @@ for (let i = pendStart + 1; i < pendEnd; i++) {
     // Already recorded in Procesadas — just drop the stale Pendientes copy.
     removeIdx.add(i);
     moved.push({ url, role: '(already in Procesadas)', dup: true });
+    continue;
+  }
+
+  if (done.closed) {
+    // Posting is gone — resolve it as expired, the same line the pipeline
+    // mode's liveness sweep writes, instead of leaving it in Pendientes forever.
+    const parts = body.split('|').map(s => s.trim());
+    movedProcLines.push(`- [x] ~~${url} | ${parts[1] || ''} | ${parts[2] || ''}~~ — posting expired (batch: 404/410)`);
+    moved.push({ url, company: parts[1] || '', role: parts[2] || '', num: '-', score: 'expired' });
+    procUrls.add(url);
+    removeIdx.add(i);
     continue;
   }
 
