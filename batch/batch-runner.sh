@@ -529,28 +529,22 @@ update_state_unlocked() {
   fi
 
   local tmp="$STATE_FILE.tmp"
-  local found=false
+  local row
+  row=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "$id" "$url" "$status" "$started" "$completed" "$report_num" "$score" "$error" "$retries")
 
-  # Write header
-  head -1 "$STATE_FILE" > "$tmp"
-
-  # Process existing lines
-  while IFS=$'\t' read -r sid surl sstatus sstarted scompleted sreport sscore serror sretries; do
-    [[ "$sid" == "id" ]] && continue  # skip header
-    if [[ "$sid" == "$id" ]]; then
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$id" "$url" "$status" "$started" "$completed" "$report_num" "$score" "$error" "$retries" >> "$tmp"
-      found=true
-    else
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$sid" "$surl" "$sstatus" "$sstarted" "$scompleted" "$sreport" "$sscore" "$serror" "$sretries" >> "$tmp"
-    fi
-  done < "$STATE_FILE"
-
-  if [[ "$found" == "false" ]]; then
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$id" "$url" "$status" "$started" "$completed" "$report_num" "$score" "$error" "$retries" >> "$tmp"
-  fi
+  # One awk pass, not a bash read loop. The loop appended each of ~3,200 rows
+  # with its own `printf >>`, reopening the file per line: ~5s per call on
+  # Windows, all of it inside the state lock, so reservations queued behind it
+  # for 40-80s. Values go through ENVIRON, not -v, so backslashes in error
+  # messages are written verbatim.
+  STATE_ROW="$row" STATE_ID="$id" awk -F'\t' '
+    NR == 1 { print; next }
+    $1 == "id" { next }
+    $1 == ENVIRON["STATE_ID"] { print ENVIRON["STATE_ROW"]; found = 1; next }
+    { print }
+    END { if (!found) print ENVIRON["STATE_ROW"] }
+  ' "$STATE_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
 
   mv "$tmp" "$STATE_FILE"
 }
