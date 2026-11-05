@@ -58,7 +58,14 @@ const SELECTORS = {
   // for each job card on the search page. The previous "Dismiss button →
   // ancestor div[role='button']" XPath stopped matching when LinkedIn dropped
   // the per-card Dismiss control from the default search list.
-  listingCard: 'div[data-job-id]',
+  //
+  // Around 2026-11-03 /jobs/search/ started redirecting to a redesigned
+  // /jobs/search-results/ page: hashed class names, no data-job-id, no h1.
+  // Cards there are `div[role=button][componentkey="job-card-component-ref-<id>"]`
+  // (an inner div repeats the componentkey, hence the role filter). Both
+  // layouts are matched in case LinkedIn is still A/B-testing the redesign.
+  listingCard: 'div[data-job-id], div[role="button"][componentkey^="job-card-component-ref-"]',
+  cardComponentKeyPrefix: 'job-card-component-ref-',
   cardJobsViewLink: 'a[href*="/jobs/view/"]',
 
   // Detail panel selectors. Primary uses dedicated CSS classes shipped with
@@ -67,7 +74,10 @@ const SELECTORS = {
   panelTitle: '.job-details-jobs-unified-top-card__job-title h1, h1.t-24, h1',
   panelCompany: '.job-details-jobs-unified-top-card__company-name a, .job-details-jobs-unified-top-card__company-name',
   panelApply: 'a[aria-label*="Apply"]:not([aria-label*="Easy"]):not([aria-label*="continue"])',
-  panelJdContent: '#job-details, .jobs-description__container, .jobs-box__html-content',
+  panelJdContent: '#job-details, .jobs-description__container, .jobs-box__html-content, [componentkey^="JobDetails_AboutTheJob_"]',
+  // Redesigned layout: the panel title is the page's only /jobs/view/ link
+  // (cards no longer link there).
+  panelTitleRedesign: 'a[href*="/jobs/view/"]',
   panelMoreButton: '.jobs-description__footer-button button, button.jobs-description__footer-button',
 
   // Logged-in probe. Anchored on the nav href, not its aria-label: LinkedIn
@@ -76,9 +86,12 @@ const SELECTORS = {
   // The href is stable and locale-independent; the aria-label variants stay as
   // fallbacks in case the nav markup changes again.
   loggedIn: 'a[href*="/mynetwork"], a[aria-label*="My Network"], a[aria-label^="Network"]',
-  xpathCurrentPage: "//button[@aria-current='true'][starts-with(@aria-label, 'Page')]",
-  xpathPageButton: "//button[starts-with(@aria-label, 'Page')]",
 };
+
+// Redesigned layout: the JD section is keyed by job id, so waiting on it
+// confirms the panel switched to the clicked card. Kept outside SELECTORS,
+// which is passed whole into page.evaluate and must stay serializable.
+const panelAboutForJob = id => `[componentkey="JobDetails_AboutTheJob_${id}"]`;
 
 const NOISE_LABELS = new Set([
   'more', 'show more', 'see more',
@@ -88,6 +101,8 @@ const NOISE_LABELS = new Set([
 const MIN_TITLE_LENGTH = 4;
 const DEFAULT_DELAY_PAGES = [3000, 8000];
 const DEFAULT_DELAY_SEARCHES = [5000, 15000];
+const PAGE_SIZE = 25;
+const DEFAULT_MAX_PAGES = 4;
 
 // ── Browser singleton ───────────────────────────────────────────────
 //
@@ -359,17 +374,52 @@ function buildSearchUrl(entry) {
 
 // ── Page interaction primitives ─────────────────────────────────────
 
+// The results list is its own scrollable pane, not the window, and LinkedIn
+// only mounts the first ~7 of a page's 25 cards until that pane scrolls.
+// Scrolling the window (the old behavior) left every search capped at 7 cards.
+// The pane's class names are obfuscated and churn, so find it structurally:
+// the nearest scrollable ancestor of a card. Scroll it in steps until the card
+// count stops growing, then return to the top so card clicks start clean.
 async function scrollToLoadResults(page) {
-  for (let i = 0; i < 5; i++) {
-    await page.mouse.wheel(0, randomDelay([300, 600]));
-    await sleep(randomDelay([500, 1200]));
+  let lastCount = -1;
+  let stable = 0;
+  for (let i = 0; i < 20 && stable < 2; i++) {
+    await page.evaluate(sel => {
+      let el = document.querySelector(sel)?.parentElement;
+      while (el && el !== document.body) {
+        const cs = getComputedStyle(el);
+        if (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight) {
+          el.scrollBy(0, 600);
+          return;
+        }
+        el = el.parentElement;
+      }
+      window.scrollBy(0, 600);
+    }, SELECTORS.listingCard);
+    await sleep(randomDelay([500, 1000]));
+    const count = await getCardCount(page);
+    stable = count === lastCount ? stable + 1 : 0;
+    lastCount = count;
   }
-  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.evaluate(sel => {
+    let el = document.querySelector(sel)?.parentElement;
+    while (el && el !== document.body) {
+      if (el.scrollTop > 0) el.scrollTop = 0;
+      el = el.parentElement;
+    }
+    window.scrollTo(0, 0);
+  }, SELECTORS.listingCard);
   await sleep(1000);
 }
 
 async function getCardCount(page) {
   return page.evaluate(sel => document.querySelectorAll(sel).length, SELECTORS.listingCard);
+}
+
+async function getCardJobIds(page) {
+  return page.evaluate(({ sel, prefix }) => [...document.querySelectorAll(sel)].map(c =>
+    c.getAttribute('data-job-id') || (c.getAttribute('componentkey') || '').replace(prefix, '') || null
+  ), { sel: SELECTORS.listingCard, prefix: SELECTORS.cardComponentKeyPrefix });
 }
 
 async function clickCard(page, index) {
@@ -386,11 +436,14 @@ async function clickCard(page, index) {
   }, { sel: SELECTORS.listingCard, link: SELECTORS.cardJobsViewLink, idx: index });
 }
 
-async function extractDetailFromPanel(page) {
+async function extractDetailFromPanel(page, jobId) {
   // Wait for the right-pane to populate before reading. LinkedIn sometimes
   // renders the panel shell before the company name DOM mounts (sponsored
   // placements especially), which produced empty-company entries in scans.
-  await page.waitForSelector(SELECTORS.panelCompany, { state: 'visible', timeout: 5000 }).catch(() => {});
+  // The redesigned layout has no panelCompany element, so also accept its
+  // job-keyed JD section — otherwise every card would burn the full timeout.
+  const ready = jobId ? `${SELECTORS.panelCompany}, ${panelAboutForJob(jobId)}` : SELECTORS.panelCompany;
+  await page.waitForSelector(ready, { state: 'visible', timeout: 5000 }).catch(() => {});
 
   // Expand description if collapsed (best-effort; some panels render fully
   // expanded already, in which case the button isn't present).
@@ -401,56 +454,34 @@ async function extractDetailFromPanel(page) {
   await sleep(500);
 
   return page.evaluate(({ sel, noiseLabels, minLen }) => {
-    const titleEl = document.querySelector(sel.panelTitle);
-    let title = titleEl?.textContent?.trim() ?? '';
+    // Redesigned layout: document.title is "<title> | <company> | LinkedIn"
+    // and tracks the selected card — the company's only plain-text source.
+    const docParts = document.title.split(' | ');
+    const fromDocTitle = docParts.length >= 3 && docParts[docParts.length - 1].trim() === 'LinkedIn'
+      ? { title: docParts.slice(0, -2).join(' | ').trim(), company: docParts[docParts.length - 2].trim() }
+      : { title: '', company: '' };
+
+    // Not folded into the panelTitle list: querySelector returns the first
+    // match in document order, and the old layout's card links precede its h1.
+    const titleEl = document.querySelector(sel.panelTitle) || document.querySelector(sel.panelTitleRedesign);
+    let title = titleEl?.textContent?.trim() || fromDocTitle.title;
     if (noiseLabels.includes(title.toLowerCase()) || title.length < minLen) {
       title = '';
     }
 
     const companyEl = document.querySelector(sel.panelCompany);
-    const company = companyEl?.textContent?.trim() ?? '';
+    const company = companyEl?.textContent?.trim() || fromDocTitle.company;
 
     const applyEl = document.querySelector(sel.panelApply);
     const applicationUrl = applyEl?.href?.trim() ?? '';
 
     const jdEl = document.querySelector(sel.panelJdContent);
-    const jdText = jdEl?.innerText?.trim() ?? '';
+    const jdText = (jdEl?.innerText?.trim() ?? '').replace(/^About the job\s*/, '');
 
     return { title, company, applicationUrl, jdText, url: window.location.href };
   }, { sel: SELECTORS, noiseLabels: [...NOISE_LABELS], minLen: MIN_TITLE_LENGTH });
 }
 
-async function getCurrentPageNumber(page) {
-  return page.evaluate(xpath => {
-    const r = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-    const btn = r.singleNodeValue;
-    if (!btn) return 0;
-    const m = (btn.getAttribute('aria-label') || '').match(/Page (\d+)/);
-    return m ? parseInt(m[1], 10) : 0;
-  }, SELECTORS.xpathCurrentPage);
-}
-
-async function goToNextPage(page) {
-  return page.evaluate(({ xpathCurrent, xpathAll }) => {
-    const curR = document.evaluate(xpathCurrent, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-    const curBtn = curR.singleNodeValue;
-    if (!curBtn) return false;
-    const curM = (curBtn.getAttribute('aria-label') || '').match(/Page (\d+)/);
-    if (!curM) return false;
-    const curNum = parseInt(curM[1], 10);
-
-    const allR = document.evaluate(xpathAll, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-    for (let i = 0; i < allR.snapshotLength; i++) {
-      const btn = allR.snapshotItem(i);
-      const m = (btn.getAttribute('aria-label') || '').match(/Page (\d+)/);
-      if (m && parseInt(m[1], 10) === curNum + 1) {
-        btn.click();
-        return true;
-      }
-    }
-    return false;
-  }, { xpathCurrent: SELECTORS.xpathCurrentPage, xpathAll: SELECTORS.xpathPageButton });
-}
 
 // ── JD file writer ──────────────────────────────────────────────────
 
@@ -495,31 +526,62 @@ ${detail.jdText}
 
 // ── Search execution ────────────────────────────────────────────────
 
+// Job IDs already opened during this process. The configured searches overlap
+// heavily (the same Director role surfaces under CTO, Director and VP
+// keywords), so skipping a card another search already opened saves a
+// click-and-wait per duplicate. Searches run concurrently; whichever claims an
+// ID first reports it.
+const seenJobIds = new Set();
+
 async function runSearch(page, entry) {
-  const max = entry.max_results || 25;
+  const max = entry.max_results || DEFAULT_MAX_PAGES * PAGE_SIZE;
+  const maxPages = entry.max_pages || DEFAULT_MAX_PAGES;
   const delayPages = normalizeDelayTuple(entry.delay_pages, DEFAULT_DELAY_PAGES);
   const url = buildSearchUrl(entry);
 
   log(`Search: ${entry.search}`);
 
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await sleep(randomDelay(delayPages));
-  await scrollToLoadResults(page);
-
   const accepted = [];
   const seenInSearch = new Set();
-  let hasNextPage = true;
 
-  while (hasNextPage && accepted.length < max) {
-    const currentPage = await getCurrentPageNumber(page);
-    log(`Page ${currentPage || 1}`);
-    await scrollToLoadResults(page);
+  // Paginate by URL (`start` offset) rather than clicking "Page N" buttons:
+  // those only render at the bottom of the scrolled list pane, so the old
+  // button-click pagination never found them and every search stopped at page 1.
+  for (let pageNum = 1; pageNum <= maxPages && accepted.length < max; pageNum++) {
+    const start = (pageNum - 1) * PAGE_SIZE;
+    const pageUrl = start ? `${url}&start=${start}` : url;
+    log(`Page ${pageNum}`);
+    // With five searches loading concurrently, a later page sometimes reports
+    // zero cards because the list hasn't mounted yet, which ended 4 of 5
+    // searches at page 2 on the first paginated run even though every search
+    // had 99-100+ results. Wait for a card explicitly and retry the page once
+    // before treating an empty list as the real end of results.
+    let jobIds = [];
+    for (let attempt = 1; attempt <= 2 && jobIds.length === 0; attempt++) {
+      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await sleep(randomDelay(delayPages));
+      await page.waitForSelector(SELECTORS.listingCard, { timeout: 15000 }).catch(() => {});
+      await scrollToLoadResults(page);
+      jobIds = await getCardJobIds(page);
+      if (jobIds.length === 0 && attempt === 1) warn(`  Page ${pageNum} empty, retrying once`);
+    }
 
-    const cardCount = await getCardCount(page);
+    const cardCount = jobIds.length;
     log(`Found ${cardCount} cards`);
+    // Past the last page LinkedIn renders an empty list (or repeats the final
+    // page), so stop once a page brings nothing new.
+    if (cardCount === 0 || jobIds.every(id => seenInSearch.has(id))) break;
 
     for (let i = 0; i < cardCount; i++) {
       if (accepted.length >= max) break;
+
+      const jobId = jobIds[i];
+      if (jobId) {
+        if (seenInSearch.has(jobId)) continue;
+        seenInSearch.add(jobId);
+        if (seenJobIds.has(jobId)) continue;
+        seenJobIds.add(jobId);
+      }
 
       if (!await clickCard(page, i)) {
         warn(`  ✗ Could not click card ${i}`);
@@ -527,7 +589,7 @@ async function runSearch(page, entry) {
       }
       await sleep(randomDelay(delayPages));
 
-      const detail = await extractDetailFromPanel(page);
+      const detail = await extractDetailFromPanel(page, jobId);
       if (!detail.title) {
         warn(`  ✗ No title on card ${i}`);
         continue;
@@ -537,10 +599,10 @@ async function runSearch(page, entry) {
         continue;
       }
       detail.applicationUrl = unwrapRedirect(detail.applicationUrl);
-
-      // Within-search dedup (same role can appear on multiple pages)
-      if (seenInSearch.has(detail.url)) continue;
-      seenInSearch.add(detail.url);
+      // The redesigned search URL carries per-visit tracking tokens (eBP,
+      // refId, trackingId), which would change saveJd's hash every scan and
+      // put a throwaway link in report headers. The job id is the stable part.
+      if (jobId) detail.url = `https://www.linkedin.com/jobs/view/${jobId}/`;
 
       if (!detail.jdText) {
         warn(`  ✗ No JD text: ${detail.title}`);
@@ -559,13 +621,6 @@ async function runSearch(page, entry) {
         _application_url: detail.applicationUrl,
       });
       log(`  ✓ ${detail.title} — ${detail.company}`);
-    }
-
-    if (accepted.length < max) {
-      hasNextPage = await goToNextPage(page);
-      if (hasNextPage) await sleep(randomDelay(delayPages));
-    } else {
-      hasNextPage = false;
     }
   }
 

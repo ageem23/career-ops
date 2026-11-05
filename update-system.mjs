@@ -513,6 +513,7 @@ export const USER_PATHS = [
   'opencode.json',
   '.claude/settings.json',
   '.claude/hooks/',
+  'nightly-hibernate.cmd',
 ];
 
 // Local user layer — a fork's own files, declared OUTSIDE the system layer.

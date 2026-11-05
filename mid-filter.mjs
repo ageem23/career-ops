@@ -180,7 +180,7 @@ B. **CV alignment** — does the candidate's actual experience (per the CV above
 - **1** = no match — wrong domain (civil/mechanical/electrical engineering for a software archetype), wrong function (CRM functional consulting, pure infra ops, support), or a hard filter triggered.
 
 ## Hard signals to flag in reason (push score to 1-2)
-- Required tech stack/credentials the CV clearly lacks (e.g. JD requires 5+ years production Python ML; CV is .NET-only)
+- Required tech stack/credentials the CV clearly lacks (e.g. JD requires 5+ years hands-on production Python ML and the CV shows none). Judge stack only against the languages/frameworks actually listed in the CV above — a JD stack the CV names is a strength, never a gap
 - Industry license required not in CV (PE, MD, defense clearance, regulated specialization)
 - Visible total comp clearly below the walk-away floor (${compensation.minimum || 'N/A'})
 - On-site only outside the candidate's commute range for a non-remote role
