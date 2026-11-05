@@ -25,7 +25,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import * as yaml from 'js-yaml';
+import { loadYaml } from './lib/yaml-document.mjs';
 
 const PORTALS_PATH = 'portals.yml';
 const PROFILE_DIR = join(homedir(), '.career-ops-auth', 'linkedin', 'profile');
@@ -47,7 +47,7 @@ function loadConfig() {
     fail(`Could not read ${PORTALS_PATH}: ${err.message}`);
   }
   try {
-    return yaml.load(raw);
+    return loadYaml(raw);
   } catch (err) {
     fail(`${PORTALS_PATH} is not valid YAML: ${err.message}`);
   }

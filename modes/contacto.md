@@ -21,7 +21,7 @@ This skill has **two execution modes**. You MUST decide which one is active **be
 
 | Resolved mode | What to do |
 |---------------|------------|
-| `prompt` | Go to **"## MODE A — Prompt output"** below. **DO NOT** read or execute MODE B. Stop at the end of Mode A. |
+| `prompt` | Go to **"## MODE A — Prompt output"** below. **DO NOT** read or execute MODE B (sole exception: a saved warm lead the candidate accepts in Mode A's warm-lead check). Stop at the end of Mode A. |
 | `inline` | Skip MODE A entirely. Execute **"## MODE B — Inline workflow"**. |
 
 **Greeting short-circuit (overrides both modes):** when the user says "greeting" / "打招呼" / "cold opener", names a chat-style platform (e.g. BOSS Zhipin), or asks for a very short first-touch message, skip MODE A and MODE B entirely and run **"## Greeting variant"** at the end of this file. It shares the same persona engine (recruiter → hard requirements; hiring manager → impact/vision) but does no contact discovery, so the name-verification protocol does not apply.
@@ -33,6 +33,8 @@ If you find yourself drafting a `Sending to:` line, opening WebSearch tabs, or c
 ## MODE A — Prompt output (when resolved mode = `prompt`)
 
 Your job is to emit a **single copy-paste-ready research prompt** that the user pastes into a new claude.ai web chat with **Research mode** enabled. You do NOT perform LinkedIn lookups, name verification, or message drafting yourself in this mode — the web Claude does all of that with better tooling.
+
+**Before emitting — check for a warm lead (#4691).** The web Claude cannot see `data/contacts.tsv`, so run MODE B's **Step 0** lookup here, locally (`node contact-lookup.mjs --company "{company}" --summary`). Silent on a miss — emit the prompt as normal. On a match, surface the saved contact(s) exactly as Step 0 describes. If the candidate picks one for an internal-referral ask, no research prompt is needed (the person is already known): draft that message here using MODE B's **Step 3.5**, **Step 4 → Internal Referral**, and **Steps 5–7**, then stop — do not also emit the prompt. If the candidate declines or wants a fresh contact, continue with the prompt below.
 
 **Before emitting — resolve the App# once.** Open `data/applications.md` and find the most recent active row (`Applied` / `Responded` / `Interview` / `Evaluated`) for `{Company}`; note its `#`. Do this here because the web Claude cannot see the local tracker. Use it to fill the `{APP_OR_COMPANY}` placeholder in template **section 5**: on a match use `--app {number}`, otherwise use `--company "{Company}"`.
 
@@ -135,9 +137,32 @@ If you end your response without the `Sending to:` line or without the `add-task
 
 ---
 
+## Step 0 — Check for a warm lead before searching cold (#4691)
+
+Before any WebSearch, run `node contact-lookup.mjs --company "{company}" --summary`
+against `data/contacts.tsv`. This is the saved-contacts phonebook — written by a
+prior `contacto` run or by `add` from an earlier, *different-role* application —
+and a real prior relationship there beats a cold search every time.
+
+- **If one or more matches come back:** surface them to the candidate ahead of
+  doing any searching, naming each one's name, title, and which tracker#/prior
+  role ties them to this company (e.g. "You already have Jane Doe (Eng Manager)
+  saved from tracker #042 — she interviewed you for the SWE role in March. Want
+  to reach out to her for an internal referral on this new role instead of
+  searching cold?"). With more than one match, list each briefly and let the
+  candidate pick, or say "search cold instead."
+  - If the candidate says yes → skip Step 1 entirely, set contact type to
+    **Internal Referral** (see Step 2), and continue from Step 3.5 using that
+    persona.
+  - If the candidate declines, or wants a different/fresh contact →
+    continue to step 1 as normal. Nothing here changes step 1's behavior.
+- **If no match exists** (empty `data/contacts.tsv`, or no row for this
+  company): say nothing extra, continue straight to step 1. This check is
+  silent on a miss — it is not a reason to pause the flow.
+
 ## Step 1 — Identify targets
 
-Via WebSearch:
+**Find ONE target** via WebSearch for the primary, plus alternates for the Step 5 table:
 - Hiring manager of the team
 - Assigned recruiter
 - 2-3 team peers (people with similar roles)
@@ -148,8 +173,9 @@ Via WebSearch:
 Ask the candidate or infer from context:
 - **Recruiter** — person whose role is talent acquisition, sourcing, or recruiting
 - **Hiring Manager** — the person who leads the hiring team
-- **Peer** — someone with a similar role in the team (indirect referral)
+- **Peer** — someone with a similar role in the team (indirect referral, NO prior relationship assumed)
 - **Interviewer** — someone who will interview the candidate (known date)
+- **Internal Referral** — a contact surfaced by Step 0, where a REAL prior relationship already exists (they interviewed the candidate before, or are a saved contact from an earlier application at this company). This is the opposite of Peer: Peer explicitly assumes no relationship yet; Internal Referral exists only because one already does.
 
 ## Step 3 — Select primary target
 
@@ -191,6 +217,12 @@ Adapt the framework to the contact type:
 - **Sentence 2 (Context)**: Light connection to the candidate's experience in that area
 - **Sentence 3 (CTA)**: "Looking forward to our conversation on [date]"
 - **Note**: Light tone, not desperate. The goal is to show that you prepared.
+
+### Internal Referral (#4691)
+- **Sentence 1 (Acknowledge the history)**: Name the real prior relationship directly and specifically — e.g. "We spoke during my interview for the [prior role] back in [month/year]" or "You were kind enough to save my details after my [prior role] application last [year]." Pull the prior role and date from the saved contact's tracker#/notes (Step 0), never invent one.
+- **Sentence 2 (Bridge)**: One line on why this new role is a genuine fit (brief — this is not a full pitch, the relationship already does most of the work).
+- **Sentence 3 (CTA)**: Ask DIRECTLY — "Would you be willing to pass my resume along for [new role]?" or "Any chance you could refer me for [new role]?"
+- **Note**: This is the opposite of Peer's "do not ask for a job." A real prior relationship already exists, so asking directly is the honest, time-respecting move — hedging here reads as if the candidate forgot the relationship happened.
 
 **Languages**: EN (default). ES if the company is Spanish.
 
@@ -242,7 +274,12 @@ table to `data/contacts.tsv` (one line:
 the person's existing line in place if they are already there — match by
 name+company, the same key the vCard UID uses. NEVER save without the
 candidate confirming first. Saved contacts export to the phone with
-`node contacts.mjs --vcf` (vCard).
+`node contacts.mjs --vcf` (vCard). A target that came from Step 0 (an existing row) gets its `type` cell UPDATED to `internal-referral` in place rather than appended as a new line, but **only once the candidate has confirmed a real prior relationship with this specific person** — the Step 0 company match alone is not that confirmation. A row already saved as `peer` explicitly assumed NO prior relationship (see Step 2); surfacing it as a same-company option and the candidate agreeing to send a referral ask does not, by itself, retroactively make that relationship real. If the candidate can't point to an actual prior interaction (an interview, a real conversation, anything beyond "we're both at this company"), leave the saved row's type as-is and treat this as a fresh `peer`/`recruiter` outreach instead, not an `internal-referral` one.
+
+When the contact comes from a pasted recruiter/interviewer reply, run
+`node contact-extract.mjs --file <email.txt>` instead. It reuses the reply
+matcher, confirms before writing, and updates an existing name+company row; it
+never sends a message or changes tracker status.
 
 ---
 

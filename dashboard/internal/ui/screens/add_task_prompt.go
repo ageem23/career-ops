@@ -32,7 +32,7 @@ const (
 // Enter and returns submit=true when the user completes stage 2. The caller
 // then reads Title() / ResolvedDue() and calls close().
 type addTaskPrompt struct {
-	stage   int    // 0 closed, 1 title, 2 due
+	stage   int // 0 closed, 1 title, 2 due
 	title   string
 	dueDays int    // -1 = no due, 0 = today, N = today + N days
 	typed   bool   // user has typed a digit since stage 2 opened

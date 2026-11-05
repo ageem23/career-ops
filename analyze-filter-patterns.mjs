@@ -52,7 +52,7 @@ const STOPWORDS = new Set([
 function tokenize(title) {
   return String(title)
     .toLowerCase()
-    .replace(/[\(\)\[\]\{\},\.;:!?'"&|/\\@#$%^*+=<>~`]/g, ' ')
+    .replace(/[\(\)\[\]\{\},\.;:!?'"&|/\\@#$%^*+=<>~\x60]/g, ' ')
     .replace(/\s+-\s+|—|–/g, ' ')
     .split(/\s+/)
     .filter(t => t && !STOPWORDS.has(t) && t.length >= 2);
@@ -264,8 +264,23 @@ function printTable(label, suggestions, direction) {
   console.log('');
 }
 
+const USAGE = `Usage: node analyze-filter-patterns.mjs [--since N] [--min-freq N] [--top N] [--no-bigrams]
+
+Mine data/scan-semantic-log.tsv for title tokens that predict the semantic
+phase's ACCEPT/REJECT verdicts, and suggest title_filter additions.
+
+  --since N       only rows from the last N days (default 30)
+  --min-freq N    minimum occurrences for a suggestion (default 5)
+  --top N         suggestions per direction (default 20)
+  --no-bigrams    tokens only
+  -h, --help      show this help`;
+
 function main() {
   const args = process.argv.slice(2);
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(USAGE);
+    return;
+  }
   const sinceDays = parsePositiveIntFlag(args, '--since', 30);
   const minFreq = parsePositiveIntFlag(args, '--min-freq', 5);
   const topN = parsePositiveIntFlag(args, '--top', 20);

@@ -31,7 +31,8 @@ import { readFileSync, writeFileSync, copyFileSync, unlinkSync, mkdirSync, exist
 import path from 'path';
 import os from 'os';
 import { createHash } from 'crypto';
-import * as yaml from 'js-yaml';
+import { loadYaml } from './lib/yaml-document.mjs';
+import { getProfilePath } from './path-resolver.mjs';
 
 // Load .env so ANTHROPIC_API_KEY is visible — without this, hasSemanticBackend()
 // falls through to the CLI path even when the user has the key configured.
@@ -46,7 +47,7 @@ import { fetchText } from './providers/_http.mjs';
 import { fetchText as browserFetchText, closeBrowser } from './providers/_browser.mjs';
 
 const PIPELINE = 'data/pipeline.md';
-const PROFILE = 'config/profile.yml';
+const PROFILE = getProfilePath();
 const CV_PATH = 'cv.md';
 const JDS_DIR = 'jds';
 
@@ -90,7 +91,7 @@ console.log(`backend: ${backend} | min-score: ${MIN_SCORE} | snippet: ${SNIPPET_
 // ── Archetypes from profile.yml ─────────────────────────────────────
 let profile;
 try {
-  profile = yaml.load(readFileSync(PROFILE, 'utf8'));
+  profile = loadYaml(readFileSync(PROFILE, 'utf8'));
 } catch (err) {
   console.error(`Could not read ${PROFILE}: ${err.message}`);
   console.error(`Run onboarding to create config/profile.yml from config/profile.example.yml.`);

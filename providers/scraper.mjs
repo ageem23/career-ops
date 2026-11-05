@@ -35,7 +35,7 @@
 // the resulting pipeline entry is fetchable later.
 
 const MAX_PAGES = 20;
-import { assertSafeHttpUrl } from './_http.mjs';
+import { assertSafeHttpUrl, isRefusedRedirectError, sleep } from './_http.mjs';
 
 // Defensive cap for `list_item_pattern` execution. Patterns are compiled from
 // portals.yml — a runaway regex on a large page can spin for a long time. Stop
@@ -228,13 +228,37 @@ function isTransientFetchError(err) {
   return false;
 }
 
-async function fetchWithRetry(ctx, url) {
+// The http transport refuses redirects by default so a 3xx can't be followed
+// to a private IP. Career pages redirect routinely (http -> https, trailing
+// slash, a careers subdomain), so follow up to MAX_REDIRECTS hops by hand and
+// put every Location through the same SSRF guard as the configured URL.
+const MAX_REDIRECTS = 3;
+
+async function fetchFollowingRedirects(ctx, url) {
   try {
     return await ctx.fetchText(url, { timeoutMs: LIST_FETCH_TIMEOUT_MS });
   } catch (err) {
+    if (!isRefusedRedirectError(err) || typeof ctx.fetchResponse !== 'function') throw err;
+    let current = url;
+    for (let hop = 0; hop < MAX_REDIRECTS; hop++) {
+      const res = await ctx.fetchResponse(current, { timeoutMs: LIST_FETCH_TIMEOUT_MS, redirect: 'manual' });
+      if (res.status < 300 || res.status >= 400) return await res.text();
+      const location = res.headers.get('location');
+      if (!location) throw err;
+      current = new URL(location, current).toString();
+      assertSafeHttpUrl(current);
+    }
+    throw new Error(`Too many redirects (>${MAX_REDIRECTS}) fetching ${url}`);
+  }
+}
+
+async function fetchWithRetry(ctx, url) {
+  try {
+    return await fetchFollowingRedirects(ctx, url);
+  } catch (err) {
     if (!isTransientFetchError(err)) throw err;
-    await new Promise(r => setTimeout(r, LIST_FETCH_RETRY_DELAY_MS));
-    return await ctx.fetchText(url, { timeoutMs: LIST_FETCH_TIMEOUT_MS });
+    await sleep(LIST_FETCH_RETRY_DELAY_MS, ctx);
+    return await fetchFollowingRedirects(ctx, url);
   }
 }
 

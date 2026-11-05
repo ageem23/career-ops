@@ -45,15 +45,19 @@
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import * as yaml from 'js-yaml';
+import { loadYaml } from './lib/yaml-document.mjs';
 import { LIVENESS_CONTEXT_OPTIONS, rejectPrivateOrInvalid } from './liveness-browser.mjs';
-import { getCareerOpsRoot } from './path-resolver.mjs';
+import { getCareerOpsRoot, getProfilePath } from './path-resolver.mjs';
 import { resolveAtsApi, JD_TEXT_API_ATS } from './liveness-api.mjs';
+import { classifyLiveness } from './liveness-core.mjs';
 import { decodeEntities } from './providers/_html-entities.mjs';
 import { isWorkModelOnly } from './providers/greenhouse.mjs';
+import { isZohoRecordClosed, parseZohoDetailPage } from './providers/zoho-recruit.mjs';
+import { extractCandidateOpportunityDetail, extractLocations } from './providers/ultipro.mjs';
 import { DEFAULT_USER_AGENT } from './user-agent.mjs';
 import { flagValue, hasFlag, validateFlags } from './lib/cli-flags.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
+import { browserLaunchOptions } from './lib/browser-launch.mjs';
 
 const CAREER_OPS = getCareerOpsRoot();
 
@@ -89,10 +93,10 @@ const NAV_LABEL_STOPWORDS = new Set([
  * @param {string} [profilePath]
  * @returns {'cli'|'mcp'}
  */
-export function resolveExtractorMode(profilePath = join(CAREER_OPS, 'config/profile.yml')) {
+export function resolveExtractorMode(profilePath = getProfilePath()) {
   try {
     if (!existsSync(profilePath)) return 'mcp';
-    const raw = yaml.load(readFileSync(profilePath, 'utf-8')) || {};
+    const raw = loadYaml(readFileSync(profilePath, 'utf-8')) || {};
     const v = raw?.scan?.extractor;
     return v === 'cli' ? 'cli' : 'mcp';
   } catch {
@@ -139,6 +143,10 @@ export function normalizeJd(raw, finalUrl, textCap = JD_TEXT_CAP) {
     url: finalUrl,
     title: compactText(raw?.title || raw?.jsonLdTitle || '', 300),
     text: compactText(text, textCap),
+    // For the liveness check in jdFailure() only. `text` has had nav/header/footer
+    // stripped, and an expired-posting banner often sits in one of them. Never
+    // emitted on the success path.
+    bodyText: compactText(raw?.bodyText || '', 4100),
   };
 }
 
@@ -248,6 +256,27 @@ export function normalizeWorkdayJob(json, postingUrl, textCap = JD_TEXT_CAP) {
 }
 
 /**
+ * Read the body of a response no fetcher will use, dropping each chunk as it
+ * arrives, and return null. Left unread, a body still arriving keeps its
+ * socket open, and with it the process: fetch-jd.mjs exits once nothing is
+ * left to run. Fetchers await this inside their try, so the read stays under
+ * their abort timer and a body that never ends stops at the same timeout as
+ * the rest of the request. Reading, not cancelling: these error bodies are
+ * small, while a cancel aborts the request mid-body and undici then opens a
+ * new connection that the process waits for (0.1 to 2.5 s on real Greenhouse
+ * and Workday misses, Node 24).
+ *
+ * @param {Response} res
+ */
+async function discard(res) {
+  try {
+    const reader = res.body?.getReader();
+    while (reader && !(await reader.read()).done) { /* drop the chunk */ }
+  } catch { /* cut off by the abort timer, or unreadable */ }
+  return null;
+}
+
+/**
  * Fetch + shape one Workday posting from its CXS endpoint. Returns null for
  * ANY inconclusive outcome (blocked host, redirect, non-200, unparseable or
  * unexpected body, timeout) so the caller falls through to the browser path —
@@ -272,7 +301,7 @@ async function fetchWorkdayJd(apiUrl, postingUrl, textCap, timeoutMs) {
       redirect: 'error', // a redirect off the derived host is not one to follow
       signal: controller.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) return await discard(res);
     return normalizeWorkdayJob(await res.json(), postingUrl, textCap);
   } catch {
     return null;
@@ -361,7 +390,7 @@ async function fetchAshbyJd(apiUrl, jobId, postingUrl, textCap, timeoutMs) {
       redirect: 'error',
       signal: controller.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) return await discard(res);
     const json = await res.json();
     return normalizeAshbyJob(json, jobId, postingUrl, textCap);
   } catch {
@@ -446,7 +475,7 @@ async function fetchGreenhouseJd(apiUrl, postingUrl, textCap, timeoutMs) {
       redirect: 'error',
       signal: controller.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) return await discard(res);
     const json = await res.json();
     return normalizeGreenhouseJob(json, postingUrl, textCap);
   } catch {
@@ -497,7 +526,9 @@ export function normalizeLeverJob(json, postingUrl, textCap = JD_TEXT_CAP) {
         .filter(Boolean)
         .join('\n\n')
     : '';
-  const body = [str(json.descriptionPlain), lists, str(json.additionalPlain)].filter(Boolean).join('\n\n');
+  // Lever can leave descriptionPlain empty while description holds the HTML.
+  const intro = str(json.descriptionPlain) || jdHtmlToText(json.description);
+  const body = [intro, lists, str(json.additionalPlain)].filter(Boolean).join('\n\n');
   if (!body) return null;
 
   const meta = [];
@@ -535,12 +566,335 @@ async function fetchLeverJd(apiUrl, postingUrl, textCap, timeoutMs) {
       redirect: 'error',
       signal: controller.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) return await discard(res);
     const json = await res.json();
     return normalizeLeverJob(json, postingUrl, textCap);
   } catch {
     return null;
   } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Greenhouse posting reached through a company careers page (`?gh_jid=` only,
+ * no board in the URL). The embed redirect names the board — the same
+ * `followEmbed` hop liveness uses, which also pins the redirect target to
+ * greenhouse.io — and the per-job boards-api endpoint then ships the JD.
+ */
+async function fetchGreenhouseEmbeddedJd(resolved, postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(resolved.apiUrl)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let jobApiUrl;
+  try {
+    const res = await fetch(resolved.apiUrl, {
+      headers: { 'user-agent': DEFAULT_USER_AGENT },
+      redirect: 'manual',
+      signal: controller.signal,
+    });
+    jobApiUrl = await resolved.followEmbed(res, resolved.parts);
+    await discard(res); // only its status and Location header are read
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+  return jobApiUrl ? fetchGreenhouseJd(jobApiUrl, postingUrl, textCap, timeoutMs) : null;
+}
+
+/**
+ * Shape one SmartRecruiters posting into a jd-mode result. Pure, same contract
+ * as the other normalizers. The body is `jobAd.sections`, HTML blocks appended
+ * in the order the rendered page shows them; the location object also carries
+ * remote/hybrid flags, surfaced because they are often the only work-model
+ * signal the posting has.
+ *
+ * @param {any} json - parsed postings-API response body
+ * @param {string} postingUrl
+ * @param {number} [textCap]
+ */
+export function normalizeSmartRecruitersJob(json, postingUrl, textCap = JD_TEXT_CAP) {
+  const sections = json?.jobAd?.sections;
+  if (!sections || typeof sections !== 'object') return null;
+
+  const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : '');
+  const blocks = ['companyDescription', 'jobDescription', 'qualifications', 'additionalInformation']
+    .map((key) => {
+      const body = jdHtmlToText(sections[key]?.text);
+      return body ? [str(sections[key]?.title), body].filter(Boolean).join('\n') : '';
+    })
+    .filter(Boolean);
+  if (!blocks.length) return null;
+
+  const loc = json?.location || {};
+  const meta = [];
+  const where = str(loc.fullLocation) || [str(loc.city), str(loc.country)].filter(Boolean).join(', ');
+  if (where) meta.push(`Location: ${where}`);
+  if (loc.remote === true) meta.push('Work model: Remote');
+  else if (loc.hybrid === true) meta.push('Work model: Hybrid');
+
+  return {
+    url: postingUrl,
+    title: compactText(str(json?.name), 300),
+    text: compactText([meta.join('\n'), ...blocks].filter(Boolean).join('\n\n'), textCap),
+  };
+}
+
+async function fetchSmartRecruitersJd(apiUrl, postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(apiUrl)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(apiUrl, {
+      headers: { accept: 'application/json', 'user-agent': DEFAULT_USER_AGENT },
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    if (!res.ok) return await discard(res);
+    const json = await res.json();
+    return normalizeSmartRecruitersJob(json, postingUrl, textCap);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Shape one Zoho Recruit posting page into a jd-mode result. Pure, same
+ * contract as the other normalizers. The page embeds the posting record
+ * (providers/zoho-recruit.mjs parseZohoDetailPage); its `Job_Description` is
+ * HTML. The record must be THIS posting's: a page carrying another id, or no
+ * record (a removed posting), returns null so the caller falls through.
+ *
+ * @param {any} html - the posting page's body
+ * @param {string} id - the {id} path segment from the posting URL
+ * @param {string} postingUrl
+ * @param {number} [textCap]
+ */
+export function normalizeZohoJob(html, id, postingUrl, textCap = JD_TEXT_CAP) {
+  const record = parseZohoDetailPage(html);
+  if (!record || String(record.id) !== String(id)) return null;
+  const body = jdHtmlToText(record.Job_Description);
+  if (!body) return null;
+
+  const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : '');
+  const meta = [];
+  const location = [str(record.City), str(record.State), str(record.Country)].filter(Boolean).join(', ');
+  if (location) meta.push(`Location: ${location}`);
+  if (record.Remote_Job === true) meta.push('Work model: Remote');
+  if (str(record.Job_Type)) meta.push(`Job type: ${str(record.Job_Type)}`);
+  if (str(record.Salary)) meta.push(`Salary: ${str(record.Salary)}`);
+  if (str(record.Date_Opened)) meta.push(`Posted: ${str(record.Date_Opened)}`);
+  if (isZohoRecordClosed(record)) meta.push('Applications closed (the career site shows the posting as filled)');
+
+  return {
+    url: postingUrl,
+    title: compactText(str(record.Posting_Title) || str(record.Job_Opening_Name), 300),
+    text: compactText([meta.join('\n'), body].filter(Boolean).join('\n\n'), textCap),
+  };
+}
+
+async function fetchZohoJd(apiUrl, id, postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(apiUrl)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(apiUrl, {
+      headers: { accept: 'text/html', 'user-agent': DEFAULT_USER_AGENT },
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    if (!res.ok) return await discard(res);
+    return normalizeZohoJob(await res.text(), id, postingUrl, textCap);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// `JobLocationType` as the board labels it. The page maps the number in script
+// it loads from elsewhere, so this was read off rendered pages: on 2026-10-29,
+// of 103 postings read in a browser, the 41 with 1 showed "On-site", the 6
+// with 2 "Remote" and the 8 with 0 "Hybrid"; the 48 without one showed none.
+const ULTIPRO_WORK_MODELS = { 0: 'Hybrid', 1: 'On-site', 2: 'Remote' };
+
+// The record's criteria lists, in the order the page's Qualifications section
+// shows them, each item worded as the page words it.
+const ULTIPRO_CRITERIA = [
+  ['SkillCriteria', 'Skill', (c) => [c.SkillName, c.MinimumScaleValueCode && c.MinimumScaleValueCode !== 'NONE' ? c.MinimumScaleValueDescription : '', c.SkillDescription]],
+  ['BehaviorCriteria', 'Behavior', (c) => [c.BehaviorName, c.BehaviorDescription]],
+  ['MotivationCriteria', 'Motivation', (c) => [c.MotivationName, c.MotivationDescription]],
+  ['EducationCriteria', 'Education', (c) => [c.DegreeName && `${c.DegreeName} or better${c.MajorName ? ` in ${c.MajorName}${c.Related ? ' or related field' : ''}` : ''}`]],
+  ['WorkExperienceCriteria', 'Experience', (c) => [ultiproYears(c.MinimumRequiredYears, c.MaximumRequiredYears), c.Description]],
+  ['LicenseAndCertificationCriteria', 'License or certification', (c) => [c.LicenseAndCertificationName]],
+];
+
+// The page reads "8-10 years" for a range and "5 years" for a minimum alone. No
+// sampled posting had a maximum alone; "Up to" keeps it from reading as a floor.
+function ultiproYears(min, max) {
+  if (Number.isFinite(min) && Number.isFinite(max)) return `${min}-${max} years`;
+  if (Number.isFinite(min)) return `${min} years`;
+  return Number.isFinite(max) ? `Up to ${max} years` : '';
+}
+
+/**
+ * Shape one UltiPro (UKG Pro Recruiting) detail page into a jd-mode result.
+ * Pure, same contract as normalizeZohoJob: UKG has no per-posting JSON API
+ * either, and the page embeds the posting record (providers/ultipro.mjs
+ * extractCandidateOpportunityDetail), whose `Description` is HTML. The record
+ * must be THIS posting's: the extractor throws on another id or on a page
+ * that changed shape, and finds nothing on the board's empty page (a removed
+ * posting). Each of those returns null so the caller falls through.
+ *
+ * The page shows more than the description: the header facts and a
+ * Qualifications section built from the record's criteria lists. Both are kept,
+ * so this text holds what a browser read of the page does, without its
+ * buttons and the equal-opportunity notice: on 2026-10-29, of 103 postings
+ * read both ways, every work model, pay line, travel line and criteria list
+ * the page showed was here too. Qualifications go before the description
+ * because compactText cuts the tail, and a long description must not push the
+ * requirements out.
+ *
+ * A closed posting keeps its record, so its JD is still returned, with the
+ * closure in the header, as normalizeWorkdayJob does for `canApply: false`.
+ *
+ * @param {any} html - the detail page's body
+ * @param {string} id - the posting's opportunityId, lower-cased as the rung requests it
+ * @param {string} postingUrl
+ * @param {number} [textCap]
+ */
+export function normalizeUltiproJob(html, id, postingUrl, textCap = JD_TEXT_CAP) {
+  let record;
+  try {
+    const found = extractCandidateOpportunityDetail(html, id);
+    if (found.status !== 'ok') return null;
+    record = found.detail;
+  } catch {
+    return null;
+  }
+  const body = jdHtmlToText(record.Description);
+  if (!body) return null;
+
+  const str = (v) => (typeof v === 'string' && v.trim() ? v.replace(/\s+/g, ' ').trim() : '');
+  const meta = [];
+  const location = extractLocations(record.Locations);
+  if (location) meta.push(`Location: ${location}`);
+  const workModel = ULTIPRO_WORK_MODELS[record.JobLocationType];
+  if (workModel) meta.push(`Work model: ${workModel}`);
+  if (typeof record.FullTime === 'boolean') meta.push(`Job type: ${record.FullTime ? 'Full time' : 'Part time'}`);
+  if (str(record.JobCategoryName)) meta.push(`Job category: ${str(record.JobCategoryName)}`);
+  const pay = record.PayRangeVisible === true ? record.PayRange : null;
+  if (str(pay?.PayRangeMinimum) && str(pay?.PayRangeMaximum)) {
+    meta.push(`Pay range: ${str(pay.PayRangeMinimum)} to ${str(pay.PayRangeMaximum)} ${str(record.PayRangeCurrencyCode)}`.trim());
+  }
+  const amount = record.CompensationAmount;
+  if (str(amount?.Value)) {
+    const salaried = record.Salaried === true;
+    meta.push(`${salaried ? 'Salary' : 'Pay'}: ${[str(amount.Value), str(amount.Code), salaried ? 'per year' : ''].filter(Boolean).join(' ')}`);
+  }
+  if (typeof record.TravelRequired === 'boolean') {
+    const travel = str(record.TravelDescription);
+    meta.push(`Travel required: ${record.TravelRequired ? 'Yes' : 'No'}${travel ? ` (${travel})` : ''}`);
+  }
+  const posted = str(record.PostedDate).match(/^\d{4}-\d{2}-\d{2}/);
+  if (posted) meta.push(`Posted: ${posted[0]}`);
+  if (str(record.RequisitionNumber)) meta.push(`Req ID: ${str(record.RequisitionNumber)}`);
+  if (record.OpportunityIsClosed === true) meta.push('Applications closed (OpportunityIsClosed: true)');
+
+  const qualifications = [];
+  for (const [key, label, words] of ULTIPRO_CRITERIA) {
+    const items = Array.isArray(record[key]) ? record[key].filter((c) => c && typeof c === 'object') : [];
+    // Required first, then preferred, as the page groups them.
+    for (const required of [true, false]) {
+      for (const c of items.filter((item) => (item.Required === true) === required)) {
+        const text = words(c).map(str).filter(Boolean).join(': ');
+        if (text) qualifications.push(`- ${label} (${required ? 'required' : 'preferred'}): ${text}`);
+      }
+    }
+  }
+
+  return {
+    url: postingUrl,
+    title: compactText(str(record.Title), 300),
+    text: compactText([
+      meta.join('\n'),
+      qualifications.length ? `Qualifications:\n${qualifications.join('\n')}` : '',
+      body,
+    ].filter(Boolean).join('\n\n'), textCap),
+  };
+}
+
+async function fetchUltiproJd(apiUrl, id, postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(apiUrl)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(apiUrl, {
+      headers: { accept: 'text/html', 'user-agent': DEFAULT_USER_AGENT },
+      redirect: 'error',
+      signal: controller.signal,
+    });
+    if (!res.ok) return await discard(res);
+    return normalizeUltiproJob(await res.text(), id, postingUrl, textCap);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Workable full-body JD, independent of liveness state and listing text caps. */
+export function normalizeWorkableJob(json, shortcode, postingUrl, textCap = JD_TEXT_CAP) {
+  if (!json || typeof json !== 'object' || json.shortcode !== shortcode ||
+      typeof json.title !== 'string' || !json.title.trim()) return null;
+  const title = compactText(jdHtmlToText(json.title), 300);
+  if (!title) return null;
+  const blocks = [];
+  for (const [key, label] of [['description', 'Description'], ['requirements', 'Requirements'], ['benefits', 'Benefits']]) {
+    const html = typeof json[key] === 'string' ? json[key] : '';
+    // Decode before removing chrome: the API can entity-escape its HTML tags.
+    const body = jdHtmlToText(decodeEntities(html).replace(/<(nav|header|footer)\b[^>]*>[\s\S]*?<\/\1>/gi, ' '));
+    if (/[\p{L}\p{N}]/u.test(body)) blocks.push(`${label}:\n${body}`);
+  }
+  if (!blocks.length) return null;
+  return {
+    url: postingUrl,
+    title,
+    text: compactText(blocks.join('\n\n'), textCap),
+  };
+}
+
+/** Reuse the resolver's guarded share-link hop; never follow API redirects. */
+async function fetchWorkableJd(resolved, postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(resolved.apiUrl)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const options = {
+    headers: { accept: 'application/json', 'user-agent': DEFAULT_USER_AGENT },
+    redirect: 'error',
+    signal: controller.signal,
+  };
+  // The share link's redirect, of which only the status and Location header
+  // are read. Its body is drained last: both requests share one timer, so a
+  // slow body read first would spend the posting request's budget.
+  let redirect;
+  try {
+    let apiUrl = resolved.apiUrl;
+    if (resolved.followEmbed) {
+      redirect = await fetch(apiUrl, { ...options, redirect: 'manual' });
+      apiUrl = await resolved.followEmbed(redirect, resolved.parts);
+      if (!apiUrl || rejectPrivateOrInvalid(apiUrl)) return null;
+    }
+    const res = await fetch(apiUrl, options);
+    if (!res.ok) return await discard(res);
+    return normalizeWorkableJob(await res.json(), resolved.parts.shortcode, postingUrl, textCap);
+  } catch {
+    return null;
+  } finally {
+    if (redirect) await discard(redirect);
     clearTimeout(timer);
   }
 }
@@ -555,10 +909,13 @@ async function fetchLeverJd(apiUrl, postingUrl, textCap, timeoutMs) {
  * same deletion reddens it.
  *
  * Every entry takes the same `(resolved, url, textCap, timeoutMs)` shape so
- * dispatch stays a lookup; Ashby's extra `parts.jobId` argument is unpacked
- * inside its own entry rather than widening the shared signature.
+ * dispatch stays a lookup; the extra `parts` arguments (Ashby's `jobId`, Zoho
+ * Recruit's and UltiPro's `id`) are unpacked inside their own entries rather
+ * than widening the shared signature.
  */
 export const JD_FETCHERS = {
+  workable: fetchWorkableJd,
+  'workable-short': fetchWorkableJd,
   workday: (resolved, url, textCap, timeoutMs) =>
     fetchWorkdayJd(resolved.apiUrl, url, textCap, timeoutMs),
   ashby: (resolved, url, textCap, timeoutMs) =>
@@ -567,6 +924,14 @@ export const JD_FETCHERS = {
     fetchGreenhouseJd(resolved.apiUrl, url, textCap, timeoutMs),
   lever: (resolved, url, textCap, timeoutMs) =>
     fetchLeverJd(resolved.apiUrl, url, textCap, timeoutMs),
+  'greenhouse-embedded': (resolved, url, textCap, timeoutMs) =>
+    fetchGreenhouseEmbeddedJd(resolved, url, textCap, timeoutMs),
+  smartrecruiters: (resolved, url, textCap, timeoutMs) =>
+    fetchSmartRecruitersJd(resolved.apiUrl, url, textCap, timeoutMs),
+  'zoho-recruit': (resolved, url, textCap, timeoutMs) =>
+    fetchZohoJd(resolved.apiUrl, resolved.parts.id, url, textCap, timeoutMs),
+  ultipro: (resolved, url, textCap, timeoutMs) =>
+    fetchUltiproJd(resolved.apiUrl, resolved.parts.id, url, textCap, timeoutMs),
 };
 
 /**
@@ -607,18 +972,51 @@ export async function fetchJdViaKnownApi(url, textCap = JD_TEXT_CAP, timeoutMs =
  * A `--max-chars` below the floor is honored rather than made unsatisfiable: a
  * caller who asks for 50 chars gets 50, not a guaranteed failure.
  */
-function emitJd(result, maxChars) {
+/**
+ * Why a jd-mode result cannot be emitted, or null when it can. Pure — exported
+ * for tests.
+ *
+ * A page whose cleaned text is below the floor is either unreadable (a client-
+ * rendered shell: `empty_text`, worth another attempt) or gone (the posting
+ * was taken down: `unavailable`, terminal). Both produce the same empty text,
+ * because the "no longer available" banner usually sits in a header or footer
+ * that readDom() strips — so the unstripped body is checked too. A result at or
+ * above the floor is never reclassified: a full JD may quote such a phrase.
+ */
+export function jdFailure(result, maxChars) {
   const floor = Math.min(MIN_JD_TEXT_CHARS, maxChars);
-  if (result.text.length < floor) {
-    console.error(JSON.stringify({
-      error: `extracted ${result.text.length} chars of JD text (minimum ${floor}) — the page most likely renders its content client-side`,
-      code: 'empty_text',
-      url: result.url,
-    }));
+  if (result.text.length >= floor) return null;
+  // The shared liveness classifier, not a second phrase list. Only its
+  // posting-specific expiry verdicts count: `insufficient_content` is what a
+  // page that has not rendered yet looks like (liveness-browser treats it the
+  // same way), so it stays empty_text and remains worth retrying.
+  const verdict = classifyLiveness({
+    requestedUrl: result.url,
+    finalUrl: result.url,
+    bodyText: `${result.text}\n${result.bodyText || ''}`,
+  });
+  if (verdict.result === 'expired' && (verdict.code === 'expired_body' || verdict.code === 'expired_body_soft')) {
+    return { error: `posting is no longer available (${verdict.reason})`, code: 'unavailable', url: result.url };
+  }
+  return {
+    error: `extracted ${result.text.length} chars of JD text (minimum ${floor}) — the page most likely renders its content client-side`,
+    code: 'empty_text',
+    url: result.url,
+    body_text: String(result.bodyText || '').slice(0, 4000),
+  };
+}
+
+function emitJd(result, maxChars) {
+  const failure = jdFailure(result, maxChars);
+  if (failure) {
+    console.error(JSON.stringify(failure));
     process.exitCode = 1;
     return;
   }
-  process.stdout.write(JSON.stringify(result));
+  // bodyText exists only for jdFailure(); drop it so the documented success
+  // shape `{ url, title, text }` is unchanged.
+  const { bodyText: _bodyText, ...emitted } = result;
+  process.stdout.write(JSON.stringify(emitted));
 }
 
 /**
@@ -726,19 +1124,41 @@ export function parseArgs(argv) {
 
 // Read the raw DOM inside the page: title, main visible text, and visible
 // anchors. Runs in the browser context; returns plain data only.
-async function readDom(page) {
+export async function readDom(page) {
   return page.evaluate(() => {
     const title = (document.querySelector('h1')?.innerText || document.title || '').trim();
 
     // Main text: prefer <main>/[role=main]/<article>, else body; strip nav chrome.
-    const root =
-      document.querySelector('main, [role="main"], article') || document.body;
+    // Keep the candidate with the most text left after stripping, not the first
+    // match: a board can lead with a short <article> (a share widget) ahead of
+    // the one holding the posting, and a <main> that is mostly menu would
+    // otherwise outrank it.
+    // Read innerText from the live element: on a detached clone it degrades to
+    // textContent, so CSS-hidden text would count and could outrank the posting.
+    // The chrome is hidden only for the read and its style attribute restored.
+    // script/style/noscript are never rendered, so innerText already skips them.
+    const strippedText = (el) => {
+      if (el.getClientRects().length === 0 && getComputedStyle(el).display !== 'contents') return '';
+      const chrome = Array.from(el.querySelectorAll('nav, header, footer'));
+      const saved = chrome.map((n) => n.getAttribute('style'));
+      // Attribute writes only: setting a property through n.style leaves style=""
+      // behind after removeAttribute. The prefix is the browser's serialized
+      // cssText, not the raw attribute, so an unterminated token in the original
+      // (an open /* comment) cannot swallow the appended display:none.
+      chrome.forEach((n) => n.setAttribute('style', `${n.style.cssText} display: none !important;`));
+      try {
+        return el.innerText || '';
+      } finally {
+        chrome.forEach((n, i) => (saved[i] == null ? n.removeAttribute('style') : n.setAttribute('style', saved[i])));
+      }
+    };
+    const candidates = Array.from(document.querySelectorAll('main, [role="main"], article'));
     let text = '';
-    if (root) {
-      const clone = root.cloneNode(true);
-      clone.querySelectorAll('script, style, nav, header, footer, noscript').forEach((el) => el.remove());
-      text = clone.innerText || '';
+    for (const el of candidates) {
+      const t = strippedText(el);
+      if (t.length > text.length) text = t;
     }
+    if (candidates.length === 0 && document.body) text = strippedText(document.body);
 
     const anchors = Array.from(document.querySelectorAll('a[href]'))
       .filter((el) => {
@@ -785,7 +1205,14 @@ async function readDom(page) {
       }
     }
 
-    return { title, text, anchors, jsonLdDescription, jsonLdTitle };
+    // The unstripped body: `text` above removes nav/header/footer, where an
+    // expired-posting banner often lives.
+    // Head and tail, so a banner in the footer is still in the sample when the
+    // leading content fills the first 4000 characters.
+    const fullBody = document.body?.innerText || '';
+    const bodyText = fullBody.length > 4000 ? `${fullBody.slice(0, 2000)}\n…\n${fullBody.slice(-2000)}` : fullBody;
+
+    return { title, text, anchors, jsonLdDescription, jsonLdTitle, bodyText };
   });
 }
 
@@ -847,7 +1274,7 @@ async function main() {
 
   let browser;
   try {
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch(browserLaunchOptions({ headless: true }));
     const context = await browser.newContext(LIVENESS_CONTEXT_OPTIONS);
     // Block every request (main navigation, redirect hop, or subresource) to a
     // private/loopback/link-local or non-http(s) host. Guarding only the initial

@@ -39,6 +39,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline';
 import { createHash } from 'crypto';
+import { sleep } from './_http.mjs';
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -256,7 +257,6 @@ async function checkSession(page) {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 const randomDelay = ([min, max]) => Math.floor(Math.random() * (max - min) + min);
 
 // Defensive — if a user supplies a scalar/string for delay_pages or

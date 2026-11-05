@@ -9,7 +9,14 @@
      their font stacks with var(--font-family). This template styles the Latin
      path directly, so define the token as the same stack — without it those
      declarations are invalid and silently dropped. */
-  :root { --font-family: 'Helvetica', 'Arial', sans-serif; }
+  :root {
+    --font-family: "Helvetica", Arial, "Arial Unicode MS", sans-serif;
+    /* Roles and projects may flow across a page break (see the break-inside
+       rules below). Override via config/profile.yml `style.job_break_inside:
+       avoid` / `style.project_break_inside: avoid` to keep each one whole. */
+    --job-break-inside: auto;
+    --project-break-inside: auto;
+  }
 
   /* ATS-safe typography: this template uses a standard static system sans
      stack (Helvetica/Arial) so PDF text extractors read clean, machine-readable
@@ -73,10 +80,10 @@
     margin-bottom: 10px;
   }
 
-  /* The contact block is emitted as one .contact-row by build-cv-html.mjs, with
-     its items joined by "|" separators. This layout stacks them one per line and
-     drops the separators. `order: -1` lifts the location (the only non-separator
-     <span>; every other item is an <a>) back to the top line. */
+  /* The contact block is rebuilt as one .contact-row by build-cv-html.mjs. This
+     layout stacks its items one per line, so it needs no separators (a column
+     never wraps mid-row). `order: -1` lifts the location (the only <span>; every
+     other item is an <a>) back to the top line. */
   .contact-row {
     display: flex;
     flex-direction: column;
@@ -86,9 +93,7 @@
     color: #000000;
   }
 
-  .contact-row .separator { display: none; }
-
-  .contact-row > span:not(.separator) { order: -1; }
+  .contact-row > span { order: -1; }
 
   .contact-row a {
     color: #1155cc;
@@ -176,6 +181,8 @@
   /* === EXPERIENCE === */
   .job {
     margin-bottom: 14px;
+    page-break-inside: var(--job-break-inside, auto);
+    break-inside: var(--job-break-inside, auto);
   }
 
   .job-header {
@@ -348,6 +355,8 @@
   /* === PROJECTS (kept for parity; the block strips itself when empty) === */
   .project {
     margin-bottom: 8px;
+    page-break-inside: var(--project-break-inside, auto);
+    break-inside: var(--project-break-inside, auto);
   }
 
   .project-title {
@@ -583,16 +592,12 @@
   <!-- HEADER -->
   <div class="header">
     <div class="header-name">{{NAME}}</div>
-    {{TARGET_TITLE}}
+    {{TITLE_BLOCK}}
     <div class="contact-row">
       <a href="tel:{{PHONE}}">{{PHONE}}</a>
-      <span class="separator">|</span>
       <a href="mailto:{{EMAIL}}">{{EMAIL}}</a>
-      <span class="separator">|</span>
       <a href="{{LINKEDIN_URL}}">{{LINKEDIN_DISPLAY}}</a>
-      <span class="separator">|</span>
       <a href="{{PORTFOLIO_URL}}">{{PORTFOLIO_DISPLAY}}</a>
-      <span class="separator">|</span>
       <span>{{LOCATION}}</span>
     </div>
   </div>

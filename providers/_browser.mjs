@@ -9,6 +9,7 @@
 // The browser is launched on first fetch and closed at process exit.
 
 import { fetchJson as httpFetchJson, assertSafeHttpUrl } from './_http.mjs';
+import { DEFAULT_USER_AGENT } from '../user-agent.mjs';
 
 const DEFAULT_NAVIGATE_TIMEOUT_MS = 30_000;
 let browserPromise = null;
@@ -37,7 +38,7 @@ export async function closeBrowser() {
 async function withPage(fn) {
   const browser = await getBrowser();
   const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (compatible; career-ops/1.3)',
+    userAgent: DEFAULT_USER_AGENT,
   });
   const page = await context.newPage();
   try {
