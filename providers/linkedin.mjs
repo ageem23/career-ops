@@ -58,7 +58,14 @@ const SELECTORS = {
   // for each job card on the search page. The previous "Dismiss button →
   // ancestor div[role='button']" XPath stopped matching when LinkedIn dropped
   // the per-card Dismiss control from the default search list.
-  listingCard: 'div[data-job-id]',
+  //
+  // Around 2026-11-03 /jobs/search/ started redirecting to a redesigned
+  // /jobs/search-results/ page: hashed class names, no data-job-id, no h1.
+  // Cards there are `div[role=button][componentkey="job-card-component-ref-<id>"]`
+  // (an inner div repeats the componentkey, hence the role filter). Both
+  // layouts are matched in case LinkedIn is still A/B-testing the redesign.
+  listingCard: 'div[data-job-id], div[role="button"][componentkey^="job-card-component-ref-"]',
+  cardComponentKeyPrefix: 'job-card-component-ref-',
   cardJobsViewLink: 'a[href*="/jobs/view/"]',
 
   // Detail panel selectors. Primary uses dedicated CSS classes shipped with
@@ -67,7 +74,10 @@ const SELECTORS = {
   panelTitle: '.job-details-jobs-unified-top-card__job-title h1, h1.t-24, h1',
   panelCompany: '.job-details-jobs-unified-top-card__company-name a, .job-details-jobs-unified-top-card__company-name',
   panelApply: 'a[aria-label*="Apply"]:not([aria-label*="Easy"]):not([aria-label*="continue"])',
-  panelJdContent: '#job-details, .jobs-description__container, .jobs-box__html-content',
+  panelJdContent: '#job-details, .jobs-description__container, .jobs-box__html-content, [componentkey^="JobDetails_AboutTheJob_"]',
+  // Redesigned layout: the panel title is the page's only /jobs/view/ link
+  // (cards no longer link there).
+  panelTitleRedesign: 'a[href*="/jobs/view/"]',
   panelMoreButton: '.jobs-description__footer-button button, button.jobs-description__footer-button',
 
   // Logged-in probe. Anchored on the nav href, not its aria-label: LinkedIn
@@ -77,6 +87,11 @@ const SELECTORS = {
   // fallbacks in case the nav markup changes again.
   loggedIn: 'a[href*="/mynetwork"], a[aria-label*="My Network"], a[aria-label^="Network"]',
 };
+
+// Redesigned layout: the JD section is keyed by job id, so waiting on it
+// confirms the panel switched to the clicked card. Kept outside SELECTORS,
+// which is passed whole into page.evaluate and must stay serializable.
+const panelAboutForJob = id => `[componentkey="JobDetails_AboutTheJob_${id}"]`;
 
 const NOISE_LABELS = new Set([
   'more', 'show more', 'see more',
@@ -402,7 +417,9 @@ async function getCardCount(page) {
 }
 
 async function getCardJobIds(page) {
-  return page.evaluate(sel => [...document.querySelectorAll(sel)].map(c => c.getAttribute('data-job-id')), SELECTORS.listingCard);
+  return page.evaluate(({ sel, prefix }) => [...document.querySelectorAll(sel)].map(c =>
+    c.getAttribute('data-job-id') || (c.getAttribute('componentkey') || '').replace(prefix, '') || null
+  ), { sel: SELECTORS.listingCard, prefix: SELECTORS.cardComponentKeyPrefix });
 }
 
 async function clickCard(page, index) {
@@ -419,11 +436,14 @@ async function clickCard(page, index) {
   }, { sel: SELECTORS.listingCard, link: SELECTORS.cardJobsViewLink, idx: index });
 }
 
-async function extractDetailFromPanel(page) {
+async function extractDetailFromPanel(page, jobId) {
   // Wait for the right-pane to populate before reading. LinkedIn sometimes
   // renders the panel shell before the company name DOM mounts (sponsored
   // placements especially), which produced empty-company entries in scans.
-  await page.waitForSelector(SELECTORS.panelCompany, { state: 'visible', timeout: 5000 }).catch(() => {});
+  // The redesigned layout has no panelCompany element, so also accept its
+  // job-keyed JD section — otherwise every card would burn the full timeout.
+  const ready = jobId ? `${SELECTORS.panelCompany}, ${panelAboutForJob(jobId)}` : SELECTORS.panelCompany;
+  await page.waitForSelector(ready, { state: 'visible', timeout: 5000 }).catch(() => {});
 
   // Expand description if collapsed (best-effort; some panels render fully
   // expanded already, in which case the button isn't present).
@@ -434,20 +454,29 @@ async function extractDetailFromPanel(page) {
   await sleep(500);
 
   return page.evaluate(({ sel, noiseLabels, minLen }) => {
-    const titleEl = document.querySelector(sel.panelTitle);
-    let title = titleEl?.textContent?.trim() ?? '';
+    // Redesigned layout: document.title is "<title> | <company> | LinkedIn"
+    // and tracks the selected card — the company's only plain-text source.
+    const docParts = document.title.split(' | ');
+    const fromDocTitle = docParts.length >= 3 && docParts[docParts.length - 1].trim() === 'LinkedIn'
+      ? { title: docParts.slice(0, -2).join(' | ').trim(), company: docParts[docParts.length - 2].trim() }
+      : { title: '', company: '' };
+
+    // Not folded into the panelTitle list: querySelector returns the first
+    // match in document order, and the old layout's card links precede its h1.
+    const titleEl = document.querySelector(sel.panelTitle) || document.querySelector(sel.panelTitleRedesign);
+    let title = titleEl?.textContent?.trim() || fromDocTitle.title;
     if (noiseLabels.includes(title.toLowerCase()) || title.length < minLen) {
       title = '';
     }
 
     const companyEl = document.querySelector(sel.panelCompany);
-    const company = companyEl?.textContent?.trim() ?? '';
+    const company = companyEl?.textContent?.trim() || fromDocTitle.company;
 
     const applyEl = document.querySelector(sel.panelApply);
     const applicationUrl = applyEl?.href?.trim() ?? '';
 
     const jdEl = document.querySelector(sel.panelJdContent);
-    const jdText = jdEl?.innerText?.trim() ?? '';
+    const jdText = (jdEl?.innerText?.trim() ?? '').replace(/^About the job\s*/, '');
 
     return { title, company, applicationUrl, jdText, url: window.location.href };
   }, { sel: SELECTORS, noiseLabels: [...NOISE_LABELS], minLen: MIN_TITLE_LENGTH });
@@ -560,7 +589,7 @@ async function runSearch(page, entry) {
       }
       await sleep(randomDelay(delayPages));
 
-      const detail = await extractDetailFromPanel(page);
+      const detail = await extractDetailFromPanel(page, jobId);
       if (!detail.title) {
         warn(`  ✗ No title on card ${i}`);
         continue;
@@ -570,6 +599,10 @@ async function runSearch(page, entry) {
         continue;
       }
       detail.applicationUrl = unwrapRedirect(detail.applicationUrl);
+      // The redesigned search URL carries per-visit tracking tokens (eBP,
+      // refId, trackingId), which would change saveJd's hash every scan and
+      // put a throwaway link in report headers. The job id is the stable part.
+      if (jobId) detail.url = `https://www.linkedin.com/jobs/view/${jobId}/`;
 
       if (!detail.jdText) {
         warn(`  ✗ No JD text: ${detail.title}`);
