@@ -1,0 +1,1282 @@
+#!/usr/bin/env node
+/**
+ * career-ops OpenRouter Runner
+ * No Claude Code CLI required — uses OpenRouter free models with automatic fallback.
+ *
+ * Usage:
+ *   node openrouter-runner.mjs scan              → Scan Greenhouse API companies for new listings
+ *   node openrouter-runner.mjs evaluate <url>    → Evaluate a job by URL
+ *   node openrouter-runner.mjs evaluate          → Paste job text interactively
+ *   node openrouter-runner.mjs pipeline          → Process all pending URLs from pipeline.md
+ *   node openrouter-runner.mjs apply <report_no> → Generate draft application form answers
+ *   node openrouter-runner.mjs models            → List available free models
+ *   node openrouter-runner.mjs help              → Show this help
+ *
+ * Setup:
+ *   1. copy .env.example .env
+ *   2. Add OPENROUTER_API_KEY=sk-or-v1-... to .env
+ *   3. Free API key: https://openrouter.ai
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import readline from 'node:readline';
+import { loadYaml } from './lib/yaml-document.mjs';
+import { outputLanguageInstruction, parseOutputLanguage } from './profile-language.mjs';
+import { TSV_ADDITION_HEADER } from './tracker-parse.mjs';
+import { normalizedTrackerScore } from './lib/tracker-addition.mjs';
+import {
+  formatReportNumber, releaseReportNumbers, reserveReportNumbers,
+} from './reserve-report-num.mjs';
+import { TokenAccumulator, formatBreakdown, normalizeOpenAIUsage } from './utils/token-tracker.mjs';
+import { anonymizeContext } from './utils/privacy-filter.mjs';
+import { DEFAULT_USER_AGENT } from './user-agent.mjs';
+import { buildTitleFilter } from './title-keywords.mjs';
+import {
+  appendToPipeline, appendToScanHistory, atomicWriteFile, BROWSER_PROCESS_ENV,
+} from './scan.mjs';
+import { withPipelineLock } from './pipeline-lock.mjs';
+import { createAdmissionGate, formatSkipCounts } from './lib/admission-gate.mjs';
+import { localToday } from './lib/local-today.mjs';
+import { getCareerOpsRoot, getProfilePath } from './path-resolver.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { withJdArchiveSection } from './lib/jd-archive-section.mjs';
+import { locateApplyReport } from './apply-scope.mjs';
+import { classifyLiveness, isUnreadableVerdict } from './liveness-core.mjs';
+import { installPiiInterceptor } from './lib/pii-interceptor.mjs';
+import { assertLlmRequestAllowed } from './lib/llm-outbound.mjs';
+import { browserLaunchOptions } from './lib/browser-launch.mjs';
+
+// Ambient privacy guard over global fetch. Installed explicitly here (rather
+// than relying on NODE_OPTIONS) so the OpenRouter path is guarded in a plain
+// checkout. Idempotent — a second install is a no-op.
+installPiiInterceptor();
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const tracker = new TokenAccumulator();
+let activeModel = null;
+
+// ---------------------------------------------------------------------------
+// .env loader
+// ---------------------------------------------------------------------------
+// Lazy: only runs when this file is the CLI entry point (`node
+// openrouter-runner.mjs ...`). Importing the module (e.g. for buildSystemPrompt
+// in test-all.mjs) must NOT mutate process.env — a module-level loader here
+// leaked every .env key (including CAREER_OPS_CLI) into the importing process
+// and broke later CLI-resolution tests.
+function loadEnvFile() {
+  const envPath = path.join(__dirname, '.env');
+  if (!fs.existsSync(envPath)) return;
+  for (const line of fs.readFileSync(envPath, 'utf-8').split('\n')) {
+    const m = line.trim().match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+    if (m && process.env[m[1]] === undefined) {
+      process.env[m[1]] = m[2].trim().replace(/^(['"])(.*?)\1$/, '$2');
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models';
+const MAX_TOKENS = 8192;
+const RATE_LIMIT_DELAY_MS = 2500;  // pause between requests on free tier
+const DEFAULT_MODEL_TIMEOUT_MS = 120_000;
+// setTimeout() treats delays above 2^31-1 ms as 1 ms, so larger overrides are rejected.
+const MAX_TIMEOUT_MS = 2_147_483_647;
+const parseTimeoutOverride = (val) => {
+  if (typeof val !== 'string') return null;
+  const trimmed = val.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const parsed = Number.parseInt(trimmed, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= MAX_TIMEOUT_MS ? parsed : null;
+};
+// Resolved on each call (not at import) so overrides loaded later from .env apply.
+const getModelTimeoutMs = () =>
+  parseTimeoutOverride(process.env.CAREER_OPS_TIMEOUT_MS) ??
+  parseTimeoutOverride(process.env.OPENROUTER_TIMEOUT_MS) ??
+  DEFAULT_MODEL_TIMEOUT_MS;
+
+// ---------------------------------------------------------------------------
+// Quota & response validation errors
+// ---------------------------------------------------------------------------
+export class QuotaExhaustedError extends Error {
+  constructor(message = 'OpenRouter free-model daily quota exhausted') {
+    super(message);
+    this.name = 'QuotaExhaustedError';
+  }
+}
+
+export function isDailyQuotaExhausted(status, bodyText) {
+  if (status !== 429) return false;
+  const lower = String(bodyText || '').toLowerCase();
+  return lower.includes('free-models-per-day') ||
+    lower.includes('daily limit exceeded') ||
+    lower.includes('free model daily quota') ||
+    lower.includes('per-day limit') ||
+    lower.includes('daily quota exceeded');
+}
+
+export function validateEvaluationResponse(content) {
+  if (!content || typeof content !== 'string') {
+    return { ok: false, reason: 'empty_response' };
+  }
+  const text = content.trim();
+  if (text.length === 0) {
+    return { ok: false, reason: 'empty_response' };
+  }
+
+  // 1. Reject malformed tool-call markup
+  const toolCallPatterns = [
+    /<tool_call[\s>]/i,
+    /<\/tool_call>/i,
+    /<dots_function_call[\s>]/i,
+    /<\/dots_function_call>/i,
+    /<\|tool_call_start\|>/i,
+    /<\|tool_call_end\|>/i,
+    /<arg_key>/i,
+    /<arg_value>/i,
+    /<parameter[\s>]/i,
+    /<\/parameter>/i,
+    /<invoke[\s>]/i,
+    /<\/invoke>/i,
+    /playwright<param_key>/i,
+  ];
+  for (const pat of toolCallPatterns) {
+    if (pat.test(text)) {
+      return { ok: false, reason: 'contains_tool_call_markup' };
+    }
+  }
+
+  // 2. Reject JSON tool invocation requests
+  if (/^\s*\[?\s*\{\s*"tool"\s*:/i.test(text) ||
+    /\{\s*"tool"\s*:\s*"(?:browser_navigate|browser_snapshot|bash|playwright)"/i.test(text) ||
+    /\{\s*"command"\s*:\s*"[^"]*"\s*,\s*"description"\s*:/i.test(text)) {
+    return { ok: false, reason: 'json_tool_request' };
+  }
+
+  // 3. Reject browser commands / session placeholders
+  if (/(?:browser_navigate|browser_snapshot)\s*[<{("']/i.test(text) ||
+    /(?:<arg_value>|["']url["']:\s*["'])https?:\/\/[^\s"']+.*?browser_navigate/i.test(text) ||
+    /^\s*Browser session opened\./im.test(text) ||
+    /^\s*visiting URL:\s*http/im.test(text)) {
+    return { ok: false, reason: 'browser_command_instruction' };
+  }
+
+  // 4. Reject safety stubs / extraction fallbacks
+  if (/^\s*User Safety:\s*safe/im.test(text)) {
+    return { ok: false, reason: 'safety_filter_placeholder' };
+  }
+  if (/You need to enable JavaScript to run this app/i.test(text)) {
+    return { ok: false, reason: 'unrendered_spa_error' };
+  }
+  if (/^\s*fetching job description from URL/im.test(text) && text.length < 600) {
+    return { ok: false, reason: 'incomplete_fetch_placeholder' };
+  }
+
+  // 5. Reject shell command instructions presented instead of report
+  if (/```(?:bash|sh)\s*\n\s*(?:node browser-extract\.mjs|cat \/workspace\/)/i.test(text) ||
+    /\bnode\s+reserve-report-num(?:\.mjs)?\b/i.test(text) ||
+    /node browser-extract\.mjs.*--mode jd/i.test(text) ||
+    /cat \/workspace\/data\/blacklist/i.test(text)) {
+    return { ok: false, reason: 'shell_command_instruction' };
+  }
+
+  // 6. Minimum content length for a genuine evaluation report
+  if (text.length < 350) {
+    return { ok: false, reason: 'content_too_short' };
+  }
+
+  // 7. Require essential sections from the A-G evaluation format
+  const blocks = [
+    ['A', /(?:^|\n)#{1,4}\s*(?:A(?![A-Za-z0-9])[).:-]?\s*|Block A\b|Role Summary\b)/im],
+    ['B', /(?:^|\n)#{1,4}\s*(?:B(?![A-Za-z0-9])[).:-]?\s*|Block B\b|Match with CV\b|CV Match\b)/im],
+    ['C', /(?:^|\n)#{1,4}\s*(?:C(?![A-Za-z0-9])[).:-]?\s*|Block C\b|Level and Strategy\b)/im],
+    ['D', /(?:^|\n)#{1,4}\s*(?:D(?![A-Za-z0-9])[).:-]?\s*|Block D\b|Comp and Demand\b)/im],
+    ['E', /(?:^|\n)#{1,4}\s*(?:E(?![A-Za-z0-9])[).:-]?\s*|Block E\b|Customization Plan\b|Personalization Plan\b|Tailoring Plan\b)/im],
+    ['F', /(?:^|\n)#{1,4}\s*(?:F(?![A-Za-z0-9])[).:-]?\s*|Block F\b|Interview Plan\b)/im],
+    ['G', /(?:^|\n)#{1,4}\s*(?:G(?![A-Za-z0-9])[).:-]?\s*|Block G\b|Posting Legitimacy\b|Legitimacy\b)/im],
+  ];
+
+  for (const [letter, pattern] of blocks) {
+    if (!pattern.test(text)) {
+      return { ok: false, reason: `missing_block_${letter}` };
+    }
+  }
+
+  // 8. Require Score or Decision
+  const hasScoreOrDecision = /(?:^|\n)\s*\*?\*?\s*(?:Score|Puntuaci[oó]n|Note|Bewertung)\s*:\*?\*?\s*\d/im.test(text) ||
+    /(?:^|\n)\s*\*?\*?\s*(?:Decision|D[eé]cision|Entscheidung)\s*:\*?\*?\s*\*?\*?(?:Apply|Consider|Research first|Skip)/im.test(text) ||
+    /(?:^|\n)\s*score:\s*\d+(?:\.\d+)?/im.test(text) ||
+    /(?:^|\n)\s*final_decision:\s*["']?(?:Apply|Consider|Research first|Skip)/im.test(text);
+
+  if (!hasScoreOrDecision) {
+    return { ok: false, reason: 'missing_score_or_decision' };
+  }
+
+  return { ok: true };
+}
+
+// Provider priority order — models are sorted by provider prefix, not hardcoded names.
+// Add, remove, or reorder providers here; model names are resolved at runtime from the API.
+const PROVIDER_PRIORITY = [
+  'google',
+  'qwen',
+  'openai',
+  'meta-llama',
+  'nvidia',
+  'mistralai',
+  'nousresearch',
+  'minimax',
+  'arcee-ai',
+  // any unlisted provider goes last (alphabetical)
+];
+
+// In-memory model list — populated on first callOpenRouter()
+let freeModels = null;   // string[]
+let modelIndex = 0;      // current position in rotation
+
+// Persistent blacklist file — survives process restarts. data/ is User Layer
+// (gitignored runtime state), so it follows the data root like every other
+// data/ path this runner touches.
+const BLACKLIST_DIR = path.join(getCareerOpsRoot(), 'data');
+const BLACKLIST_FILE = path.join(BLACKLIST_DIR, 'model-blacklist.json');
+function loadPersistedBlacklist() {
+  try {
+    const data = JSON.parse(fs.readFileSync(BLACKLIST_FILE, 'utf-8'));
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
+}
+function saveBlacklist(set) {
+  try {
+    fs.mkdirSync(BLACKLIST_DIR, { recursive: true });
+    fs.writeFileSync(BLACKLIST_FILE, JSON.stringify([...set], null, 2), 'utf-8');
+  } catch { }
+}
+
+// Models that failed permanently (403, timeout, persistent 429) — never retry
+const blacklistedModels = new Set(loadPersistedBlacklist());
+if (blacklistedModels.size > 0) {
+  console.log(`[blacklist] Loaded ${blacklistedModels.size} pre-blacklisted model(s) from disk.`);
+}
+// 429 failure count per model — auto-blacklist after 3 consecutive 429s
+// (a success or any other failure resets the count)
+const rateLimitCounts = {};
+
+// ---------------------------------------------------------------------------
+// Fetch free models from OpenRouter API
+// ---------------------------------------------------------------------------
+async function loadFreeModels() {
+  if (freeModels !== null) return freeModels;
+
+  try {
+    const resp = await fetch(OPENROUTER_MODELS_URL, {
+      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}` }
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+
+    // A model is free when its prompt and completion pricing are both "0"
+    const list = (data.data ?? [])
+      .filter(m => {
+        const p = m.pricing ?? {};
+        return String(p.prompt) === '0' && String(p.completion) === '0';
+      })
+      .map(m => m.id);
+
+    if (list.length === 0) throw new Error('No free models found in API response');
+
+    // Sort by provider priority; within the same provider sort alphabetically
+    function providerOf(id) { return id.split('/')[0]; }
+    function priorityOf(id) {
+      const idx = PROVIDER_PRIORITY.indexOf(providerOf(id));
+      return idx === -1 ? PROVIDER_PRIORITY.length : idx;
+    }
+
+    freeModels = list.sort((a, b) => {
+      const diff = priorityOf(a) - priorityOf(b);
+      if (diff !== 0) return diff;
+      if (providerOf(a) === 'minimax' && providerOf(b) === 'minimax') {
+        const flash = 'minimax/minimax-m3.1-flash:free';
+        if (a === flash) return b === flash ? 0 : -1;
+        if (b === flash) return 1;
+      }
+      return a.localeCompare(b);
+    });
+
+    console.log(`[models] ${freeModels.length} free models loaded from OpenRouter API.`);
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    const hasKey = Boolean(process.env.OPENROUTER_API_KEY);
+    throw new Error(
+      `[models] Failed to fetch free model list: ${reason}. ` +
+      (hasKey ? 'Check that your API key is valid and that network access to OpenRouter is available.'
+        : 'OPENROUTER_API_KEY is not set — copy .env.example to .env and add your key.')
+    );
+  }
+
+  return freeModels;
+}
+
+// List and exit (helper command)
+async function cmdModels() {
+  const models = await loadFreeModels();
+  console.log(`\nFree models available on OpenRouter (${models.length} total):\n`);
+  models.forEach((id, i) => console.log(`  ${String(i + 1).padStart(2)}. ${id}`));
+  console.log('');
+}
+
+// ---------------------------------------------------------------------------
+// File helpers
+// ---------------------------------------------------------------------------
+// Anchored to the career-ops data root, not to __dirname. scan.mjs resolves
+// every path it touches through getCareerOpsRoot(), so with CAREER_OPS_DATA_DIR
+// set this module was reading a DIFFERENT data/scan-history.tsv than the shared
+// writers it now delegates to — dedup would clear a URL the writer then found
+// present, or skip one it had never seen. The default is unchanged: with no
+// env and no .career-ops-data marker, getCareerOpsRoot() returns the same
+// directory __dirname did.
+const DATA_ROOT = getCareerOpsRoot();
+// System-layer files ship with the code and never follow the data root: a data
+// root outside the checkout holds cv.md and modes/_profile.md, but no
+// modes/_shared.md or modes/oferta.md. Read through readFile() those came back
+// null, fell through to '', and the evaluation ran on a system prompt with no
+// shared rules and no evaluation mode (#5115). Same split as ollama-eval.mjs
+// and gemini-eval.mjs.
+const CODE_ROOT = __dirname;
+
+function readFile(relPath) {
+  try { return fs.readFileSync(path.join(DATA_ROOT, relPath), 'utf-8'); }
+  catch { return null; }
+}
+
+function readProfile() {
+  try { return fs.readFileSync(getProfilePath(), 'utf-8'); }
+  catch { return null; }
+}
+
+function readSystemFile(relPath) {
+  try { return fs.readFileSync(path.join(CODE_ROOT, relPath), 'utf-8'); }
+  catch { return null; }
+}
+
+function writeFile(relPath, content) {
+  const full = path.join(DATA_ROOT, relPath);
+  fs.mkdirSync(path.dirname(full), { recursive: true });
+  fs.writeFileSync(full, content, 'utf-8');
+}
+
+function fileExists(relPath) {
+  // Same root as readFile() above: a fileExists that disagrees with the reader
+  // is a split-brain waiting to happen under CAREER_OPS_DATA_DIR.
+  return fs.existsSync(path.join(DATA_ROOT, relPath));
+}
+
+// ---------------------------------------------------------------------------
+// Prompt caching (#1709)
+// ---------------------------------------------------------------------------
+// The static system prefix (shared + profile + mode + cv, ~12K tokens) is
+// byte-identical across every offer in a run, yet it was re-sent and re-billed
+// on each call. Send it as a structured content block with an ephemeral
+// `cache_control` breakpoint — OpenRouter's documented prompt-caching mechanism.
+// Providers that support caching (Anthropic, Gemini, …) reuse the prefix across
+// back-to-back calls within the cache TTL; providers that don't simply ignore
+// the field, so this is a safe passthrough that never changes the prompt text.
+export function buildCachedSystemMessage(systemPrompt) {
+  return {
+    role: 'system',
+    content: [
+      { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } },
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// OpenRouter API call — automatic model rotation with fallback
+// ---------------------------------------------------------------------------
+async function callOpenRouter(systemPrompt, userMessage) {
+  const key = process.env.OPENROUTER_API_KEY;
+  if (!key) {
+    throw new Error(
+      'OPENROUTER_API_KEY not found.\n' +
+      'Copy .env.example to .env and add your API key.\n' +
+      'Free key: https://openrouter.ai'
+    );
+  }
+
+  const pinnedModel = process.env.CAREER_OPS_MODEL;
+  if (pinnedModel) {
+    activeModel = pinnedModel;
+    process.stdout.write(`[model] ${pinnedModel} (pinned) ... `);
+    const body = JSON.stringify({
+      model: pinnedModel,
+      messages: [
+        buildCachedSystemMessage(systemPrompt),
+        { role: 'user', content: userMessage },
+      ],
+      max_tokens: MAX_TOKENS,
+    });
+    const ctrl = new AbortController();
+    const timeoutMs = getModelTimeoutMs();
+    const timerId = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      // Privacy gate: the complete serialized request is inspected after prompt
+      // construction and before the network call. Throws (nothing sent) on a hit.
+      assertLlmRequestAllowed(OPENROUTER_API_URL, body);
+      const resp = await fetch(OPENROUTER_API_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${key}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://github.com/career-ops-hq/career-ops',
+          'X-Title': 'career-ops',
+        },
+        body,
+        signal: ctrl.signal,
+      });
+      if (!resp.ok) {
+        const t = await resp.text();
+        if (isDailyQuotaExhausted(resp.status, t)) {
+          throw new QuotaExhaustedError(`OpenRouter daily free-tier quota exhausted (${t.slice(0, 120)})`);
+        }
+        throw new Error(`HTTP ${resp.status}: ${t.slice(0, 120)}`);
+      }
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error.message);
+      const content = data.choices?.[0]?.message?.content ?? '';
+      if (!content) throw new Error('Empty response');
+      console.log('OK');
+      const usage = normalizeOpenAIUsage(data.usage);
+      return { content, usage };
+    } catch (e) {
+      if (e.name === 'AbortError') throw new Error(`Pinned model timed out after ${timeoutMs / 1000}s`);
+      throw e;
+    } finally {
+      clearTimeout(timerId);
+    }
+  }
+
+  const models = await loadFreeModels();
+  let lastError;
+
+  if (models.length === 0) {
+    throw new Error(
+      'No free OpenRouter models are available. Model loading may have failed, or your account currently has no free models.'
+    );
+  }
+  // Build the active (non-blacklisted) model list in rotation order
+  const active = models.filter(m => !blacklistedModels.has(m));
+  if (active.length === 0) throw new Error('All loaded models have been blacklisted this session.');
+
+  for (let attempt = 0; attempt < active.length; attempt++) {
+    const model = active[(modelIndex % active.length + attempt) % active.length];
+    activeModel = model;
+    process.stdout.write(`[model] ${model} ... `);
+
+    try {
+      const body = JSON.stringify({
+        model,
+        messages: [
+          buildCachedSystemMessage(systemPrompt),
+          { role: 'user', content: userMessage },
+        ],
+        max_tokens: MAX_TOKENS,
+      });
+
+      const controller = new AbortController();
+      const timeoutMs = getModelTimeoutMs();
+      const timerId = setTimeout(() => controller.abort(), timeoutMs);
+      let data;
+      try {
+        // Privacy gate (rotation path). Same rule as the pinned-model path above.
+        assertLlmRequestAllowed(OPENROUTER_API_URL, body);
+        const resp = await fetch(OPENROUTER_API_URL, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${key}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://github.com/career-ops-hq/career-ops',
+            'X-Title': 'career-ops',
+          },
+          body,
+          signal: controller.signal,
+        });
+        if (!resp.ok) {
+          const t = await resp.text();
+          if (isDailyQuotaExhausted(resp.status, t)) {
+            throw new QuotaExhaustedError(`OpenRouter daily free-tier quota exhausted (${t.slice(0, 120)})`);
+          }
+          throw new Error(`HTTP ${resp.status}: ${t.slice(0, 120)}`);
+        }
+        data = await resp.json();
+      } catch (e) {
+        if (e.name === 'AbortError') throw new Error(`Timeout after ${timeoutMs / 1000}s`);
+        throw e;
+      } finally {
+        clearTimeout(timerId);
+      }
+      if (data.error) throw new Error(data.error.message);
+
+      const content = data.choices?.[0]?.message?.content ?? '';
+      if (!content) throw new Error('Empty response');
+
+      const usage = normalizeOpenAIUsage(data.usage);
+
+      modelIndex = (modelIndex + attempt + 1) % active.length;
+      delete rateLimitCounts[model];
+      console.log('OK');
+      return { content, usage };
+
+    } catch (e) {
+      if (e?.code === 'PRIVACY_GUARD_BLOCKED') throw e;
+      if (e instanceof QuotaExhaustedError || e.name === 'QuotaExhaustedError') {
+        console.log(`FAILED (${e.message})`);
+        throw e;
+      }
+      lastError = e;
+      const msg = e.message.split('\n')[0];
+
+      const is403 = msg.includes('HTTP 403');
+      const isTimeout = msg.startsWith('Timeout');
+      const is429 = msg.includes('HTTP 429') || msg.includes('rate-li') || msg.includes('rate limit') || msg.includes('temporarily rate');
+      if (is403) {
+        blacklistedModels.add(model);
+        saveBlacklist(blacklistedModels);
+        console.log(`SKIP (blacklisted: ${msg})`);
+      } else if (isTimeout) {
+        // Do not permanently disk-blacklist models on transient timeouts (Safeguard 8)
+        console.log(`FAILED (${msg})`);
+        await new Promise(r => setTimeout(r, Math.min(800 * Math.pow(1.5, attempt), 3000)));
+      } else if (is429) {
+        rateLimitCounts[model] = (rateLimitCounts[model] ?? 0) + 1;
+        if (rateLimitCounts[model] >= 3) {
+          blacklistedModels.add(model);
+          saveBlacklist(blacklistedModels);
+          console.log(`SKIP (auto-blacklisted: persistent 429)`);
+        } else {
+          console.log(`FAILED (HTTP 429 [${rateLimitCounts[model]}/3])`);
+          await new Promise(r => setTimeout(r, Math.min(800 * Math.pow(1.5, attempt), 3000)));
+        }
+      } else {
+        delete rateLimitCounts[model];
+        console.log(`FAILED (${msg})`);
+        await new Promise(r => setTimeout(r, Math.min(800 * Math.pow(1.5, attempt), 3000)));
+      }
+    }
+  }
+
+  throw new Error(`All ${active.length} active models failed. Last error: ${lastError?.message}`);
+}
+
+// Exported so tests/openrouter-runner-429-reset.test.mjs and
+// tests/openrouter-runner-validation.test.mjs can script fetch()
+// against the real rotation and blacklist logic without a network or a CLI run.
+export {
+  callOpenRouter,
+  rateLimitCounts,
+  blacklistedModels,
+  getModelTimeoutMs,
+  cmdEvaluate,
+  cmdPipeline,
+};
+
+// ---------------------------------------------------------------------------
+// Context loading
+// ---------------------------------------------------------------------------
+function loadContext() {
+  // Opt-in (privacy.redact_contact_info in config/profile.yml): keep name and
+  // contact details out of the prompt sent to the model.
+  return anonymizeContext({
+    cv:          readFile('cv.md')               ?? 'CV not found.',
+    profile:     readProfile()                   ?? '',
+    shared:      readSystemFile('modes/_shared.md') ?? '',
+    profileMode: readFile('modes/_profile.md')   ?? '',
+  });
+}
+
+// The mode files are written for Claude Code, which has Playwright, WebFetch,
+// Bash and file reads. This runner sends no `tools`, so a model that follows
+// them answers with tool calls and no evaluation (#5809). Say so before them,
+// and drop the parts that tell the model to use tools.
+function noToolsNote(evaluate) {
+  return [
+    'RUNNER NOTE: you have no tools in this run.',
+    // Only evaluate sends a posting; apply sends an evaluation report.
+    evaluate
+      ? 'The job text is in the user message and the CV is below.'
+      : 'Everything you need is in the user message and the CV below.',
+    'Do not navigate, fetch, read files or run commands, and ignore any instruction below to do so.',
+  ].join('\n');
+}
+
+// Matched by heading, not line number, so edits to modes/ don't move them. A
+// section runs to the next heading of the same or a higher level, or to its
+// `until` line. A heading that is gone leaves the text as it was.
+const TOOL_SECTIONS = [
+  '## Liveness gate (URL inputs)',
+  '## Bounded Research Budget',
+  '### Tools',
+  // Stops before the agency-confirmation rule, which the runner keeps.
+  { heading: '### Subagent delegation (cost guardrail)', until: '<!-- guardrail:agency-confirmation -->' },
+  '### Prior-contact FYI (non-scoring)',
+  '### 1b. Embed ATS keyword coverage',
+  '### 2. Record in tracker',
+  '### 3. Salary observations (desired ask only)',
+];
+// Single lines that tell the model to run a command or search, by how they start.
+const TOOL_LINES = [
+  '1b. **First evaluation of each session:** Run `node cv-sync-check.mjs`',
+  '4. Use WebSearch for comp and company data',
+  '- Search: `"{company}"',
+  '- `{###}` = next sequential number',
+];
+const READ_CV_RULE = '**RULE: NEVER hardcode metrics from proof points.**';
+
+export function stripToolInstructions(text) {
+  let lines = text.split('\n');
+  for (const section of TOOL_SECTIONS) {
+    const { heading, until } = typeof section === 'string' ? { heading: section } : section;
+    const start = lines.findIndex(l => l.trimEnd() === heading);
+    if (start === -1) continue;
+    const level = heading.match(/^#+/)[0].length;
+    const next = lines.findIndex((l, i) => i > start
+      && (new RegExp(`^#{1,${level}} `).test(l) || (until !== undefined && l.trimEnd() === until)));
+    lines.splice(start, (next === -1 ? lines.length : next) - start);
+  }
+  lines = lines.filter(l => !TOOL_LINES.some(p => l.startsWith(p)));
+  lines = lines.map(l => (l.startsWith(READ_CV_RULE) ? `${READ_CV_RULE} Take them from the CV below.` : l));
+  return lines.join('\n');
+}
+
+export function buildSystemPrompt(modeContent, ctx, { evaluate = false } = {}) {
+  const languageInstruction = outputLanguageInstruction(parseOutputLanguage(ctx.profile));
+
+  const executionBoundary = [
+    '═══════════════════════════════════════════════════════',
+    'CRITICAL OPERATING RULES FOR THIS SESSION',
+    '═══════════════════════════════════════════════════════',
+    evaluate
+      ? '1. You are a standalone evaluation report writer, NOT an interactive tool-using CLI agent.'
+      : '1. You generate application form answers from the supplied evaluation report, NOT an interactive tool-using CLI agent.',
+    '2. You do NOT have access to WebSearch, Playwright, bash, file-writing, or any external tools.',
+    '3. Do NOT emit function calls, tool calls (<tool_call>, <dots_function_call>, <|tool_call_start|>), JSON tool requests, or XML invocation tags.',
+    '4. Do NOT output shell commands or code snippets asking to execute tools (such as browser-extract, reserve-report-num, curl, or bash).',
+    '5. All needed job description text and candidate data are already provided below.',
+    ...(evaluate ? [
+      '6. Generate the complete, standalone Markdown evaluation report covering Blocks A through G directly.',
+    ] : []),
+    '═══════════════════════════════════════════════════════',
+  ].join('\n');
+
+  return [
+    noToolsNote(evaluate),
+    executionBoundary,
+    stripToolInstructions(ctx.shared),
+    ctx.profileMode,
+    stripToolInstructions(modeContent),
+    '---',
+    'CANDIDATE PROFILE (YAML):',
+    ctx.profile,
+    '---',
+    'CANDIDATE CV:',
+    ctx.cv,
+    languageInstruction,
+  ].filter(Boolean).join('\n\n');
+}
+
+// ---------------------------------------------------------------------------
+// Job page content fetcher (Playwright-first, plain fetch fallback)
+// ---------------------------------------------------------------------------
+// Reject unsafe fetch targets (SSRF defense-in-depth): http(s) only, never
+// loopback / link-local / private / cloud-metadata hosts. URLs come from the
+// user's own portals.yml / pipeline.md, but we still fail closed.
+function assertSafeRemoteUrl(url) {
+  let u;
+  try { u = new URL(url); } catch { throw new Error(`Invalid URL: ${url}`); }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+    throw new Error(`Refusing non-HTTP(S) URL: ${url}`);
+  }
+  const host = u.hostname.toLowerCase();
+  const blocked = host === 'localhost' || host === '::1' || host.endsWith('.local') ||
+    /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) ||
+    /^169\.254\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+  if (blocked) throw new Error(`Refusing private/loopback host: ${host}`);
+  return u;
+}
+
+// Verdicts from the liveness check that mean the page is not an open posting
+// that can be read: besides any `expired` one (404, a closed or listing page),
+// a page too short to read (isUnreadableVerdict: nav/footer only, or not
+// rendered yet, which classifyLiveness reports as `uncertain`), a bot wall or
+// a redirect away from the posting.
+const UNREADABLE_PAGE_CODES = new Set(['bot_challenge', 'redirected_off_posting']);
+
+// Why a fetched page holds no job description to evaluate, or null when it
+// does. The runner used to send any page to the model, so a 404, a bot wall or
+// a Workday page that had not rendered yet came back as a report and a done
+// pipeline row for a posting nobody read (#5809).
+export function unreadableJobPage({ status = 0, requestedUrl = '', finalUrl = '', text = '' } = {}) {
+  if (status >= 400) return `HTTP ${status}`;
+  const verdict = classifyLiveness({ status, requestedUrl, finalUrl, bodyText: text });
+  if (verdict.result === 'expired' || isUnreadableVerdict(verdict) || UNREADABLE_PAGE_CODES.has(verdict.code)) {
+    return `${verdict.code}: ${verdict.reason}`;
+  }
+  return null;
+}
+
+async function fetchJobPage(url) {
+  assertSafeRemoteUrl(url);
+  let chromium;
+  if (!process.env.CAREER_OPS_NO_PLAYWRIGHT) {
+    try {
+      ({ chromium } = await import('playwright'));
+    } catch {
+      console.warn('[fetch] Playwright unavailable — falling back to plain fetch.');
+    }
+  }
+
+  if (chromium) {
+    let browser;
+    let unreadable = null;
+    try {
+      browser = await chromium.launch(browserLaunchOptions(
+        { headless: true },
+        { projectRoot: DATA_ROOT, processEnv: BROWSER_PROCESS_ENV },
+      ));
+      const page = await browser.newPage();
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await page.waitForTimeout(2000); // wait for SPA render
+      const text = await page.evaluate(() => {
+        document.querySelectorAll('script,style,nav,footer,header').forEach(el => el.remove());
+        return (document.body?.innerText || document.body?.textContent || '').replace(/\s+/g, ' ').trim();
+      });
+      unreadable = unreadableJobPage({ status: response?.status() ?? 0, requestedUrl: url, finalUrl: page.url(), text });
+      if (!unreadable) return text.slice(0, 16_000);
+    } catch (e) {
+      console.warn(`[fetch] Playwright error: ${e.message} — falling back to plain fetch.`);
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+    }
+    // The browser read the page; a plain fetch would only see less of it.
+    if (unreadable) throw new Error(`No job description to evaluate at ${url} (${unreadable})`);
+  }
+
+  // Plain HTTP fallback
+  try {
+    const r = await fetch(url, {
+      headers: { 'User-Agent': DEFAULT_USER_AGENT }
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
+    const html = await r.text();
+    const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const unreadable = unreadableJobPage({ status: r.status, requestedUrl: url, finalUrl: r.url, text });
+    if (unreadable) throw new Error(`no job description (${unreadable})`);
+    return text.slice(0, 16_000);
+  } catch (e) {
+    throw new Error(`Could not fetch job page: ${e.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// portals.yml parser — reads the canonical schema with js-yaml (same library and
+// field names as scan.mjs: `title_filter.positive/negative` + `tracked_companies`),
+// so it never drifts from the main scanner. The runner's no-CLI scan path covers
+// companies that expose a direct JSON `api:`; careers_url-only / Playwright /
+// search-query companies are handled by the full /career-ops scan pipeline.
+// `rawOverride` lets tests feed YAML text directly (see test-all.mjs drift guard).
+// ---------------------------------------------------------------------------
+export function parsePortals(rawOverride) {
+  const raw = rawOverride ?? readFile('portals.yml');
+  if (!raw) throw new Error('portals.yml not found');
+  const config = loadYaml(raw) || {};
+
+  // The shared predicate rather than a second copy of the matching rules. This
+  // path kept its own `includes` loop, and the two had drifted three ways: an
+  // empty positive list accepted every title in scan.mjs and rejected every
+  // title here, AND-groups worked only in scan.mjs, and a non-string YAML entry
+  // was dropped there but coerced into a live keyword here. A `word:` prefix
+  // would have become the fourth — read as literal text, it would have matched
+  // nothing, so the shipped `word:Intern` would stop rejecting "Operations
+  // Intern" here while still working in scan.mjs.
+  //
+  // Side effect worth naming, since it changes this path's verdicts rather than
+  // just its structure: it now also gets the 2-3 char rule. Measured over 2324
+  // real titles that moves one verdict, and it moves it the permissive way —
+  // the negative "iOS" had been matching inside "Biosamples". Nothing becomes
+  // newly rejected.
+  const titleMatches = buildTitleFilter(config.title_filter);
+
+  // Companies with a direct JSON `api:` endpoint (the no-CLI scan path).
+  const tracked = Array.isArray(config.tracked_companies) ? config.tracked_companies : [];
+  const companies = tracked
+    .filter(c => c && c.api && c.enabled !== false)
+    .map(c => ({ name: String(c.name ?? c.company ?? 'Unknown'), api: String(c.api).trim() }));
+
+  return { companies, titleMatches, config };
+}
+
+// ---------------------------------------------------------------------------
+// pipeline.md management
+// ---------------------------------------------------------------------------
+function readPipeline() {
+  const content = readFile('data/pipeline.md') ?? '';
+  const pending = [];
+  for (const line of content.split('\n')) {
+    const m = line.match(/^- \[ \] (.+)/);
+    if (m) {
+      const parts = m[1].split(' | ');
+      pending.push({
+        url: parts[0]?.trim() ?? '',
+        company: parts[1]?.trim() ?? 'Unknown',
+        role: parts[2]?.trim() ?? 'Unknown',
+      });
+    }
+  }
+  return pending;
+}
+
+// Tick the pending row whose URL is exactly `url`. The previous version matched
+// `- [ ] {url}.*`, so with `.../jobs/12` still pending above `.../jobs/1`,
+// finishing jobs/1 ticked jobs/12. It also rewrote the file with an unlocked,
+// truncating writeFileSync, which erased any row a scanner appended through
+// appendToPipeline in between. The URL is read the way readPipeline reads it.
+export async function markPipelineDone(url, { pipelinePath = path.join(DATA_ROOT, 'data', 'pipeline.md') } = {}) {
+  await withPipelineLock(pipelinePath, async () => {
+    if (!fs.existsSync(pipelinePath)) return;
+    const lines = fs.readFileSync(pipelinePath, 'utf-8').split('\n');
+    const i = lines.findIndex(line => /^- \[ \] /.test(line) && line.slice(6).split(' | ')[0].trim() === url);
+    if (i === -1) return;
+    lines[i] = lines[i].replace('- [ ]', '- [x]');
+    atomicWriteFile(pipelinePath, lines.join('\n'));
+  });
+}
+
+// Both writes go through the shared writers in scan.mjs rather than this
+// module's own read-modify-write. Those writers hold pipeline-lock.mjs on the
+// file they touch, so this stops being a fourth, unlocked writer racing the
+// three appendToPipeline already names. The previous version read each file
+// whole, appended in memory, and wrote the whole thing back with a truncating
+// writeFileSync — so any row another scanner appended in between was erased,
+// silently, because every reader skips a malformed or missing row quietly.
+//
+// Delegating fixes three things at once that were all symptoms of hand-rolling
+// the write: the lock, the row format (formatScanHistoryRow emits every trailing
+// column; this module wrote seven and created a seven-column header), and the
+// date (the shared path stamps the local day, this one stamped the UTC day —
+// the defect #3240/#3241 fixed in the other scanners, which this module escaped
+// because that census finds scanners by looking for appendToScanHistory calls).
+//
+// It also picks up CAREER_OPS_DATA_DIR support for free: the shared paths are
+// DATA_ROOT-anchored, while the __dirname-relative paths here ignored it.
+//
+// Admission goes through the shared gate (#5478): the seen set compares
+// normalized URLs across scan-history, the pipeline and the tracker, and the
+// blacklist and location filter apply as they do in scan.mjs. The raw-URL sets
+// this built before re-queued a posting whose URL differed by a tracking
+// parameter, and nothing here read data/blacklist.md.
+export async function addToPipeline(entries, config = {}, gate = createAdmissionGate({ config })) {
+  // The shared writers take {url, company, title, location}; this module calls
+  // the title `role`.
+  const offers = entries.map(e => ({
+    url: e.url,
+    company: e.company,
+    title: e.role,
+    location: typeof e.location === 'string' ? e.location : '',
+    source: 'openrouter scan',
+  }));
+
+  const { admitted } = gate.partition(offers);
+  const skipped = formatSkipCounts(gate.counts);
+  if (skipped) console.log(`Skipped: ${skipped}`);
+  if (admitted.length === 0) return 0;
+
+  await appendToPipeline(admitted);
+  await appendToScanHistory(admitted, localToday());
+  return admitted.length;
+}
+
+function extractCompanySlug(text, url) {
+  // Try to extract from text (e.g. "Senior Engineer at Acme" or "Company: Acme")
+  const m = text.match(/(?:at|@|company[:\s]+)\s*([A-Z][A-Za-z0-9]{2,25})/);
+  if (m) return m[1].toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  // Fall back to URL hostname (e.g. job-boards.greenhouse.io/acme → acme)
+  if (url) {
+    try {
+      const parts = new URL(url).pathname.split('/').filter(Boolean);
+      const slug = parts[0] ?? 'company';
+      return slug.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    } catch { /* not a valid URL */ }
+  }
+  return 'company';
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+// -- SCAN --
+async function cmdScan() {
+  tracker.recordZeroToken('scan');
+  tracker.recordZeroToken('evaluation');
+  tracker.recordZeroToken('pdf payload');
+  console.log('Scanning Greenhouse portals...\n');
+
+  let portals;
+  try { portals = parsePortals(); }
+  catch (e) { console.error(e.message); return; }
+
+  const { companies, titleMatches, config } = portals;
+  console.log(`Greenhouse API companies: ${companies.length}\n`);
+
+  const found = [];
+  for (const c of companies) {
+    process.stdout.write(`  ${c.name.padEnd(25)} → `);
+    try {
+      assertSafeRemoteUrl(c.api);
+      const r = await fetch(c.api);
+      if (!r.ok) { console.log(`HTTP ${r.status}`); continue; }
+      const data = await r.json();
+      const jobs = data.jobs ?? [];
+      const matched = jobs.filter(j => titleMatches(j.title));
+      console.log(`${jobs.length} listings, ${matched.length} matched`);
+      for (const j of matched) {
+        // Skip postings without a public URL — falling back to the API
+        // endpoint would write an unusable link into the pipeline.
+        if (!j.absolute_url) continue;
+        found.push({ url: j.absolute_url, company: c.name, role: j.title, location: j.location?.name ?? '' });
+      }
+    } catch (e) {
+      console.log(`ERROR: ${e.message}`);
+    }
+  }
+
+  const added = await addToPipeline(found, config);
+  console.log(`\n✅ Scan complete. ${found.length} matches, ${added} new entries added to pipeline.md.`);
+  if (added > 0) {
+    console.log('\n→  node openrouter-runner.mjs pipeline\n   to evaluate pending listings.\n');
+  }
+}
+
+// -- EVALUATE --
+async function cmdEvaluate(input, ctx) {
+  tracker.recordZeroToken('scan');
+  tracker.recordZeroToken('pdf payload');
+  const modeContent = readSystemFile('modes/oferta.md') ?? readSystemFile('modes/auto-pipeline.md') ?? '';
+
+  let jdText = input;
+  // The posting text alone, for the report's verbatim archive: jdText gains a
+  // `URL:` line for the model when the input is a link.
+  let archiveText = input;
+
+  if (!input) {
+    // Interactive paste mode
+    console.log('Paste job description or URL, then press Enter on an empty line:\n');
+    const rl = readline.createInterface({ input: process.stdin });
+    const lines = [];
+    try {
+      for await (const line of rl) {
+        if (line === '') break;
+        lines.push(line);
+      }
+    } finally {
+      rl.close();
+    }
+    jdText = lines.join('\n');
+    archiveText = jdText;
+    if (!jdText.trim()) { console.log('No input provided.'); return null; }
+  } else if (input.startsWith('http')) {
+    console.log('Fetching job page...');
+    try {
+      const content = await fetchJobPage(input);
+      jdText = `URL: ${input}\n\n${content}`;
+      archiveText = content;
+    } catch (e) {
+      console.error(e.message);
+      return null;
+    }
+  }
+
+  console.log('\nEvaluating...');
+  const systemPrompt = buildSystemPrompt(modeContent, ctx, { evaluate: true });
+
+  let resultObj;
+  try {
+    resultObj = await callOpenRouter(systemPrompt, `Evaluate this job listing:\n\n${jdText}`);
+  } catch (e) {
+    if (e.name === 'QuotaExhaustedError' || e instanceof QuotaExhaustedError) {
+      throw e;
+    }
+    console.error(`OpenRouter error: ${e.message}`);
+    return null;
+  }
+  tracker.record('evaluation', resultObj.usage);
+  const result = resultObj.content;
+
+  // A model that says it could not evaluate the posting has not evaluated it:
+  // save nothing, so the pipeline leaves the row pending (#5809).
+  const notEvaluated = result.match(/^---DEAD_POSTING---\s*$|^\s*(?:status:\s*)?needs_confirmation\b.*$/m);
+  if (notEvaluated) {
+    console.error(`Not evaluated, nothing saved. The model replied: ${notEvaluated[0].trim()}`);
+    return { success: false, reason: 'not_evaluated' };
+  }
+
+  // Validate the evaluation response BEFORE reserving a report number or writing anything!
+  const validation = validateEvaluationResponse(result);
+  if (!validation.ok) {
+    console.error(`\n❌ Evaluation rejected by validation: ${validation.reason}`);
+    console.error(`   Output failed validation check (${validation.reason}). Report will NOT be marked successful.`);
+    return { success: false, reason: validation.reason };
+  }
+
+  let reservedNumbers;
+  try {
+    reservedNumbers = await reserveReportNumbers(1, {
+      rootDir: DATA_ROOT,
+      reportsDir: path.join(DATA_ROOT, 'reports'),
+    });
+  } catch (e) {
+    console.error(`Could not reserve a report number: ${e.message}`);
+    return null;
+  }
+
+  try {
+    // Save report
+    const today = localToday();
+    const num = reservedNumbers[0];
+    const slug = extractCompanySlug(jdText, typeof input === 'string' ? input : null);
+    const numStr = formatReportNumber(num);
+    const relPath = `reports/${numStr}-${slug}-${today}.md`;
+
+    // Extract Legitimacy from LLM output or fall back to placeholder
+    const legitMatch = result.match(/\*\*Legitimacy:\*\*\s*([^\n]+)/);
+    const legitLine = legitMatch ? `**Legitimacy:** ${legitMatch[1].trim()}` : '**Legitimacy:** unconfirmed';
+    writeFile(relPath, `**URL:** ${input || '(pasted)'}\n${legitLine}\n\n${withJdArchiveSection(result, archiveText)}`);
+
+    // Capture the DENOMINATOR when the model writes one. The old pattern took
+    // only the numeric prefix, so `Score: 8/10` yielded `8` and the cell became
+    // `8.0/5` -- a ten-point score reinterpreted as a five-point one. That
+    // satisfies SCORE_CELL_RE, so it merged as a genuine score and fed
+    // stats.mjs's averages. normalizedTrackerScore refuses a denominator that
+    // is not 5, but only if it is handed one (#3796).
+    //
+    // The capture runs to END OF LINE rather than stopping at a denominator
+    // adjacent to the number. Requiring adjacency read `Score: 4.2 (strong
+    // fit)/10` -- a ten-point score with an annotation -- as a bare 4.2 and
+    // wrote `4.2/5`, the same wrong number the numeric prefix used to produce.
+    // The cost is that an unrelated fraction later in the line (`Score: 4.2 --
+    // matched 3/4 axes`) is refused as N/A rather than guessed at. That is the
+    // trade the shared helper already documents and the gemini path already
+    // pins: N/A is recoverable, a wrong score is not.
+    const scoreMatch = result.match(/(?:score|puntuaci[oó]n)[^\d]*(\d+(?:\.\d+)?[^\r\n]*)/i);
+    // An unparseable score used to become the EMPTY string, and merge-tracker
+    // refuses a blank required cell ("use the documented sentinel rather than a
+    // blank cell") -- so the evaluation was skipped whole, the same loss #3796
+    // documents for the drifted copies. The shared helper returns the `N/A`
+    // sentinel (#1799), which merges as an unscored row instead of as nothing.
+    const scoreStr = normalizedTrackerScore(scoreMatch ? scoreMatch[1] : '');
+    const companyName = slug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    const reportLink = `[${numStr}](reports/${numStr}-${slug}-${today}.md)`;
+    const tsvLine = `${num}\t${today}\t${companyName}\t(see report)\tEvaluated\t${scoreStr}\t❌\t${reportLink}\t\n`;
+    const tsvFile = `batch/tracker-additions/or-${numStr}-${slug}.tsv`;
+    // Header row, then the single data row. merge-tracker.mjs resolves the
+    // fields by NAME when the header is present (#3517), so this row cannot be
+    // read into the wrong columns. (Headerless files still work; they are the
+    // legacy form, and they are the ones that can hit the undecidable
+    // score-vs-status case.)
+    writeFile(tsvFile, `${TSV_ADDITION_HEADER}\n${tsvLine}`);
+
+    console.log(`\n✅ Report saved: ${relPath}`);
+    console.log('\n─── EVALUATION ──────────────────────────────────────\n');
+    console.log(result);
+    console.log('\n─────────────────────────────────────────────────────\n');
+
+    return { success: true, relPath, score: scoreStr };
+  } finally {
+    try {
+      await releaseReportNumbers(reservedNumbers, { reportsDir: path.join(DATA_ROOT, 'reports') });
+    } catch (e) {
+      console.warn(`Could not release report reservation: ${e.message}`);
+    }
+  }
+}
+
+// -- PIPELINE --
+async function cmdPipeline(ctx, options = {}) {
+  const pending = readPipeline();
+  if (pending.length === 0) {
+    console.log('No pending listings in pipeline.md.');
+    return;
+  }
+
+  const isOne = options.one === true || options.limit === 1;
+  const toProcess = isOne ? pending.slice(0, 1) : pending;
+
+  console.log(`Processing ${toProcess.length} pending listing(s) from pipeline.md${isOne ? ' (one-job mode)' : ''}...\n`);
+
+  for (let i = 0; i < toProcess.length; i++) {
+    const item = toProcess[i];
+    console.log(`\n[${i + 1}/${toProcess.length}] ${item.company} — ${item.role}`);
+    try {
+      const res = await cmdEvaluate(item.url, ctx);
+      if (res && res.success === true) {
+        await markPipelineDone(item.url);
+        console.log(`  Marked complete in pipeline: ${item.company} — ${item.role}`);
+      } else {
+        console.warn(`  Evaluation incomplete or failed. Listing preserved as pending in pipeline.md for retry.`);
+      }
+    } catch (e) {
+      if (e.name === 'QuotaExhaustedError' || e instanceof QuotaExhaustedError) {
+        console.error(`\n🛑 OpenRouter daily quota exhausted: ${e.message}`);
+        console.error('Stopping pipeline immediately to avoid wasting requests.');
+        break;
+      }
+      console.error(`  Error: ${e.message}`);
+    }
+    if (i < toProcess.length - 1) {
+      await new Promise(r => setTimeout(r, RATE_LIMIT_DELAY_MS));
+    }
+  }
+
+  console.log('\n✅ Pipeline processing finished.\n');
+}
+
+// -- APPLY --
+async function cmdApply(ref, ctx) {
+  tracker.recordZeroToken('scan');
+  tracker.recordZeroToken('evaluation');
+  tracker.recordZeroToken('pdf payload');
+  const modeContent = readSystemFile('modes/apply.md') ?? '';
+
+  let reportContent;
+  let reportPath;
+  try {
+    const located = locateApplyReport(DATA_ROOT, ref, {
+      exists: (p) => fs.existsSync(p),
+      list: (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir) : []),
+    });
+    if (!located.ok) {
+      console.error(`Report not found: ${ref}`);
+      return;
+    }
+    reportPath = located.path;
+  } catch (e) {
+    console.error(e instanceof Error ? e.message : String(e));
+    return;
+  }
+  try {
+    reportContent = fs.readFileSync(reportPath, 'utf8');
+  } catch {
+    reportContent = null;
+  }
+
+  if (!reportContent) { console.error('Could not read report content.'); return; }
+
+  // Score-gate: warn and confirm before applying to low-fit roles (AGENTS.md Ethical Use)
+  const scoreMatch = reportContent.match(/^\s*\*?\*?\s*(?:score|puntuaci[oó]n)\s*:\s*\*?\*?\s*(\d+(?:\.\d+)?)\s*\/\s*5/im);
+  const scoreValue = scoreMatch ? parseFloat(scoreMatch[1]) : NaN;
+  if (isFinite(scoreValue) && scoreValue < 4.0) {
+    console.log(`\n⚠️  This report scored ${scoreValue.toFixed(1)}/5 — below the 4.0/5 threshold.`);
+    console.log('Strongly discourage low-fit applications. Your time and the recruiter\'s time are both valuable.');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise(resolve => {
+      rl.question('Proceed anyway? (yes/no): ', resolve);
+    });
+    rl.close();
+    if (answer.trim().toLowerCase() !== 'yes') {
+      console.log('Aborted.');
+      return;
+    }
+  }
+
+  console.log('Generating application form answers...');
+  const systemPrompt = buildSystemPrompt(modeContent, ctx);
+
+  let resultObj;
+  try {
+    resultObj = await callOpenRouter(
+      systemPrompt,
+      `Generate application form answers based on this evaluation report:\n\n${reportContent}`
+    );
+  } catch (e) {
+    console.error(`OpenRouter error: ${e.message}`);
+    return;
+  }
+  tracker.record('apply', resultObj.usage);
+  const result = resultObj.content;
+
+  console.log('\n─── APPLICATION ANSWERS ─────────────────────────────\n');
+  console.log(result);
+  console.log('\n─────────────────────────────────────────────────────\n');
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+// Only run the CLI when invoked directly (`node openrouter-runner.mjs ...`), so the
+// module can be imported (e.g. by test-all.mjs) without executing a command.
+const invokedDirectly = isMainModule(import.meta.url);
+const [, , command, ...args] = invokedDirectly ? process.argv : [];
+if (invokedDirectly) loadEnvFile();
+const ctx = invokedDirectly ? loadContext() : null;
+
+// Load free models list before running any AI command (skip when a model is pinned)
+if (invokedDirectly && ['evaluate', 'eval', 'pipeline', 'apply', 'models'].includes(command) && !process.env.CAREER_OPS_MODEL) {
+  await loadFreeModels();
+}
+
+if (invokedDirectly) switch (command) {
+  case 'scan':
+    await cmdScan();
+    break;
+
+  case 'evaluate':
+  case 'eval':
+    await cmdEvaluate(args.join(' ').trim() || null, ctx);
+    break;
+
+  case 'pipeline':
+    const isOneJob = args.includes('--one') || args.includes('-1') || args.includes('--limit=1');
+    await cmdPipeline(ctx, { one: isOneJob });
+    break;
+
+  case 'apply':
+    if (!args[0]) { console.error('Usage: node openrouter-runner.mjs apply <report_num|report_path>'); break; }
+    await cmdApply(args[0], ctx);
+    break;
+
+  case 'models':
+    await cmdModels();
+    break;
+
+  default:
+    console.log(`
+career-ops OpenRouter Runner
+Auto-fetches free models from OpenRouter API and rotates through them with fallback.
+
+COMMANDS:
+  node openrouter-runner.mjs scan              → Scan Greenhouse APIs for new matching listings
+  node openrouter-runner.mjs evaluate <url>    → Evaluate a listing by URL
+  node openrouter-runner.mjs evaluate          → Paste a job description interactively
+  node openrouter-runner.mjs pipeline          → Batch-evaluate all pending entries in pipeline.md
+  node openrouter-runner.mjs pipeline --one    → Batch-evaluate only 1 pending entry (test mode)
+  node openrouter-runner.mjs apply <report_no> → Generate application form answers from a report
+  node openrouter-runner.mjs models            → List available free models from OpenRouter
+
+SETUP:
+  1. Copy .env.example to .env
+  2. Add your key: OPENROUTER_API_KEY=sk-or-v1-...
+  3. Free API key: https://openrouter.ai
+
+MODEL SELECTION:
+  - Free models are fetched automatically via the OpenRouter API at runtime.
+  - They are tried in sequence; if one fails the next is used automatically.
+  - Pin a model:  CAREER_OPS_MODEL=deepseek/deepseek-r1:free node openrouter-runner.mjs eval <url>
+`);
+}
+
+if (invokedDirectly && ['scan', 'evaluate', 'eval', 'pipeline', 'apply'].includes(command)) {
+  const modelName = process.env.CAREER_OPS_MODEL || activeModel || 'free-rotation';
+  console.log('\n' + formatBreakdown(tracker, modelName, 'openrouter'));
+}

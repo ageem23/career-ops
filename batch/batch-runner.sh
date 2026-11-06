@@ -1,48 +1,218 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# career-ops batch runner — standalone orchestrator for claude -p workers
-# Reads batch-input.tsv, delegates each offer to a claude -p worker,
-# tracks state in batch-state.tsv for resumability.
+# career-ops batch runner — standalone orchestrator for headless agent workers
+# Reads batch-input.tsv, delegates each offer to a worker, tracks state in
+# batch-state.tsv for resumability.
+#
+# Supported CLIs (--cli flag):
+#   claude    — claude -p with --dangerously-skip-permissions (default)
+#   opencode  — opencode run (falls back to ollama launch opencode if not in PATH)
+#   gemini    — gemini -p
+#   qwen      — qwen -p
+#   grok      — grok -p with --always-approve
+#
+# Only claude supports --strict-mcp-config, the rate-limit/session retry loop,
+# and --parallel > 1; other CLIs run sequentially with a single attempt.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Under Git Bash / MSYS, pwd gives a POSIX path (/c/...). Node is a native
+# Windows binary and gets it unconverted when MSYS path conversion is off
+# (MSYS_NO_PATHCONV=1), so every `node "$PROJECT_DIR/..."` call failed with
+# MODULE_NOT_FOUND (#4910). cygpath -m yields C:/... which both bash and node
+# resolve, as for jd_file below.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) command -v cygpath >/dev/null 2>&1 && PROJECT_DIR="$(cygpath -m "$PROJECT_DIR")" ;;
+esac
+# The user layer (profile, reports, tracker additions) lives under the data
+# root, which CAREER_OPS_ROOT / CAREER_OPS_DATA_DIR / a .career-ops-data marker
+# can place outside the checkout. Every path here used to be built from
+# PROJECT_DIR, so under an external data root workers were scored against the
+# checkout's template profile, and their reports and tracker lines were looked
+# for in directories reserve-report-num.mjs and merge-tracker.mjs never read
+# (#5115). path-resolver.mjs owns the precedence, so ask it instead of
+# re-deriving it in bash. It prints nothing when the data root is the checkout,
+# which keeps DATA_ROOT spelled exactly like PROJECT_DIR in the default layout.
+DATA_ROOT="$PROJECT_DIR"
+if [[ -f "$PROJECT_DIR/path-resolver.mjs" ]]; then
+  if ! resolved_data_root="$(node --input-type=module -e '
+    import { realpathSync } from "node:fs";
+    import { dirname } from "node:path";
+    import { pathToFileURL } from "node:url";
+    const resolver = process.argv[1];
+    const { getCareerOpsRoot } = await import(pathToFileURL(resolver).href);
+    const real = (p) => { try { return realpathSync(p); } catch { return p; } };
+    const root = getCareerOpsRoot();
+    if (real(root) !== real(dirname(resolver))) {
+      process.stdout.write(process.platform === "win32" ? root.replace(/\\/g, "/") : root);
+    }
+  ' "$PROJECT_DIR/path-resolver.mjs")"; then
+    echo "ERROR: could not resolve the career-ops data root through path-resolver.mjs" >&2
+    exit 1
+  fi
+  if [[ -n "$resolved_data_root" ]]; then
+    DATA_ROOT="$resolved_data_root"
+  fi
+fi
 BATCH_DIR="$SCRIPT_DIR"
 INPUT_FILE="$BATCH_DIR/batch-input.tsv"
 STATE_FILE="$BATCH_DIR/batch-state.tsv"
 PROMPT_FILE="$BATCH_DIR/batch-prompt.md"
+# The profile follows CAREER_OPS_PROFILE as well as the data root, like every
+# other reader does through path-resolver.mjs (#5144). Building it from the
+# data root here left a run reading the data root's profile for spend_tier and
+# for the prompt's personalization while the .mjs readers used the override.
+# The .md prompt files still name config/profile.yml; the script-generated
+# runtime block and the injected personalization use $PROFILE_FILE.
+PROFILE_FILE="$DATA_ROOT/config/profile.yml"
+PROFILE_RESOLVED=false
+if [[ -f "$PROJECT_DIR/path-resolver.mjs" ]]; then
+  if ! resolved_profile_file="$(node --input-type=module -e '
+    import { pathToFileURL } from "node:url";
+    const resolver = process.argv[1];
+    const { getProfilePath } = await import(pathToFileURL(resolver).href);
+    if (typeof getProfilePath !== "function") {
+      process.stderr.write("WARN: path-resolver.mjs has no getProfilePath(), so CAREER_OPS_PROFILE is ignored in this run. Update the install to use the override.\n");
+    } else {
+      const profile = getProfilePath();
+      process.stdout.write(process.platform === "win32" ? profile.replace(/\\/g, "/") : profile);
+    }
+  ' "$PROJECT_DIR/path-resolver.mjs")"; then
+    echo "ERROR: could not resolve the career-ops profile path through path-resolver.mjs" >&2
+    exit 1
+  fi
+  if [[ -n "$resolved_profile_file" ]]; then
+    PROFILE_FILE="$resolved_profile_file"
+    PROFILE_RESOLVED=true
+  fi
+elif [[ -n "${CAREER_OPS_PROFILE:-}" ]]; then
+  echo "WARN: no path-resolver.mjs next to this script, so CAREER_OPS_PROFILE is ignored in this run." >&2
+fi
+if [[ -n "${CAREER_OPS_PROFILE:-}" && "$PROFILE_RESOLVED" == "true" && ! -f "$PROFILE_FILE" ]]; then
+  # Before the override was honored this read the data root's profile anyway.
+  # Say it, instead of silently running with no profile at all.
+  echo "WARN: no profile at $PROFILE_FILE (CAREER_OPS_PROFILE); the prompt gets no profile and spend_tier is not taken from it." >&2
+fi
 LOGS_DIR="$BATCH_DIR/logs"
-TRACKER_DIR="$BATCH_DIR/tracker-additions"
-REPORTS_DIR="$PROJECT_DIR/reports"
-APPLICATIONS_FILE="$PROJECT_DIR/data/applications.md"
+DISCARD_LOG="$LOGS_DIR/discard.log"
+TRACKER_DIR="$DATA_ROOT/batch/tracker-additions"
+REPORTS_DIR="$DATA_ROOT/reports"
+# The runner's own bookkeeping (input, state, logs, locks) stays beside the
+# script. reserve-report-num.mjs and merge-tracker.mjs read batch-state.tsv
+# there too, and a data root's own copy beside it (resolveBatchStatePaths), and
+# both skip report numbers recorded as failed. The variable still names the file for every worker, and
+# learn.mjs reads it to tell a batch worker. Built from PROJECT_DIR, which is
+# the form node can open under Git Bash (see above).
+export CAREER_OPS_BATCH_STATE="$PROJECT_DIR/batch/batch-state.tsv"
+# Workers run unattended, so nobody can confirm a change to the user's standing
+# rules. modes/_shared.md tells an agent that sees this flag not to write them.
+export CAREER_OPS_HEADLESS=1
 LOCK_FILE="$BATCH_DIR/batch-runner.pid"
+PAUSE_FILE="$BATCH_DIR/batch-runner.paused"
+THROTTLE_FILE="$BATCH_DIR/batch-runner.throttled"
 STATE_LOCK_DIR="$BATCH_DIR/.batch-state.lock"
 STATE_LOCK_PID_FILE="$STATE_LOCK_DIR/pid"
-STATE_LOCK_TIMEOUT_SECONDS=30
+STATE_LOCK_TIMEOUT_SECONDS=60
+# Persisted high-water mark for report numbers. Reconciled once per run against
+# the reports directory and batch-state.tsv; read/incremented per reservation so
+# the hot path never touches the (OneDrive-backed, ~3,000 file) reports dir.
+# How many times process_offer retries reserving its state row before giving
+# up. acquire_state_lock can lose the mkdir race or time out under a parallel
+# burst; if the initial "processing" row never lands, the worker would run
+# claude -p with no state row and silently orphan the offer (in batch-input,
+# never in batch-state, never reconciled out of pipeline.md). On exhaustion we
+# mark the offer failed instead of evaluating it, so it's retried next run.
+RESERVE_STATE_MAX_ATTEMPTS=5
+# How often (in seconds of wall time) the parallel-mode wait loop runs the
+# orphan sweep to recover state rows where a worker finished but update_state
+# silently failed (e.g. lock-acquire timeout). 0 disables the periodic sweep;
+# the end-of-batch sweep still runs.
+ORPHAN_SWEEP_INTERVAL_SECONDS=30
 MAIN_PID="${BASHPID:-$$}"
 
 # Defaults
-PARALLEL=1
+PARALLEL=""
+DEFAULT_CLAUDE_PARALLEL=3
 DRY_RUN=false
 RETRY_FAILED=false
+RESUME_PAUSED=false
 START_FROM=0
+SCOPE_COMPANY=""
 MAX_RETRIES=2
 MIN_SCORE=0
+SKIP_PDF=false
+MODE="full"
+MODEL=""  # explicit override; otherwise resolved from the profile's spend_tier
+RESOLVED_MODEL=""
+RESOLVED_SPEND_TIER=""
+CLI=claude
+RATE_LIMIT_SLEEP=300
+# Wall-clock cap per worker in seconds (run_worker). A normal evaluation runs
+# 3-5 minutes, so 30 minutes is generous headroom for a slow one while still
+# killing a genuine hang the same night instead of jamming the run until
+# someone notices. Override with --worker-timeout or the WORKER_TIMEOUT env
+# var (validated below); 0 disables.
+WORKER_TIMEOUT="${WORKER_TIMEOUT:-1800}"
+THIN_ACTION=webfetch   # webfetch | skip | browser-extract: what to do when the JD is still empty after the prefetch and the ATS API fallback
+BATCH_PAUSED=false
+STATUS_ONLY=false
+STATUS_FULL=true
+WATCH_MODE=false
+LIMIT=0  # internal sentinel only; explicit --limit must be positive
+
+# Return success for non-negative integer or decimal strings.
+is_decimal_number() {
+  [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
 
 usage() {
   cat <<'USAGE'
-career-ops batch runner — process job offers in batch via claude -p workers
-Uses your default Claude model (Claude Max subscription).
+career-ops batch runner — process job offers in batch via headless agent workers
+Defaults to claude; other CLIs via --cli. For claude the model is resolved from
+spend_tier in config/profile.yml (or in the file CAREER_OPS_PROFILE names)
+unless --model overrides it.
 
 Usage: batch-runner.sh [OPTIONS]
 
 Options:
-  --parallel N         Number of parallel workers (default: 1)
+  --cli NAME           Agent CLI to use: claude (default), opencode, gemini, qwen, grok
+  --model NAME         Model for the CLI (e.g. qwen2.5:32b for opencode/ollama).
+                       For claude, overrides the tier-resolved model (otherwise
+                       the spend_tier in config/profile.yml, or in the file
+                       CAREER_OPS_PROFILE names: economy/standard/premium;
+                       default standard).
+  --parallel N         Number of parallel workers (default: 3 for claude, 1 otherwise).
+                       On a rate limit, the rest of the batch runs on 1 worker.
   --dry-run            Show what would be processed, don't execute
   --retry-failed       Only retry offers marked as "failed" in state
+  --resume-paused      Resume offers paused by a Claude session/rate limit
   --start-from N       Start from offer ID N (skip earlier IDs)
+  --company A,B        Only process offers whose company matches (case- and
+                       punctuation-insensitive substring of the notes' company
+                       half or of the URL, leaving out a shared ATS domain;
+                       comma-separated). Applies before --limit
+  --limit N            Max offers: positive integer; omit for no limit
   --max-retries N      Max retry attempts per offer (default: 2)
   --min-score N        Skip PDF/tracker for offers scoring below N (default: 0 = off)
+  --skip-pdf           Skip PDF generation entirely (write ❌ in tracker PDF column)
+  --worker-timeout N   Stop a worker after N seconds and record it as failed
+                       (default: 1800; 0 = no limit)
+  --mode MODE          Evaluation mode: full (default) or match (condensed single-pass CV match)
+  --single-pass        Alias for --mode match
+  --thin-action MODE   What to do when no usable JD text could be fetched (JS-rendered
+                       page, empty shell): 'webfetch' (default) spawns the worker and
+                       lets it try WebFetch; 'skip' records the offer as skipped with
+                       a needs-playwright marker and spawns no worker; 'browser-extract'
+                       renders the page with browser-extract.mjs (headless Chromium,
+                       zero model tokens, needs 'npx playwright install chromium') and
+                       hands the recovered text to the worker
+  --rate-limit-sleep N Maximum adaptive retry delay in seconds; 0 pauses immediately
+                       (default: 300; range: 0–2147483647; claude only)
+  --status             Show batch progress and a per-job table, then exit
+  --summary            With --status, print the totals only (the table is one row per offer)
+  --full               With --status, print the per-job table (the default)
+  --watch              Live-refresh progress (always with the per-job table) until the run completes
   -h, --help           Show this help
 
 Files:
@@ -51,6 +221,12 @@ Files:
   batch-prompt.md      Prompt template for workers
   logs/                Per-offer logs
   tracker-additions/   Tracker lines for post-batch merge
+
+With a data root outside the checkout (CAREER_OPS_ROOT, CAREER_OPS_DATA_DIR
+or a .career-ops-data marker), config/profile.yml, reports/ and
+batch/tracker-additions/ are read and written there. The other files stay
+beside this script. CAREER_OPS_PROFILE, when set, names the profile read for
+spend_tier and injected into the prompt, as it does for the other scripts.
 
 Examples:
   # Dry run to see pending offers
@@ -62,45 +238,186 @@ Examples:
   # Retry only failed offers
   ./batch-runner.sh --retry-failed
 
-  # Process 2 at a time starting from ID 10
+  # Process 2 at a time starting from ID 10 (claude only)
   ./batch-runner.sh --parallel 2 --start-from 10
+
+  # Local LLM via OpenCode (free, runs sequentially)
+  ./batch-runner.sh --cli opencode --model qwen2.5:32b
 USAGE
 }
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --cli) CLI="$2"; shift 2 ;;
     --parallel) PARALLEL="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --retry-failed) RETRY_FAILED=true; shift ;;
+    --resume-paused) RESUME_PAUSED=true; shift ;;
     --start-from) START_FROM="$2"; shift 2 ;;
+    --company)
+      [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { echo "ERROR: --company requires an argument"; exit 1; }
+      SCOPE_COMPANY="$2"; shift 2 ;;
+    --limit)
+      if [[ $# -lt 2 ]] || ! [[ "$2" =~ ^[0-9]+$ ]] || [[ "$2" =~ ^0+$ ]]; then
+        echo "ERROR: --limit must be a positive integer; omit --limit for no limit."
+        exit 1
+      fi
+      # Remove leading zeroes before Bash arithmetic (which otherwise reads octal).
+      LIMIT="${2#"${2%%[!0]*}"}"
+      # Compare decimal strings before arithmetic can wrap an oversized integer.
+      if [[ ${#LIMIT} -gt 19 ]] || { [[ ${#LIMIT} -eq 19 ]] && [[ "$LIMIT" > 9223372036854775807 ]]; }; then
+        echo "ERROR: --limit must be at most 9223372036854775807; omit --limit for no limit."
+        exit 1
+      fi
+      shift 2
+      ;;
     --max-retries) MAX_RETRIES="$2"; shift 2 ;;
     --min-score) MIN_SCORE="$2"; shift 2 ;;
+    --skip-pdf) SKIP_PDF=true; shift ;;
+    --mode)
+      [[ $# -ge 2 ]] || { echo "ERROR: --mode requires an argument (full or match)"; exit 1; }
+      MODE="$2"
+      if [[ "$MODE" == "match" || "$MODE" == "single-pass" ]]; then
+        MODE="match"
+      fi
+      shift 2
+      ;;
+    --single-pass)
+      MODE="match"
+      shift
+      ;;
+    --rate-limit-sleep)
+      [[ $# -ge 2 ]] || { echo "ERROR: --rate-limit-sleep requires an argument"; exit 1; }
+      RATE_LIMIT_SLEEP="$2"
+      shift 2
+      ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --thin-action)
+      [[ $# -ge 2 ]] || { echo "ERROR: --thin-action requires an argument (skip, webfetch or browser-extract)"; exit 1; }
+      case "$2" in
+        skip|webfetch|browser-extract) THIN_ACTION="$2" ;;
+        *) echo "ERROR: --thin-action must be 'skip', 'webfetch' or 'browser-extract' (got '$2')."; exit 1 ;;
+      esac
+      shift 2
+      ;;
+    --worker-timeout)
+      if [[ $# -lt 2 ]] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: --worker-timeout must be a non-negative integer (seconds)."
+        exit 1
+      fi
+      # Strip leading zeroes, then compare as a decimal string: Bash arithmetic
+      # wraps past 2^63-1, and a wrapped value at or below 0 disables the watchdog.
+      WORKER_TIMEOUT="${2#"${2%%[!0]*}"}"
+      WORKER_TIMEOUT="${WORKER_TIMEOUT:-0}"
+      if [[ ${#WORKER_TIMEOUT} -gt 19 ]] || { [[ ${#WORKER_TIMEOUT} -eq 19 ]] && [[ "$WORKER_TIMEOUT" > 9223372036854775807 ]]; }; then
+        echo "ERROR: --worker-timeout must be at most 9223372036854775807 seconds."
+        exit 1
+      fi
+      shift 2
+      ;;
+    --status) STATUS_ONLY=true; shift ;;
+    --summary) STATUS_FULL=false; shift ;;
+    --full) STATUS_FULL=true; shift ;;
+    --watch) WATCH_MODE=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1"; usage; exit 1 ;;
   esac
 done
 
+if [[ "$MODE" != "full" && "$MODE" != "match" ]]; then
+  echo "ERROR: Unknown --mode '$MODE'. Supported: full, match."
+  exit 1
+fi
+
+MATCH_OUTPUT_LANGUAGE=""
+if [[ "$MODE" == "match" ]]; then
+  PROMPT_FILE="$BATCH_DIR/batch-prompt-match.md"
+  SKIP_PDF=true
+  # #5297: a match worker never sees the user profile, so targeting and
+  # compensation cannot move the score. language.output is the one setting it
+  # gets, resolved here once per run with the same reader the evaluators use.
+  if [[ -f "$PROFILE_FILE" ]]; then
+    MATCH_OUTPUT_LANGUAGE="$(node --input-type=module -e '
+      import { readFileSync } from "node:fs";
+      import { pathToFileURL } from "node:url";
+      const { parseOutputLanguage } = await import(pathToFileURL(process.argv[1]).href);
+      process.stdout.write(parseOutputLanguage(readFileSync(process.argv[2], "utf-8")));
+    ' "$PROJECT_DIR/profile-language.mjs" "$PROFILE_FILE" 2>/dev/null)" || {
+      MATCH_OUTPUT_LANGUAGE=""
+      echo "WARN: could not read language.output from $PROFILE_FILE; match workers will write in en." >&2
+    }
+  fi
+  [[ -n "$MATCH_OUTPUT_LANGUAGE" ]] || MATCH_OUTPUT_LANGUAGE="en"
+fi
+
+if [[ -z "$PARALLEL" ]]; then
+  if [[ "$CLI" == "claude" ]]; then PARALLEL=$DEFAULT_CLAUDE_PARALLEL; else PARALLEL=1; fi
+fi
+
+if ! [[ "$RATE_LIMIT_SLEEP" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --rate-limit-sleep must be a non-negative integer (seconds)."
+  exit 1
+fi
+# Normalize decimal input before shell arithmetic (08 must not mean octal),
+# and bound it before conversion so oversized input cannot wrap around.
+RATE_LIMIT_SLEEP=$(printf '%s' "$RATE_LIMIT_SLEEP" | sed 's/^0*//')
+RATE_LIMIT_SLEEP=${RATE_LIMIT_SLEEP:-0}
+if [[ ${#RATE_LIMIT_SLEEP} -gt 10 ]] || { [[ ${#RATE_LIMIT_SLEEP} -eq 10 ]] && [[ "$RATE_LIMIT_SLEEP" > 2147483647 ]]; }; then
+  echo "ERROR: --rate-limit-sleep must not exceed 2147483647 seconds."
+  exit 1
+fi
+
+if ! is_decimal_number "$MIN_SCORE"; then
+  echo "ERROR: --min-score must be a non-negative number."
+  exit 1
+fi
+
+# WORKER_TIMEOUT can also come from the environment, which the option parser
+# above never checks: hold it to the same rule as --worker-timeout.
+if ! [[ "$WORKER_TIMEOUT" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: WORKER_TIMEOUT must be a non-negative integer (seconds)."
+  exit 1
+fi
+WORKER_TIMEOUT="${WORKER_TIMEOUT#"${WORKER_TIMEOUT%%[!0]*}"}"
+WORKER_TIMEOUT="${WORKER_TIMEOUT:-0}"
+if [[ ${#WORKER_TIMEOUT} -gt 19 ]] || { [[ ${#WORKER_TIMEOUT} -eq 19 ]] && [[ "$WORKER_TIMEOUT" > 9223372036854775807 ]]; }; then
+  echo "ERROR: WORKER_TIMEOUT must be at most 9223372036854775807 seconds."
+  exit 1
+fi
+
 # Lock file to prevent double execution
+# noclobber makes the create atomic, so two runners started together cannot
+# both own the lock (and both stop the shared PDF painter on exit).
 acquire_lock() {
-  if [[ -f "$LOCK_FILE" ]]; then
+  if ! (set -C; printf '%s\n' "$MAIN_PID" > "$LOCK_FILE") 2>/dev/null; then
     local old_pid
-    old_pid=$(cat "$LOCK_FILE")
-    if kill -0 "$old_pid" 2>/dev/null; then
+    old_pid=$(cat "$LOCK_FILE" 2>/dev/null || true)
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
       echo "ERROR: Another batch-runner is already running (PID $old_pid)"
       echo "If this is stale, remove $LOCK_FILE"
       exit 1
-    else
-      echo "WARN: Stale lock file found (PID $old_pid not running). Removing."
-      rm -f "$LOCK_FILE"
+    fi
+    echo "WARN: Stale lock file found (PID $old_pid not running). Removing."
+    rm -f "$LOCK_FILE"
+    if ! (set -C; printf '%s\n' "$MAIN_PID" > "$LOCK_FILE") 2>/dev/null; then
+      echo "ERROR: Another batch-runner took the lock first"
+      exit 1
     fi
   fi
-  echo "$MAIN_PID" > "$LOCK_FILE"
 }
 
 release_lock() {
   if [[ "${BASHPID:-$$}" != "$MAIN_PID" ]]; then
     return
+  fi
+  # Stop the painter this run started. A copied runner in a fixture has no
+  # lib/pdf-server.mjs, and a run that never painted has no pid file. Either
+  # miss must not fail the batch.
+  if [[ "${PDF_SERVER_OWNER:-}" == "1" ]]; then
+    PDF_SERVER_MODULE="$PROJECT_DIR/lib/pdf-server.mjs" PDF_SERVER_ROOT="$PROJECT_DIR" \
+      node --input-type=module -e 'import { pathToFileURL } from "node:url"; const m = await import(pathToFileURL(process.env.PDF_SERVER_MODULE).href); await m.stopSharedPdfServer(process.env.PDF_SERVER_ROOT);' \
+      >/dev/null 2>&1 || true
   fi
   rm -f "$LOCK_FILE"
 }
@@ -119,12 +436,49 @@ check_prerequisites() {
     exit 1
   fi
 
-  if ! command -v claude &>/dev/null; then
-    echo "ERROR: 'claude' CLI not found in PATH."
+  if [[ "$THIN_ACTION" == "browser-extract" && ! -f "$PROJECT_DIR/browser-extract.mjs" ]]; then
+    echo "ERROR: --thin-action browser-extract needs browser-extract.mjs (and 'npx playwright install chromium')."
     exit 1
   fi
 
+  # Resolve the binary the configured CLI actually needs. opencode can run
+  # natively or fall back to ollama, so check for either.
+  local cli_cmd
+  case "$CLI" in
+    claude)   cli_cmd="claude" ;;
+    opencode) command -v opencode &>/dev/null && cli_cmd="opencode" || cli_cmd="ollama" ;;
+    gemini)   cli_cmd="gemini" ;;
+    qwen)     cli_cmd="qwen" ;;
+    grok)     cli_cmd="grok" ;;
+    *) echo "ERROR: Unknown --cli '$CLI'. Supported: claude, opencode, gemini, qwen, grok"; exit 1 ;;
+  esac
+
+  if ! command -v "$cli_cmd" &>/dev/null; then
+    local level="ERROR"
+    [[ "$DRY_RUN" == "true" ]] && level="WARN"
+    echo "$level: '$cli_cmd' not found in PATH (required for --cli $CLI)."
+    if [[ "$CLI" == "opencode" ]]; then
+      echo "       Install opencode (https://opencode.ai) or Ollama (https://ollama.ai) with an opencode model."
+    fi
+    [[ "$DRY_RUN" == "true" ]] || exit 1
+  fi
+
+  # Parallelism, the rate-limit retry loop, and --strict-mcp-config are
+  # claude-only; local models run one at a time.
+  if [[ "$CLI" != "claude" && "$PARALLEL" -gt 1 ]]; then
+    echo "WARN: --parallel >1 is not supported for --cli $CLI (local models run sequentially). Resetting to 1."
+    PARALLEL=1
+  fi
+
   mkdir -p "$LOGS_DIR" "$TRACKER_DIR" "$REPORTS_DIR"
+}
+
+# Status/watch mode only needs prior batch state, not worker prerequisites.
+check_status_prerequisites() {
+  if [[ ! -f "$STATE_FILE" ]]; then
+    echo "No state file found at $STATE_FILE"
+    exit 0
+  fi
 }
 
 # Initialize state file if it doesn't exist
@@ -134,41 +488,98 @@ init_state() {
   fi
 }
 
+# A lock held longer than this is assumed abandoned, independent of the
+# PID-liveness check below. This exists because `kill -0 $pid` is unreliable
+# on Git Bash/Windows (MSYS PIDs from $!/$BASHPID don't reliably map to real
+# Windows process IDs), so a genuinely-dead lock holder can otherwise never
+# be recovered there and every other worker times out waiting for it.
+STATE_LOCK_STALE_AGE_SECONDS=15
+
 acquire_state_lock() {
+  if [[ "${STATE_LOCK_DISABLED:-0}" -eq 1 ]]; then
+    return 0
+  fi
+
   local waited=0
   local max_waits=$((STATE_LOCK_TIMEOUT_SECONDS * 10))
 
   while true; do
     if mkdir "$STATE_LOCK_DIR" 2>/dev/null; then
-      if printf '%s\n' "${BASHPID:-$$}" > "$STATE_LOCK_PID_FILE"; then
+      if printf '%s\t%s\n' "${BASHPID:-$$}" "$(date +%s)" > "$STATE_LOCK_PID_FILE"; then
+        STATE_LOCK_OWNED=1
         return 0
       fi
       rm -f "$STATE_LOCK_PID_FILE" 2>/dev/null || true
       rmdir "$STATE_LOCK_DIR" 2>/dev/null || true
-      echo "ERROR: Failed to initialize state lock metadata at $STATE_LOCK_DIR"
+      echo "ERROR: Failed to initialize state lock metadata at $STATE_LOCK_DIR" >&2
       return 1
     fi
 
     if [[ ! -d "$STATE_LOCK_DIR" ]]; then
-      echo "ERROR: Failed to create state lock directory $STATE_LOCK_DIR"
+      if (( PARALLEL <= 1 )); then
+        echo "WARN: State lock creation failed. Falling back to lock-free operation (single-worker mode)." >&2
+        STATE_LOCK_DISABLED=1
+        STATE_LOCK_OWNED=0
+        return 0
+      fi
+      echo "ERROR: Failed to create state lock directory $STATE_LOCK_DIR" >&2
       return 1
     fi
 
     if [[ -f "$STATE_LOCK_PID_FILE" ]]; then
-      local lock_pid
-      lock_pid=$(cat "$STATE_LOCK_PID_FILE" 2>/dev/null || true)
-      if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+      local lock_pid lock_epoch
+      lock_pid=$(cut -f1 "$STATE_LOCK_PID_FILE" 2>/dev/null || true)
+      lock_epoch=$(cut -f2 "$STATE_LOCK_PID_FILE" 2>/dev/null || true)
+      local stale=false
+      local stale_reason=""
+
+      # SAFETY INVARIANT: never treat the lock as stale while kill -0
+      # positively confirms the recorded PID is still running — a
+      # confirmed-alive owner may still write update_state_unlocked's
+      # rewrite of STATE_FILE, and reclaiming under it would let two
+      # processes rewrite $STATE_FILE.tmp concurrently (real data loss).
+      # The age-based fallback below only ever fires when the PID check
+      # could NOT confirm liveness (empty/missing PID, or kill -0 itself
+      # reported not-running) — it narrows, but does not replace, the PID
+      # check. This intentionally leaves one Windows/Git-Bash edge case
+      # unhandled: a `kill -0` FALSE POSITIVE (reports alive for a PID
+      # that Windows has actually reused for an unrelated process). That
+      # gap is accepted because the alternative — reclaiming while any
+      # chance remains the owner is genuinely alive — risks silent
+      # concurrent-write corruption, which is worse than this lock
+      # occasionally timing out (recoverable via retry) in that rare case.
+      local pid_confirmed_alive=false
+      if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+        pid_confirmed_alive=true
+      fi
+
+      if [[ "$pid_confirmed_alive" == "false" ]]; then
+        if [[ -n "$lock_pid" ]]; then
+          stale=true
+          stale_reason="PID $lock_pid not running"
+        elif [[ "$lock_epoch" =~ ^[0-9]+$ ]]; then
+          local now age
+          now=$(date +%s)
+          age=$((now - lock_epoch))
+          if (( age >= STATE_LOCK_STALE_AGE_SECONDS )); then
+            stale=true
+            stale_reason="lock age ${age}s >= ${STATE_LOCK_STALE_AGE_SECONDS}s (no PID recorded to check liveness against)"
+          fi
+        fi
+      fi
+
+      if [[ "$stale" == "true" ]]; then
         rm -f "$STATE_LOCK_PID_FILE"
         if rmdir "$STATE_LOCK_DIR" 2>/dev/null; then
-          echo "WARN: Recovered stale state lock (PID $lock_pid not running)."
+          echo "WARN: Recovered stale state lock ($stale_reason)." >&2
           continue
         fi
       fi
     fi
 
     if (( waited >= max_waits )); then
-      echo "ERROR: Timed out waiting for state lock at $STATE_LOCK_DIR"
-      echo "If no batch-runner worker is active, remove the stale lock directory."
+      echo "ERROR: Timed out waiting for state lock at $STATE_LOCK_DIR" >&2
+      echo "If no batch-runner worker is active, remove the stale lock directory." >&2
       return 1
     fi
 
@@ -178,8 +589,12 @@ acquire_state_lock() {
 }
 
 release_state_lock() {
+  if [[ "${STATE_LOCK_OWNED:-0}" -ne 1 ]]; then
+    return
+  fi
   rm -f "$STATE_LOCK_PID_FILE" 2>/dev/null || true
   rmdir "$STATE_LOCK_DIR" 2>/dev/null || true
+  STATE_LOCK_OWNED=0
 }
 
 run_with_state_lock() {
@@ -220,67 +635,171 @@ get_retries() {
   echo "${retries:-0}"
 }
 
-# Calculate next report number.
-# Caller must hold STATE_LOCK_DIR while this runs.
-next_report_num_unlocked() {
-  local max_num=0
-  if [[ -d "$REPORTS_DIR" ]]; then
-    for f in "$REPORTS_DIR"/*.md; do
-      [[ -f "$f" ]] || continue
-      local basename
-      basename=$(basename "$f")
-      local num="${basename%%-*}"
-      num=$((10#$num)) # Remove leading zeros for arithmetic
-      if (( num > max_num )); then
-        max_num=$num
-      fi
-    done
+# Read spend_tier from $PROFILE_FILE (config/profile.yml, or the file
+# CAREER_OPS_PROFILE names). Defaults to "standard" if the key is absent or
+# invalid.
+read_spend_tier() {
+  local raw=""
+
+  if [[ -f "$PROFILE_FILE" ]]; then
+    raw=$(
+      awk -F: '
+        /^[[:space:]]*spend_tier[[:space:]]*:/ {
+          value = substr($0, index($0, ":") + 1)
+          print value
+          exit
+        }
+      ' "$PROFILE_FILE"
+    )
+    raw="${raw%%#*}"
+    raw="${raw//$'\r'/}"
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    case "$raw" in
+      \"*\") raw="${raw#\"}"; raw="${raw%\"}" ;;
+      \'*\') raw="${raw#\'}"; raw="${raw%\'}" ;;
+    esac
+    raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
   fi
-  # Also check state file for assigned report numbers
-  if [[ -f "$STATE_FILE" ]]; then
-    while IFS=$'\t' read -r _ _ _ _ _ rnum _ _ _; do
-      [[ "$rnum" == "report_num" || "$rnum" == "-" || -z "$rnum" ]] && continue
-      local n=$((10#$rnum))
-      if (( n > max_num )); then
-        max_num=$n
-      fi
-    done < "$STATE_FILE"
-  fi
-  printf '%03d' $((max_num + 1))
+
+  case "$raw" in
+    economy|standard|premium)
+      printf '%s\n' "$raw"
+      ;;
+    "")
+      printf '%s\n' "standard"
+      ;;
+    *)
+      echo "WARN: Invalid spend_tier \"$raw\" in ${PROFILE_FILE#"$DATA_ROOT/"}; falling back to standard." >&2
+      printf '%s\n' "standard"
+      ;;
+  esac
 }
+
+# Tier -> model mapping. Keep in sync with the table in modes/_shared.md.
+spend_tier_to_model() {
+  case "$1" in
+    economy) echo "claude-haiku-5-5" ;;
+    premium) echo "claude-opus-5-5" ;;
+    standard|*) echo "claude-sonnet-5-5" ;;
+  esac
+}
+
+# Run one worker CLI with stdin closed, so a CLI that waits for input reads EOF
+# instead of hanging on the runner's terminal. With WORKER_TIMEOUT > 0 a
+# watchdog sends TERM at the limit and KILL 10 s later, and the worker exits
+# 124. Background jobs ignore SIGINT in a non-interactive shell, so Ctrl+C is
+# forwarded to the worker by hand.
+run_worker() {
+  "$@" </dev/null &
+  local pid=$!
+  local watchdog=""
+  if (( WORKER_TIMEOUT > 0 )); then
+    (
+      for (( s = 0; s < WORKER_TIMEOUT; s++ )); do
+        sleep 1
+        kill -0 "$pid" 2>/dev/null || exit 0
+      done
+      kill -TERM "$pid" 2>/dev/null
+      for (( s = 0; s < 10; s++ )); do
+        sleep 1
+        kill -0 "$pid" 2>/dev/null || exit 124
+      done
+      kill -KILL "$pid" 2>/dev/null
+      exit 124
+    ) &
+    watchdog=$!
+  fi
+  trap 'kill -TERM "$pid" 2>/dev/null; exit 130' INT TERM
+  local rc=0
+  wait "$pid" || rc=$?
+  trap - INT TERM
+  if [[ -n "$watchdog" ]]; then
+    local watchdog_rc=0
+    wait "$watchdog" || watchdog_rc=$?
+    if (( watchdog_rc == 124 )); then
+      echo "batch-runner: worker timed out after ${WORKER_TIMEOUT}s"
+      rc=124
+    fi
+  fi
+  return "$rc"
+}
+
+# Resolve the model to pass to the worker CLI. --model always wins.
+# spend_tier maps to Claude model names, so it only applies to --cli claude;
+# other CLIs use --model verbatim, or their own default when it is unset.
+resolve_worker_model() {
+  if [[ -n "$MODEL" ]]; then
+    RESOLVED_MODEL="$MODEL"
+    RESOLVED_SPEND_TIER="override"
+    return 0
+  fi
+
+  if [[ "$CLI" != "claude" ]]; then
+    RESOLVED_MODEL=""
+    RESOLVED_SPEND_TIER="cli-default"
+    return 0
+  fi
+
+  RESOLVED_SPEND_TIER="$(read_spend_tier)"
+  RESOLVED_MODEL="$(spend_tier_to_model "$RESOLVED_SPEND_TIER")"
+}
+
+
+# Append a one-line, auditable record of a pre-screen-gate discard to
+# batch/logs/discard.log (see modes/batch.md — Pre-screen gate). Format:
+# {ISO8601 timestamp}\t{job id}\t{url}\t{reason}
+#
+# Callers write the "skipped" state first and call this only when that state
+# (or its recovery record) was written, so the same id, url and reason are on
+# disk. A failed append is therefore reported, not fatal: the record can be
+# rebuilt from state instead of aborting the run.
+log_discard() {
+  local id="$1" url="$2" reason="$3"
+  local ts
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if ! { mkdir -p "$LOGS_DIR" && printf '%s\t%s\t%s\t%s\n' "$ts" "$id" "$url" "$reason" >> "$DISCARD_LOG"; } 2>/dev/null; then
+    echo "    ⚠️  Could not append to $DISCARD_LOG for #$id; its skipped state record keeps the reason" >&2
+  fi
+}
+
 
 # Update or insert state for an offer.
 # Caller must hold STATE_LOCK_DIR while this runs.
 update_state_unlocked() {
   local id="$1" url="$2" status="$3" started="$4" completed="$5" report_num="$6" score="$7" error="$8" retries="$9"
 
+  # batch-state.tsv is tab-separated with one row per line -- a literal tab,
+  # newline, or carriage return inside $error (e.g. from a worker's raw error
+  # text, or JSON.parse unescaping \n/\r/\t in a caller upstream) would split
+  # into extra columns or extra rows and corrupt every row after it. Collapse
+  # them to spaces centrally here so every caller is protected, not just the
+  # one that happened to trigger this.
+  error=${error//$'\r'/ }
+  error=${error//$'\n'/ }
+  error=${error//$'\t'/ }
+
   if [[ ! -f "$STATE_FILE" ]]; then
     init_state
   fi
 
   local tmp="$STATE_FILE.tmp"
-  local found=false
+  local row
+  row=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "$id" "$url" "$status" "$started" "$completed" "$report_num" "$score" "$error" "$retries")
 
-  # Write header
-  head -1 "$STATE_FILE" > "$tmp"
-
-  # Process existing lines
-  while IFS=$'\t' read -r sid surl sstatus sstarted scompleted sreport sscore serror sretries; do
-    [[ "$sid" == "id" ]] && continue  # skip header
-    if [[ "$sid" == "$id" ]]; then
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$id" "$url" "$status" "$started" "$completed" "$report_num" "$score" "$error" "$retries" >> "$tmp"
-      found=true
-    else
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$sid" "$surl" "$sstatus" "$sstarted" "$scompleted" "$sreport" "$sscore" "$serror" "$sretries" >> "$tmp"
-    fi
-  done < "$STATE_FILE"
-
-  if [[ "$found" == "false" ]]; then
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$id" "$url" "$status" "$started" "$completed" "$report_num" "$score" "$error" "$retries" >> "$tmp"
-  fi
+  # One awk pass, not a bash read loop. The loop appended each of ~3,200 rows
+  # with its own `printf >>`, reopening the file per line: ~5s per call on
+  # Windows, all of it inside the state lock, so reservations queued behind it
+  # for 40-80s. Values go through ENVIRON, not -v, so backslashes in error
+  # messages are written verbatim.
+  STATE_ROW="$row" STATE_ID="$id" awk -F'\t' '
+    NR == 1 { print; next }
+    $1 == "id" { next }
+    $1 == ENVIRON["STATE_ID"] { print ENVIRON["STATE_ROW"]; found = 1; next }
+    { print }
+    END { if (!found) print ENVIRON["STATE_ROW"] }
+  ' "$STATE_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
 
   mv "$tmp" "$STATE_FILE"
 }
@@ -289,22 +808,480 @@ update_state() {
   run_with_state_lock update_state_unlocked "$@"
 }
 
+# Atomic compare-and-set: only patch a row to "completed" if its current
+# status is still "processing". Used by sweep_orphans to avoid racing
+# worker updates that legitimately marked the row "skipped" / "failed" /
+# "completed" between the sweep's snapshot of processing IDs and the
+# patch step. Returns 0 if the row was patched, 1 if it was no longer
+# processing (caller should skip silently).
+# Caller must hold STATE_LOCK_DIR while this runs.
+update_state_if_processing_unlocked() {
+  local id="$1" url="$2" started="$3" completed="$4" report_num="$5" score="$6" retries="$7"
+  if [[ ! -f "$STATE_FILE" ]]; then
+    return 1
+  fi
+  local current
+  current=$(awk -F'\t' -v id="$id" '$1==id {print $3; exit}' "$STATE_FILE")
+  if [[ "$current" != "processing" ]]; then
+    return 1
+  fi
+  update_state_unlocked "$id" "$url" "completed" "$started" "$completed" "$report_num" "$score" "-" "$retries"
+}
+
+update_state_if_processing() {
+  run_with_state_lock update_state_if_processing_unlocked "$@"
+}
+
+# Durable last-resort records of state transitions that could NOT be written
+# into $STATE_FILE (state-lock exhausted its retries). ONE FILE PER RECORD:
+# each failed transition gets its own uniquely-named file via mktemp
+# (O_CREAT|O_EXCL — atomic creation, guaranteed-unique name), so no two
+# workers ever write to the same file and no shared-file truncate/append
+# race can exist on any platform. That matters here because recovery writes
+# are CORRELATED, not independent: they fire exactly when the state lock is
+# jammed, which makes all parallel workers fail (and try to record) at the
+# same moment — a shared recovery file is racing precisely when it is
+# needed most (PR #2417 review). This mechanism must also never depend on
+# the state lock that just failed, and it doesn't: creation is the only
+# synchronization. reconcile_recovery_records() (start of the next run,
+# single-threaded, before any worker spawns) merges each record into
+# $STATE_FILE and deletes its file only on success — there is no
+# rewrite-and-rename step, so nothing here needs cross-filesystem atomicity.
+RECOVERY_DIR="$BATCH_DIR/batch-state-recovery.d"
+
+append_recovery_record() {
+  local id="$1" url="$2" status="$3" started="$4" completed="$5" report_num="$6" score="$7" error="$8" retries="$9"
+  # Same rationale as update_state_unlocked: a literal tab/newline/CR in
+  # $error would split this single-line record into extra fields or rows,
+  # corrupting the record and the state row it later reconciles into.
+  error=${error//$'\r'/ }
+  error=${error//$'\n'/ }
+  error=${error//$'\t'/ }
+  # \x1f is used as the in-memory delimiter when this record is read back
+  # (see reconcile_recovery_records); strip it here too so a stray unit
+  # separator in $error can't inject a field boundary on the read side.
+  error=${error//$'\x1f'/ }
+  mkdir -p "$RECOVERY_DIR" || return 1
+  local rec
+  rec=$(mktemp "$RECOVERY_DIR/rec-XXXXXX") || return 1
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$id" "$url" "$status" "$started" "$completed" "$report_num" "$score" "$error" "$retries" > "$rec"
+}
+
+# A recovery record is ALWAYS older than whatever $STATE_FILE holds for the
+# same id: the record is only written when the lock was unreachable, so any
+# row present for that id now was written afterwards by a path that did reach
+# the lock. Merging it blindly therefore rolls a finished offer backwards --
+# the score and completed_at are overwritten, and since rate_limited and
+# failed are NOT terminal, the offer re-enters pending selection in main()
+# and gets evaluated a second time. Cost: one lost evaluation plus one
+# duplicate run, on a path that by construction only fires when something
+# already went wrong.
+#
+# Completed and human-held states must not be rolled back by stale records.
+# Keep these protected states in sync with the pending-selection guard.
+recovery_record_is_superseded() {
+  local current="$1"
+  [[ "$current" == "completed" || "$current" == "skipped" || "$current" == "needs_confirmation" ]]
+}
+
+# Merge one recovery record, but only into a row that has not already reached
+# a completed or human-held state. The status read happens INSIDE the lock: a
+# check-then-write gap would let a worker finish between the two and
+# reintroduce the same rollback. get_status is a lock-free reader (plain awk
+# over $STATE_FILE), so calling it here does not re-enter the non-reentrant
+# mkdir lock.
+#
+# Exit codes: 0 merged · 3 superseded (record is stale, caller should drop
+# it) · anything else is a real failure. 3 avoids colliding with the 1 that
+# acquire_state_lock returns when the lock itself is unreachable.
+reconcile_one_unlocked() {
+  local id="$1"
+  local current
+  current=$(get_status "$id")
+  if recovery_record_is_superseded "$current"; then
+    echo "    Superseded: offer id=$id already '$current' in state — discarding stale recovery record (would have rolled it back to '$3')."
+    return 3
+  fi
+  update_state_unlocked "$@"
+}
+
+reconcile_one() {
+  run_with_state_lock reconcile_one_unlocked "$@"
+}
+
+# Merge any recovery records left by a prior run into $STATE_FILE. Runs
+# single-threaded at the very start of main(), before any worker is spawned,
+# so there is no lock contention here — this is the one place these records
+# are guaranteed a clean shot at the lock. Each record file is deleted only
+# after its transition lands in $STATE_FILE (or is found to be superseded);
+# genuine failures leave the file in place for the run after that.
+reconcile_recovery_records() {
+  [[ -d "$RECOVERY_DIR" ]] || return 0
+
+  local -a rec_files=()
+  local f
+  for f in "$RECOVERY_DIR"/rec-*; do
+    [[ -f "$f" ]] || continue
+    rec_files+=("$f")
+  done
+  if (( ${#rec_files[@]} == 0 )); then
+    rmdir "$RECOVERY_DIR" 2>/dev/null || true
+    return 0
+  fi
+
+  echo "=== Reconciling ${#rec_files[@]} recovery record(s) from a prior interrupted run ==="
+  local merged=0 superseded=0 still_failed=0
+  local rid rurl rstatus rstarted rcompleted rreport rscore rerror rretries
+  local rline
+  local rc
+  for f in "${rec_files[@]}"; do
+    rline=""
+    # Don't split with `IFS=$'\t' read`: tab is IFS *whitespace*, so a run of
+    # tabs around an empty interior field (e.g. an empty completed_at on a
+    # non-terminal record) collapses to one delimiter and every later field
+    # shifts left, corrupting the merge. Read the line raw, then split on \x1f
+    # (a non-whitespace unit separator that preserves empty fields) after
+    # translating the on-disk tabs to it. Same rationale as process_offer.
+    IFS= read -r rline < "$f" || true
+    IFS=$'\x1f' read -r rid rurl rstatus rstarted rcompleted rreport rscore rerror rretries <<< "${rline//$'\t'/$'\x1f'}"
+    if [[ -z "$rid" ]]; then
+      echo "    WARN: discarding unreadable recovery record $f" >&2
+      rm -f "$f"
+      continue
+    fi
+    rc=0
+    reconcile_one "$rid" "$rurl" "$rstatus" "$rstarted" "$rcompleted" "$rreport" "$rscore" "$rerror" "$rretries" || rc=$?
+    if (( rc == 0 )); then
+      rm -f "$f"
+      merged=$((merged + 1))
+    elif (( rc == 3 )); then
+      # Stale by definition, not a failure — the row it targets already
+      # finished. Dropping the file is correct; keeping it would retry the
+      # same rollback on every subsequent run.
+      rm -f "$f"
+      superseded=$((superseded + 1))
+    else
+      still_failed=$((still_failed + 1))
+    fi
+  done
+
+  echo "    Merged: $merged | Superseded: $superseded | Still unrecovered: $still_failed"
+  if (( still_failed > 0 )); then
+    echo "    WARN: $still_failed record(s) could not be merged even single-threaded — check $STATE_LOCK_DIR for a genuinely stuck lock. Unmerged records remain in $RECOVERY_DIR." >&2
+  else
+    rmdir "$RECOVERY_DIR" 2>/dev/null || true
+  fi
+}
+
+# Retry wrapper around update_state. Bare `update_state ...` calls under
+# `set -e` will silently kill the entire background worker subshell if a
+# single lock-timeout failure propagates — this wrapper retries a few times
+# and, if it still fails, falls back to append_recovery_record so the
+# transition is never actually lost (only delayed until the next run's
+# reconcile step), then logs a clear warning and returns non-zero so the
+# CALLER can still decide whether to skip side effects that assumed success.
+# Return 1 means the transition is durable in recovery; 2 means neither write
+# succeeded, so a human gate must stop and surface the persistence failure
+# (found under --parallel 5 on Git Bash/Windows: ~47 of 50 jobs silently
+# dropped in one run from exactly this before the retry+recovery-log fix).
+update_state_retrying() {
+  local attempt=0
+  local max_attempts=3
+  while (( attempt < max_attempts )); do
+    if update_state "$@"; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    if (( attempt < max_attempts )); then
+      echo "    ⚠️  State update failed (attempt $attempt/$max_attempts), retrying in 2s..." >&2
+      sleep 2
+    fi
+  done
+  if append_recovery_record "$@"; then
+    echo "    ⚠️  State update failed after $max_attempts attempts — offer id=$1 status=$3 recorded to $RECOVERY_DIR for reconciliation on next run." >&2
+  else
+    echo "    ❌ State update failed after $max_attempts attempts AND recovery-record write also failed — offer id=$1 status=$3 was NOT recorded anywhere. It will be retried as pending next run." >&2
+    return 2
+  fi
+  return 1
+}
+
+is_rate_limit_log() {
+  local log_file="$1"
+  grep -Eiq '(rate limit|rate_limit|too many requests|429|quota exceeded|try again later|temporarily unavailable)' "$log_file"
+}
+
+is_session_limit_log() {
+  local log_file="$1"
+  grep -Eiq '(session limit|resets [0-9:]+[ap]m|usage limit|limit[[:space:]]+reached)' "$log_file"
+}
+
+# Print a delay or "pause". Only standalone delta-seconds headers are trusted;
+# never feed worker text into shell arithmetic. awk compares before formatting,
+# so even an arbitrarily long integer header safely requests a pause.
+rate_limit_delay() {
+  local log_file="$1" retry="$2" base delay hint step
+  if (( RATE_LIMIT_SLEEP == 0 )); then
+    echo pause
+    return
+  fi
+  base=30
+  (( base <= RATE_LIMIT_SLEEP )) || base=$RATE_LIMIT_SLEEP
+  # A log that exists and is empty has no header to find, and awk would print
+  # nothing for it: skip the two processes. A missing log still reaches awk.
+  hint=""
+  [[ -e "$log_file" && ! -s "$log_file" ]] || hint=$(LC_ALL=C awk -v cap="$RATE_LIMIT_SLEEP" '
+    tolower($0) ~ /^[[:space:]]*retry-after:[[:space:]]*[0-9]+[[:space:]]*$/ {
+      value=$0
+      sub(/^[^:]*:[[:space:]]*/, "", value)
+      if (value + 0 > cap) over=1
+      if (value + 0 > largest) largest=value + 0
+      found=1
+    }
+    END {
+      if (over) print "pause"
+      else if (found) printf "%.0f\n", largest
+    }
+  ' "$log_file")
+  if [[ "$hint" == pause ]]; then
+    echo pause
+    return
+  fi
+  delay=$base
+  if [[ -n "$hint" ]]; then
+    (( hint <= delay )) || delay=$hint
+  else
+    # Saturate before doubling, avoiding exponentiation/overflow even on resume.
+    for (( step=0; step<retry && delay<RATE_LIMIT_SLEEP; step++ )); do
+      if (( delay > RATE_LIMIT_SLEEP / 2 )); then
+        delay=$RATE_LIMIT_SLEEP
+      else
+        delay=$((delay * 2))
+      fi
+    done
+  fi
+  # Upward-only jitter never undercuts Retry-After or the base delay.
+  delay=$((delay + delay * (RANDOM % 21) / 100))
+  (( delay <= RATE_LIMIT_SLEEP )) || delay=$RATE_LIMIT_SLEEP
+  echo "$delay"
+}
+
+mark_paused_rate_limit() {
+  local id="$1" url="$2" started_at="$3" report_num="$4" retries="$5" log_file="$6"
+  local completed_at
+  completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local error_msg
+  error_msg=$(tail -5 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c1-200 || echo "session/rate limit reached")
+  update_state_retrying "$id" "$url" "paused_rate_limit" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries" || true
+  printf '%s\t%s\t%s\n' "$id" "$report_num" "$error_msg" > "$PAUSE_FILE"
+  BATCH_PAUSED=true
+}
+
 reserve_report_num_unlocked() {
   local id="$1" url="$2" started="$3" retries="$4"
 
+  # Use the shared, cross-process-atomic reservation system (O_CREAT|O_EXCL
+  # sentinel files in reserve-report-num.mjs) instead of the old bash-native
+  # max(existing report files, batch-state.tsv numbers)+1 scan. The bash-native
+  # version had zero visibility into reservations made by any OTHER process
+  # calling `node reserve-report-num.mjs` directly -- e.g. an interactively
+  # dispatched Agent evaluating one offer with a browser tool while a batch
+  # run is in flight. Both could independently compute the same "next" number
+  # and collide on disk. Found 2026-07-30: two separate collisions (report
+  # 049, report 051) in one batch run for exactly this reason -- routing every
+  # caller through the same node script means they all share one real lock.
   local report_num=""
-  if report_num=$(next_report_num_unlocked); then
-    update_state_unlocked "$id" "$url" "processing" "$started" "-" "$report_num" "-" "-" "$retries"
+  report_num=$(node "$PROJECT_DIR/reserve-report-num.mjs" 2>/dev/null | tr -d '[:space:]') || report_num=""
+  # No number means the allocator failed (lock timeout, unwritable reports/,
+  # exhausted retries). Returning success with an empty number let the caller
+  # launch a paid worker with a blank "Report number:" and write an empty
+  # report_num cell into batch-state.tsv; the retry wrapper below is what
+  # handles a failed reservation, so fail here and let it.
+  if [[ ! "$report_num" =~ ^[0-9]+$ ]]; then
+    echo "    ❌ reserve-report-num.mjs returned no report number for offer id=$id" >&2
+    return 1
   fi
+  update_state_unlocked "$id" "$url" "processing" "$started" "-" "$report_num" "-" "-" "$retries"
 
   printf '%s\n' "$report_num"
 }
 
+# Threshold above which the reservation path is considered pathologically slow.
+# The whole path should now run in well under a second; anything approaching the
+# lock timeout means an O(n) operation has crept back into the critical section,
+# which is exactly how the 167-second regression went unnoticed for a week.
+RESERVE_SLOW_WARN_SECONDS="${RESERVE_SLOW_WARN_SECONDS:-5}"
+
+# Release a report-number reservation via the shared atomic system. Safe to
+# call even if the number was never actually reserved this way (e.g. a
+# resumed/paused offer) -- the underlying script no-ops on a missing sentinel.
+release_report_num() {
+  local report_num="$1"
+  [[ -n "$report_num" && "$report_num" != "-" ]] || return 0
+  node "$PROJECT_DIR/reserve-report-num.mjs" --release "$report_num" >/dev/null 2>&1 || true
+}
+
 reserve_report_num() {
-  run_with_state_lock reserve_report_num_unlocked "$@"
+  # No directory scan in bash. reserve-report-num.mjs lists reports/ once in
+  # Node (~2ms for ~3,700 files) plus ~100ms of process start — the O(n) bash
+  # glob loop that made this path take minutes on OneDrive is gone.
+  local started_ns elapsed
+  started_ns=$(date +%s%N 2>/dev/null || echo 0)
+
+  local out rc=0
+  out=$(run_with_state_lock reserve_report_num_unlocked "$1" "$2" "$3" "$4") || rc=$?
+
+  if [[ "$started_ns" != "0" ]]; then
+    local now_ns
+    now_ns=$(date +%s%N 2>/dev/null || echo 0)
+    if [[ "$now_ns" != "0" ]]; then
+      elapsed=$(( (now_ns - started_ns) / 1000000000 ))
+      if (( elapsed >= RESERVE_SLOW_WARN_SECONDS )); then
+        echo "    ⚠️  reservation for #$1 took ${elapsed}s (warn threshold ${RESERVE_SLOW_WARN_SECONDS}s) — something O(n) may be inside the state lock again." >&2
+      fi
+    fi
+  fi
+
+  printf '%s\n' "$out"
+  return "$rc"
+}
+
+# Resolve the report number and score the worker ACTUALLY produced.
+#
+# The runner reserves a report number up front and hands it to the worker, but
+# nothing verified the worker used it. When it wrote a different report (for
+# example updating an existing report for the same company), the state row kept
+# the reserved number, so `report_num` pointed at a file that either did not
+# exist or belonged to a different offer. That single gap produced three
+# related defects: rows whose score stayed "-" though the report carried one,
+# report_num values that disagreed with the file on disk, and a report->JD
+# mapping built from state that silently resolved to the wrong posting.
+#
+# The old score regex compounded it: `"score":[[:space:]]*([0-9.]+)` matched
+# only a bare number, so `"score": null` or a quoted value yielded nothing and
+# the row silently landed as "-" even when the report said 2.0/5. It also took
+# head -1, the FIRST match anywhere in the log, rather than the worker's final
+# result line.
+#
+# Resolution order, most authoritative first:
+#   1. the "report" path in the worker's own result JSON
+#   2. the report whose "**Batch ID:** <id>" stamp matches this offer
+#   3. the reserved number (previous behaviour)
+#
+# Score prefers the JSON (last match, i.e. the final result line, and tolerating
+# quotes) and falls back to "**Score:** X.X/5" in the resolved report.
+#
+# Echoes "<report_num>\t<score>"; score is "-" when genuinely unavailable.
+resolve_worker_result() {
+  local log_file="$1" reserved="$2" offer_id="$3"
+  local rnum="" score="" rpath="" rfile=""
+
+  if [[ -f "$log_file" ]]; then
+    rpath=$(sed -nE 's@.*"report"[[:space:]]*:[[:space:]]*"([^"]+\.md)".*@\1@p' "$log_file" 2>/dev/null | tail -1 || true)
+    score=$(sed -nE 's/.*"score"[[:space:]]*:[[:space:]]*"?([0-9]+(\.[0-9]+)?)"?.*/\1/p' "$log_file" 2>/dev/null | tail -1 || true)
+  fi
+
+  # 1. the path the worker said it wrote
+  if [[ -n "$rpath" ]]; then
+    local cand="$rpath"
+    [[ "$cand" != /* ]] && cand="$PROJECT_DIR/${rpath#./}"
+    [[ -f "$cand" ]] && rfile="$cand"
+  fi
+
+  # 2. the report stamped with this batch id — but ONLY when that stamp is
+  #    unambiguous. batch-input.tsv has been regenerated several times, so low
+  #    ids are reused: id 1 currently matches 21 different reports going back to
+  #    May. Taking the first match would silently bind a 2026-08 offer to a
+  #    2026-05 report. A single match is trustworthy; anything else is not, and
+  #    we fall through to the reserved number rather than guess.
+  if [[ -z "$rfile" && -n "$offer_id" ]]; then
+    local bid_matches bid_count
+    bid_matches=$(grep -l -- "^\*\*Batch ID:\*\* ${offer_id}\$" "$REPORTS_DIR"/*.md 2>/dev/null || true)
+    bid_count=$(printf '%s' "$bid_matches" | grep -c . || true)
+    if [[ "${bid_count:-0}" -eq 1 ]]; then
+      rfile="$bid_matches"
+    elif [[ "${bid_count:-0}" -gt 1 ]]; then
+      echo "    ⚠️  #$offer_id: Batch ID stamp matches $bid_count reports (ids are reused across batch-input generations) — using the reserved number instead." >&2
+    fi
+  fi
+
+  # 3. whatever carries the reserved number
+  if [[ -z "$rfile" && -n "$reserved" && "$reserved" != "-" ]]; then
+    rfile=$(ls "$REPORTS_DIR/${reserved}"-*.md 2>/dev/null | head -1 || true)
+  fi
+
+  if [[ -n "$rfile" && -f "$rfile" ]]; then
+    rnum=$(basename "$rfile" | sed -nE 's/^([0-9]+)-.*/\1/p')
+    if ! is_decimal_number "${score:-}"; then
+      score=$(sed -nE 's@^\*\*Score:\*\*[[:space:]]*([0-9]+(\.[0-9]+)?)/5.*@\1@p' "$rfile" 2>/dev/null | head -1 || true)
+    fi
+  fi
+
+  [[ -n "$rnum" ]] || rnum="$reserved"
+  is_decimal_number "${score:-}" || score="-"
+  printf '%s\t%s\n' "$rnum" "$score"
+}
+
+# Succeed if reports/ holds a real report for this number. The reservation
+# sentinel ({num}-RESERVED.md) never counts: reserve-report-num.mjs creates it
+# before the worker runs, so counting it would mark a no-op worker completed.
+#
+# A plain glob loop, not `compgen -G`: compgen exists only when bash is built
+# with programmable completion, and some distro builds (NixOS among them) omit
+# it from non-interactive shells. There, compgen fails, the check sees no
+# report, and every worker is recorded as failed even though its report is on
+# disk. merge-tracker.mjs then refuses those reports as possibly fabricated.
+has_report_file() {
+  local report_num="$1" f
+  for f in "$REPORTS_DIR/${report_num}"-*.md; do
+    [[ -e "$f" ]] || continue
+    [[ "$f" == *-RESERVED.md ]] && continue
+    return 0
+  done
+  return 1
+}
+
+# Retry wrapper — same rationale as update_state_retrying above. A bare
+# `x=$(reserve_report_num ...)` under `set -e` kills the worker subshell
+# silently on a single lock-timeout; this retries and logs instead.
+reserve_report_num_retrying() {
+  local attempt=0
+  local max_attempts=3
+  local result=""
+  while (( attempt < max_attempts )); do
+    if result=$(reserve_report_num "$@"); then
+      printf '%s\n' "$result"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    if (( attempt < max_attempts )); then
+      echo "    ⚠️  Report-number reservation failed (attempt $attempt/$max_attempts), retrying in 2s..." >&2
+      sleep 2
+    fi
+  done
+  echo "    ❌ Report-number reservation failed after $max_attempts attempts for offer id=$1 — leaving it pending for next run." >&2
+  return 1
 }
 
 # Process a single offer
+# Return the path of the report already written for this offer, if there is
+# exactly one. Empty when none exists or the Batch ID stamp is ambiguous.
+#
+# The uniqueness requirement is not optional: batch-input.tsv has been
+# regenerated repeatedly, so low ids are reused and id 1 currently matches 21
+# reports going back to May. Accepting the first match would bind a current
+# offer to an unrelated historical report.
+find_existing_report_for_offer() {
+  local offer_id="$1"
+  [[ -n "$offer_id" ]] || return 0
+  local matches count
+  matches=$(grep -l -- "^\*\*Batch ID:\*\* ${offer_id}\$" "$REPORTS_DIR"/*.md 2>/dev/null || true)
+  count=$(printf '%s' "$matches" | grep -c . || true)
+  [[ "${count:-0}" -eq 1 ]] && printf '%s\n' "$matches"
+  return 0
+}
+
 process_offer() {
   local id="$1" url="$2" source="$3" notes="$4"
 
@@ -312,19 +1289,411 @@ process_offer() {
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   local retries
   retries=$(get_retries "$id")
-  local report_num
-  report_num=$(reserve_report_num "$id" "$url" "$started_at" "$retries")
+
+  # Pre-flight duplicate guard: never spend a worker on an offer that already
+  # has a report on disk.
+  #
+  # Every duplicate evaluation so far has come through this hole. A state write
+  # is lost to lock contention, the row stays "processing", sweep_orphans
+  # cannot promote it because the worker log has no parsable JSON, and the next
+  # run evaluates the offer from scratch. Bankjoy (#1341) went that way on
+  # 2026-08-11: report 3193 already existed, the 04:00 resolver even identified
+  # it, and 22:00 still produced report 3210. Codal went the same way on
+  # 2026-08-07 (2578 -> 3148).
+  #
+  # Checking the filesystem is authoritative in a way the log is not: if a
+  # report carrying this offer's Batch ID exists, the evaluation happened,
+  # regardless of what any log does or does not say. Recording it as completed
+  # both stops the re-run and repairs the state row to point at the real report.
+  local existing_report
+  existing_report=$(find_existing_report_for_offer "$id")
+  if [[ -n "$existing_report" && -f "$existing_report" ]]; then
+    local existing_num existing_score
+    existing_num=$(basename "$existing_report" | sed -nE 's/^([0-9]+)-.*/\1/p')
+    existing_score=$(sed -nE 's@^\*\*Score:\*\*[[:space:]]*([0-9]+(\.[0-9]+)?)/5.*@\1@p' "$existing_report" 2>/dev/null | head -1 || true)
+    is_decimal_number "${existing_score:-}" || existing_score="-"
+    echo "--- Skipping offer #$id: already evaluated as report $existing_num ($(basename "$existing_report"))"
+    update_state_retrying "$id" "$url" "completed" "$started_at" \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$existing_num" "$existing_score" \
+      "pre-flight: report already on disk, no re-evaluation" "$retries" || true
+    return 0
+  fi
+  # Reserve a report number AND persist the "processing" state row before doing
+  # any expensive work. When the allocator itself hands back no number (lock
+  # timeout, unwritable reports/) after reserve_report_num_retrying's attempts,
+  # stop: the offer stays pending and no worker runs without a number. A number
+  # whose state row then fails to land under a parallel burst is different:
+  # treat the reservation as successful only when the row reads back as
+  # "processing", retry a few times, then bail rather than run claude -p with
+  # no state row (which is what produced silent orphans previously).
+  local report_num="" reserve_attempt=0
+  while (( reserve_attempt < RESERVE_STATE_MAX_ATTEMPTS )); do
+    if ! report_num=$(reserve_report_num_retrying "$id" "$url" "$started_at" "$retries"); then
+      return 1
+    fi
+    if [[ -n "$report_num" && "$(get_status "$id")" == "processing" ]]; then
+      break
+    fi
+    # A number came back but its state row did not land: hand the reservation
+    # back rather than hold it until the 4h sentinel GC.
+    [[ -n "$report_num" ]] && release_report_num "$report_num"
+    report_num=""
+    ((reserve_attempt += 1))
+    sleep 0.3
+  done
+  if [[ -z "$report_num" ]]; then
+    local failed_at
+    failed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    retries=$((retries + 1))
+    update_state_retrying "$id" "$url" "failed" "$started_at" "$failed_at" "-" "-" \
+      "could not persist state row (lock contention) after ${RESERVE_STATE_MAX_ATTEMPTS} attempts" "$retries" || true
+    echo "    ❌ #$id: could not reserve state row after $RESERVE_STATE_MAX_ATTEMPTS attempts — skipping evaluation (will retry next run)"
+    return 0
+  fi
+  # The number this offer holds a reservation sentinel for. report_num can later
+  # be repointed at the report the worker actually wrote (resolve_worker_result),
+  # but the sentinel to release is always this one.
+  local reserved_num="$report_num"
   local date
   date=$(date +%Y-%m-%d)
-  local jd_file="/tmp/batch-jd-${id}.txt"
+  # Use mktemp instead of a predictable path: a fixed name like
+  # /tmp/batch-jd-${id}.txt is guessable, so an attacker on a shared machine
+  # could pre-create it as a symlink and redirect or clobber the write.
+  # Always project-local, never ${TMPDIR}: the worker CLI has to be able to read
+  # this file, and CLIs that auto-reject external_directory (/tmp/*) — opencode
+  # does — cannot read anything outside the project. Honouring TMPDIR here would
+  # re-open that hole whenever TMPDIR is the usual /tmp. mktemp still randomizes
+  # the name, so the symlink-guessability property above is unchanged.
+  local jd_tmp_dir="$PROJECT_DIR/batch/tmp"
+  mkdir -p "$jd_tmp_dir"
+  local jd_file
+  jd_file="$(mktemp "$jd_tmp_dir/batch-jd-${id}.XXXXXX")"
+  # The worker is a native process. Under Git Bash / MSYS the path above is a
+  # POSIX one (/tmp/... or /c/...) that a Windows binary cannot open, so every
+  # worker read "JD source unavailable" even when curl had filled the file.
+  # cygpath -m yields C:/... which both bash and the worker resolve.
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) command -v cygpath >/dev/null 2>&1 && jd_file="$(cygpath -m "$jd_file")" ;;
+  esac
 
-  echo "--- Processing offer #$id: $url (report $report_num, attempt $((retries + 1)))"
+  # Pre-populate $jd_file with a static curl fetch so the worker reads HTML
+  # directly instead of always falling through to WebFetch (#2492). WebFetch is
+  # unreliable on JS-rendered boards (Phenom, Workday, iCIMS) because it hits
+  # the rendered JS shell rather than the actual JD text. curl returns the raw
+  # HTML in a single round-trip; for static boards that is exactly the JD.
+  # For JS-rendered boards the file will be thin (JS shell only), which the
+  # sufficiency check below detects — the file is then truncated to 0 bytes so
+  # the worker's Step-1 WebFetch fallback fires exactly as designed.
+  # If curl is absent or fails, $jd_file stays empty and WebFetch fires too.
+  # Minimum visible word count to treat a fetched page as a real JD rather than
+  # a JS shell. A JS app shell (Workday, Phenom, iCIMS) has near-zero visible
+  # words after HTML stripping; a real JD has hundreds. 80 is a conservative
+  # lower bound — any genuine posting has at least a title, summary, and a few
+  # requirements, which together exceed 80 stripped words.
+  local prefetch_min_words=80
+  local jd_prefetch_words=0
+  local jd_raw_file=""
+  local curl_status=0
+  if command -v curl >/dev/null 2>&1; then
+    # Reject loopback, link-local, and private-network destinations before curl
+    # connects. --proto/--proto-redir restrict schemes but not destination IPs,
+    # so a malicious offer URL could reach cloud metadata (169.254.169.254) or
+    # internal services without this guard.
+    local _url_safe
+    local current_url="$url"
+    local redirect_count=0
+    local redirect_headers
+    local redirect_location
+    while :; do
+      _url_safe=$(node -e "
+      try {
+        const u = new URL(process.argv[1]);
+        const h = u.hostname.toLowerCase().replace(/\.\$/, '');
+        const blocked =
+          h === 'localhost' || h === 'localhost.localdomain' ||
+          h.endsWith('.local') || h.endsWith('.internal') ||
+          h.includes(':') ||
+          /^127\./.test(h) || /^169\.254\./.test(h) ||
+          /^10\./.test(h) || /^172\.(1[6-9]|2[0-9]|3[01])\./.test(h) ||
+          /^192\.168\./.test(h) || /^0\./.test(h);
+        process.stdout.write(blocked ? '0' : '1');
+      } catch (e) { process.stdout.write('0'); }
+      " "$current_url" 2>/dev/null)
+      if [[ "$_url_safe" != "1" ]]; then
+        echo "    ℹ️  JD prefetch: blocked — private/loopback destination ($current_url)"
+        : > "$jd_file"
+        break
+      else
+        # Headers are read by curl/bash only — never by the worker — so this one
+        # stays on ${TMPDIR:-/tmp} and the expression stays self-contained (the
+        # prefetch block is extracted and run in isolation by
+        # tests/batch-runner-jd-prefetch.test.mjs, where $jd_tmp_dir is not set).
+        redirect_headers="$(mktemp "${TMPDIR:-/tmp}/batch-jd-headers.XXXXXX")"
+        curl_status=0
+        curl --silent --show-error --location --max-redirs 0 \
+          --max-time 20 --connect-timeout 5 \
+          --fail --compressed \
+          --proto '=http,https' --proto-redir 'https,http' --max-filesize 5000000 \
+          --user-agent "Mozilla/5.0 (compatible; career-ops/batch)" \
+          --header "Accept: text/html,application/xhtml+xml,*/*;q=0.8" \
+          --dump-header "$redirect_headers" \
+          --output "$jd_file" \
+          -- "$current_url" 2>/dev/null || curl_status=$?
+        redirect_location=""
+        if [[ "$curl_status" -eq 47 ]]; then
+          redirect_location="$(awk 'tolower($0) ~ /^location:[[:space:]]*/ { value=$0; sub(/^[^:]*:[[:space:]]*/, "", value) } END { print value }' "$redirect_headers")"
+        fi
+        rm -f "$redirect_headers"
+        if [[ "$curl_status" -eq 47 && -n "$redirect_location" ]]; then
+          if [[ "$redirect_count" -ge 10 ]]; then
+            : > "$jd_file"
+            echo "    ℹ️  JD prefetch: too many redirects — worker will WebFetch"
+            break
+          fi
+          current_url="$(node -e "
+            try { process.stdout.write(new URL(process.argv[2], process.argv[1]).href); }
+            catch (e) { process.stdout.write(''); }
+          " "$current_url" "$redirect_location" 2>/dev/null)"
+          if [[ -z "$current_url" ]]; then
+            : > "$jd_file"
+            break
+          fi
+          redirect_count=$((redirect_count + 1))
+          continue
+        fi
+        if [[ "$curl_status" -ne 0 ]]; then
+          : > "$jd_file"
+        fi
+        break
+      fi
+    done
+      # Keep the bytes curl downloaded: the strip below discards <script> blocks,
+      # which is where a JS-rendered board keeps its JD (schema.org JobPosting,
+      # hydration payload), so jd-rescue.mjs reads this copy, not the stripped text.
+      jd_raw_file="${jd_file}.raw"
+      cp "$jd_file" "$jd_raw_file" 2>/dev/null || true
+      # Strip HTML tags and count visible words to distinguish a real JD (hundreds
+      # of words) from a JS shell (near zero visible text).
+      jd_prefetch_words=$(node -e "
+        const fs = require('fs');
+        try {
+          const text = fs.readFileSync(process.argv[1], 'utf-8')
+            .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+            .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&(nbsp|#160|#xa0);/gi, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          fs.writeFileSync(process.argv[1], text);
+          process.stdout.write(String(text.split(' ').filter(Boolean).length));
+        } catch (e) { process.stdout.write('0'); }
+      " "$jd_file" 2>/dev/null) || jd_prefetch_words=0
+      # Ensure jd_prefetch_words is always a non-negative integer. A non-integer
+      # (e.g. empty string, "NaN") would cause bash arithmetic to fail or
+      # miscompare. Strip everything that is not a digit and default to 0.
+      jd_prefetch_words="${jd_prefetch_words//[^0-9]/}"
+      jd_prefetch_words="${jd_prefetch_words:-0}"
+      # Zero-token JD rescue: read the JD out of the structured data the board
+      # already shipped in the bytes above. It only replaces the text when the page
+      # is thin or the rescued JD is longer, and it fails open (any failure leaves
+      # the stripped text as is, and the checks below decide as before).
+      if [[ -f "$BATCH_DIR/jd-rescue.mjs" && -s "$jd_raw_file" ]]; then
+        if _rs_line=$(node "$BATCH_DIR/jd-rescue.mjs" "$url" "$jd_raw_file" "$jd_file" "$jd_prefetch_words" 2>/dev/null); then
+          IFS=$'\t' read -r _rs_words _rs_method <<< "$_rs_line"
+          _rs_words="${_rs_words//[^0-9]/}"
+          _rs_words="${_rs_words:-0}"
+          if [[ "$_rs_words" -ge "$prefetch_min_words" ]]; then
+            echo "    ℹ️  JD rescue: recovered ${_rs_words} words via ${_rs_method} (visible text had ${jd_prefetch_words})"
+            jd_prefetch_words="$_rs_words"
+          fi
+        fi
+      fi
+      rm -f "$jd_raw_file"
+      if [[ "$jd_prefetch_words" -lt "$prefetch_min_words" ]]; then
+        : > "$jd_file"
+        echo "    ℹ️  JD prefetch: thin content (${jd_prefetch_words} words) — worker will WebFetch"
+      else
+        echo "    ℹ️  JD prefetch: ${jd_prefetch_words} words written to JD file"
+      fi
+  fi
+
+  # Resolve the URL that goes into the report header.
+  #
+  # For a `local:jds/foo.md` input the raw value is a filesystem path, and
+  # substituting it into {{URL}} put that path in the report's **URL:** header,
+  # where the dashboard expects a clickable posting link. The real URL lives in
+  # the JD's YAML frontmatter (`url: "https://..."`), so recover it here.
+  #
+  # We also copy the JD body into the temp file. The worker prompt says to fall
+  # back to WebFetch on {{URL}} when the JD file is empty; once {{URL}} is the
+  # real posting link that fallback would hit a login wall (LinkedIn) instead of
+  # reading the JD we already have on disk. Feeding the content in keeps the
+  # worker off the network. The copy is deliberate: the temp file stays
+  # disposable, so nothing downstream can touch the original in jds/.
+  # Path handed to the worker for the JD. For a local: input this is the
+  # repo-relative path (e.g. jds/foo.md), NOT the mktemp path.
+  #
+  # The mktemp path is a POSIX string like /tmp/batch-jd-1289.cdYICD embedded in
+  # the prompt prose. MSYS only rewrites paths passed as command arguments, so
+  # the worker receives it untranslated and resolves it however its tooling
+  # happens to: through the Bash tool it works, through the Read tool it lands
+  # on C:\tmp\... and misses. Same offer, same input, different outcome per run.
+  # On 2026-08-06 that cost two evaluations (#1289, #1291) while three sibling
+  # offers with identical inputs succeeded. A repo-relative path resolves
+  # identically for every tool, since the worker runs with the project as cwd.
+  local worker_jd_path="$jd_file"
+  local report_url="$url"
+  if [[ "$url" == local:* ]]; then
+    local local_jd="$PROJECT_DIR/${url#local:}"
+    if [[ -f "$local_jd" ]]; then
+      worker_jd_path="${url#local:}"
+      cat "$local_jd" > "$jd_file" 2>/dev/null || true
+      local fm_url
+      fm_url=$(awk '
+        NR==1 && $0 !~ /^---/ { exit }
+        NR>1 && /^---/ { exit }
+        NR>1 && /^url:/ {
+          line = $0
+          sub(/^url:[ \t]*/, "", line)
+          gsub(/"/, "", line)
+          gsub(/'"'"'/, "", line)
+          if (length(line)) { print line; exit }
+        }' "$local_jd")
+      # Only override when the frontmatter actually carries a URL; otherwise
+      # keep the local: path rather than writing an empty header field.
+      if [[ -n "$fm_url" ]]; then
+        report_url="$fm_url"
+      else
+        echo "    ⚠️  #$id: no url in JD frontmatter — report URL stays as the local path"
+      fi
+    fi
+  fi
+
+  # ATS API fallback (#4246). When the static fetch above left $jd_file empty
+  # (thin JS shell, curl failure, curl absent), ask the ATS's own public API
+  # through fetch-jd.mjs before the worker falls back to WebFetch, which hits
+  # the same unrendered shell on Ashby and embedded Greenhouse boards.
+  # The call lives here and not in the worker prompt on purpose: the offer URL
+  # is untrusted, and here it travels as one argv element ("$url"), never as
+  # text inside a shell command the worker composes. fetch-jd.mjs only talks to
+  # the known ATS API hosts it resolves from the URL, so a private or unknown
+  # host is a miss (exit 1), not a request.
+  local jd_api_words=0
+  if [[ ! -s "$jd_file" && -f "$PROJECT_DIR/fetch-jd.mjs" ]]; then
+    local jd_api_tmp
+    jd_api_tmp="$(mktemp "${TMPDIR:-/tmp}/batch-jd-api.XXXXXX")"
+    if node "$PROJECT_DIR/fetch-jd.mjs" "$url" > "$jd_api_tmp" 2>/dev/null; then
+      jd_api_words=$(wc -w < "$jd_api_tmp" 2>/dev/null) || jd_api_words=0
+      jd_api_words="${jd_api_words//[^0-9]/}"
+      jd_api_words="${jd_api_words:-0}"
+      if [[ "$jd_api_words" -ge "$prefetch_min_words" ]]; then
+        cat "$jd_api_tmp" > "$jd_file"
+        echo "    ℹ️  JD prefetch: ${jd_api_words} words from the ATS API (fetch-jd.mjs)"
+      fi
+    fi
+    rm -f "$jd_api_tmp"
+  fi
+
+  # --thin-action: no usable JD text after the static fetch and the ATS API
+  # fallback (a JS-rendered page, an empty shell, a failed fetch). The default,
+  # 'webfetch', changes nothing: the worker is told to WebFetch. Detection only
+  # here; the skip is recorded after the "Processing offer" line below.
+  local jd_thin_skip=0 jd_thin_note="" jd_thin_retryable=0
+  if [[ ! -s "$jd_file" && "$THIN_ACTION" != "webfetch" ]]; then
+    if [[ "$THIN_ACTION" == "browser-extract" && -f "$PROJECT_DIR/browser-extract.mjs" ]]; then
+      # Real-browser read: zero model tokens, ~5-15s of Chromium. Success is
+      # compact JSON on stdout, a failure is exit 1 with a JSON error on stderr.
+      # A near-empty or taken-down page is a failure there, so the word floor
+      # below only has to stop a login wall or an error page full of navigation.
+      local be_out be_err be_words=0 be_code=""
+      be_out="$(mktemp "${TMPDIR:-/tmp}/batch-jd-browser.XXXXXX")"
+      be_err="$(mktemp "${TMPDIR:-/tmp}/batch-jd-browser-err.XXXXXX")"
+      if node "$PROJECT_DIR/browser-extract.mjs" "$url" --mode jd > "$be_out" 2> "$be_err"; then
+        node -e '
+          let d = "";
+          process.stdin.on("data", (c) => d += c);
+          process.stdin.on("end", () => {
+            try { const o = JSON.parse(d); process.stdout.write(typeof o.text === "string" ? o.text : ""); } catch { /* empty */ }
+          });
+        ' < "$be_out" > "$jd_file" 2>/dev/null || : > "$jd_file"
+        be_words=$(wc -w < "$jd_file" 2>/dev/null) || be_words=0
+        be_words="${be_words//[^0-9]/}"; be_words="${be_words:-0}"
+        if [[ "$be_words" -ge 200 ]]; then
+          echo "    🎭 Browser extract: recovered ${be_words} words"
+          jd_prefetch_words="$be_words"
+        else
+          : > "$jd_file"
+          echo "    🎭 Browser extract: no readable JD (${be_words} words)"
+        fi
+      else
+        : > "$jd_file"
+        be_code=$(node -e '
+          let d = "";
+          process.stdin.on("data", (c) => d += c);
+          process.stdin.on("end", () => { try { process.stdout.write(String(JSON.parse(d).code || "")); } catch { /* none */ } });
+        ' < "$be_err" 2>/dev/null) || be_code=""
+        echo "    🎭 Browser extract failed${be_code:+ ($be_code)}"
+        # Allowlist of transient failures worth another try. Everything else
+        # (unavailable, URL or validation errors, an unknown code) is a verdict
+        # about the page or the call and stays terminal.
+        case "$be_code" in
+          no_playwright)
+            jd_thin_retryable=1
+            jd_thin_note="browser-extract: Playwright is not installed — run 'npx playwright install chromium' and retry"
+            ;;
+          empty_text|navigation_error)
+            jd_thin_retryable=1
+            jd_thin_note="browser-extract failed ($be_code) — retryable"
+            ;;
+        esac
+      fi
+      rm -f "$be_out" "$be_err"
+    fi
+    if [[ ! -s "$jd_file" ]]; then
+      jd_thin_skip=1
+      # curl never got an HTTP response (DNS, refused, timeout, TLS): a transport
+      # problem, not a page that cannot be read. 'skipped' is terminal and
+      # --retry-failed would never pick it up again, so it stays retryable.
+      case "$curl_status" in
+        6|7|28|35|52|55|56)
+          jd_thin_retryable=1
+          [[ -n "$jd_thin_note" ]] || jd_thin_note="JD prefetch failed to connect (curl exit $curl_status) — retryable"
+          ;;
+      esac
+      [[ -n "$jd_thin_note" ]] || jd_thin_note="no usable JD text (--thin-action $THIN_ACTION) — needs-playwright"
+    fi
+  fi
+
+  echo "--- Processing offer #$id${JOB_POS:+ ($JOB_POS)}: $url (report $report_num, attempt $((retries + 1)))"
+
+  if [[ "$jd_thin_skip" == "1" ]]; then
+    local thin_state="skipped" thin_now
+    local thin_retries="$retries"
+    if [[ "$jd_thin_retryable" == "1" ]]; then
+      thin_state="failed"
+      # Spend one retry so --retry-failed stops at MAX_RETRIES instead of looping.
+      (( thin_retries < MAX_RETRIES )) && thin_retries=$((retries + 1))
+    fi
+    thin_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    update_state_retrying "$id" "$url" "$thin_state" "$started_at" "$thin_now" "-" "-" "$jd_thin_note" "$thin_retries" || true
+    release_report_num "$report_num"
+    rm -f "$jd_file"
+    echo "    🚫 $jd_thin_note — no worker spawned"
+    return 0
+  fi
 
   # Build the prompt with placeholders replaced
   local prompt
-  prompt="Procesa esta oferta de empleo. Ejecuta el pipeline completo: evaluación A-F + report .md + PDF + tracker line."
-  prompt="$prompt URL: $url"
-  prompt="$prompt JD file: $jd_file"
+  if [[ "${MODE:-full}" == "match" ]]; then
+    prompt="Process this job offer in single-pass CV match mode. Extract CV facts, score the match against the JD requirements in a single pass, output the report and tracker addition, and output final JSON. Do not generate PDF; write ❌ in the tracker PDF column and set \"pdf\": null in the final JSON."
+  elif [[ "$SKIP_PDF" == "true" ]]; then
+    prompt="Process this job offer. Run the pipeline: A-G evaluation + report .md + tracker line. Do not generate PDF; write ❌ in the tracker PDF column and set \"pdf\": null in the final JSON."
+    echo "    ⏭️  --skip-pdf set — skipping PDF generation for #$id ($url)"
+  else
+    prompt="Process this job offer. Run the full pipeline: A-G evaluation + report .md + optional PDF + tracker line."
+  fi
+  prompt="$prompt URL: $report_url"
+  prompt="$prompt JD file: $worker_jd_path"
   prompt="$prompt Report number: $report_num"
   prompt="$prompt Date: $date"
   prompt="$prompt Batch ID: $id"
@@ -333,63 +1702,693 @@ process_offer() {
 
   # Prepare system prompt with placeholders resolved
   local resolved_prompt="$BATCH_DIR/.resolved-prompt-${id}.md"
-  # Escape sed delimiter characters in variables to prevent substitution breakage
-  local esc_url esc_jd_file esc_report_num esc_date esc_id
-  esc_url="${url//\\/\\\\}"
-  esc_url="${esc_url//|/\\|}"
-  esc_jd_file="${jd_file//\\/\\\\}"
-  esc_jd_file="${esc_jd_file//|/\\|}"
-  esc_report_num="${report_num//|/\\|}"
-  esc_date="${date//|/\\|}"
-  esc_id="${id//|/\\|}"
+  # Resolve placeholders to STABLE labels, not per-offer values: the concrete
+  # URL / JD file / report number / date / batch ID travel in the per-job user
+  # prompt built above. Keeping the system prompt byte-identical across offers
+  # lets prompt caching reuse the whole prefix instead of breaking at the first
+  # substituted value (~4 KB into a ~41 KB prompt). This also means the URL
+  # never enters a sed replacement, so it needs no delimiter/metacharacter
+  # escaping (no more esc_url/esc_jd_file/&-in-query-string concerns).
   sed \
-    -e "s|{{URL}}|${esc_url}|g" \
-    -e "s|{{JD_FILE}}|${esc_jd_file}|g" \
-    -e "s|{{REPORT_NUM}}|${esc_report_num}|g" \
-    -e "s|{{DATE}}|${esc_date}|g" \
-    -e "s|{{ID}}|${esc_id}|g" \
+    -e "s|{{URL}}|<URL from the job message>|g" \
+    -e "s|{{JD_FILE}}|<JD file from the job message>|g" \
+    -e "s|{{REPORT_NUM}}|<report number from the job message>|g" \
+    -e "s|{{DATE}}|<date from the job message>|g" \
+    -e "s|{{ID}}|<batch ID from the job message>|g" \
     "$PROMPT_FILE" > "$resolved_prompt"
 
-  # Launch claude -p worker (uses default model from Claude Max subscription)
-  local exit_code=0
-  claude -p \
-    --dangerously-skip-permissions \
-    --append-system-prompt-file "$resolved_prompt" \
-    "$prompt" \
-    > "$log_file" 2>&1 || exit_code=$?
+  # The prompt names user-layer files by repo-relative path, and the worker
+  # resolves those against its working directory, the checkout. With the data
+  # root elsewhere that is the wrong tree for everything it reads about the
+  # candidate and everything it writes, so say where the user layer is. The
+  # text depends only on the data root, so it is the same for every offer in a
+  # run, and the default layout adds nothing.
+  if [[ "$DATA_ROOT" != "$PROJECT_DIR" ]]; then
+    {
+      printf '\n\n---\n\n'
+      printf '## Runtime paths: data root outside the checkout\n\n'
+      if [[ "${MODE:-full}" == "match" ]]; then
+        # Match mode names no profile file (#5297), so do not point at one.
+        printf 'This install keeps the user layer in a separate data root. Wherever this prompt names one of the paths below, resolve it under the data root, not the working directory:\n\n'
+      else
+        printf 'This install keeps the user layer in a separate data root. The profile for this run is `%s`. Where this prompt names `config/profile.yml`, read that file instead. Wherever this prompt names one of the paths below, resolve it under the data root, not the working directory:\n\n' "$PROFILE_FILE"
+      fi
+      printf 'Data root: %s\n\n' "$DATA_ROOT"
+      printf '`cv.md`, `article-digest.md`, `modes/_profile.md`, `modes/_custom.md`, `reports/`, `output/`, `data/`, `interview-prep/`, `batch/tracker-additions/`\n\n'
+      printf 'Write the report under `reports/` in the data root and the tracker TSV under `batch/tracker-additions/` in the data root, and give scripts absolute data-root paths for these files. Markdown links written inside the report and the tracker TSV keep the relative form this prompt shows (`reports/...`). Every other path (`templates/`, the `.mjs` scripts, the other `modes/` files) stays relative to the working directory.\n'
+    } >> "$resolved_prompt"
+  fi
 
-  # Cleanup resolved prompt
-  rm -f "$resolved_prompt"
+  # The .md prompts name config/profile.yml. When CAREER_OPS_PROFILE names a
+  # different file, the worker would read the wrong profile for everything
+  # except the personalization injected below, so name the file this run uses.
+  # With the data root outside the checkout the runtime block above already
+  # does that, so this only fills the default layout.
+  # The override is checked first, the way hasProfileOverride() does it, and
+  # the path comparison only after it. With no override the two paths are the
+  # same file, but not always the same string: through a junction or symlink
+  # getProfilePath() returns the real path while DATA_ROOT keeps the one pwd
+  # gave, and that alone used to add this block.
+  local profile_override="${CAREER_OPS_PROFILE:-}"
+  if [[ "${MODE:-full}" != "match" && -n "${profile_override//[[:space:]]/}" && "$PROFILE_RESOLVED" == "true" && "$PROFILE_FILE" != "$DATA_ROOT/config/profile.yml" && "$DATA_ROOT" == "$PROJECT_DIR" ]]; then
+    {
+      printf '\n\n---\n\n'
+      printf '## Runtime profile\n\n'
+      printf 'The profile for this run is `%s`. Where this prompt names `config/profile.yml`, read that file instead.\n' "$PROFILE_FILE"
+    } >> "$resolved_prompt"
+  fi
+
+  # Inject user-layer personalization into the temporary worker prompt.
+  # The resolved prompt is gitignored runtime state, so user profile data stays
+  # out of the system layer while batch scoring matches interactive scoring.
+  # Match mode gets none of it, only the output language (#5297).
+  if [[ "${MODE:-full}" == "match" ]]; then
+    {
+      printf '\n\n---\n\n'
+      printf '## Runtime output language\n\n'
+      printf 'language.output for this run: `%s`\n' "${MATCH_OUTPUT_LANGUAGE:-en}"
+    } >> "$resolved_prompt"
+  else
+    for context_file in "$DATA_ROOT/modes/_profile.md" "$PROFILE_FILE" "$DATA_ROOT/modes/_custom.md"; do
+      if [[ -f "$context_file" ]]; then
+        {
+          printf '\n\n---\n\n'
+          printf '## Runtime personalization: %s\n\n' "${context_file#"$DATA_ROOT/"}"
+          sed 's/^/    /' "$context_file"
+          printf '\n'
+        } >> "$resolved_prompt"
+      fi
+    done
+  fi
+
+
+  # Build the launch command for the configured CLI.
+  # For claude the model is resolved once per run from spend_tier unless --model
+  # was passed; other CLIs take --model verbatim. Building claude's command in an
+  # array keeps quoting safe regardless.
+  # --strict-mcp-config (with no --mcp-config) starts workers with no MCP
+  # servers: they only evaluate offers and need none. Without it each parallel
+  # worker inherits the parent session's MCP (e.g. Playwright) and they deadlock
+  # fighting over the single shared browser when --parallel > 1 (issue #506).
+  local -a claude_args=(-p --dangerously-skip-permissions --strict-mcp-config)
+  if [[ -n "$RESOLVED_MODEL" ]]; then
+    claude_args+=(--model "$RESOLVED_MODEL")
+  fi
+  claude_args+=(--append-system-prompt-file "$resolved_prompt" "$prompt")
+
+  # Non-claude CLIs lack --append-system-prompt-file, so concatenate the
+  # resolved system prompt and the per-job prompt into a single argument.
+  # model_args is expanded with the ${arr[@]+"${arr[@]}"} idiom below: under
+  # `set -u`, bash 3.2 (macOS /bin/bash) treats an empty array expansion as an
+  # unbound variable and would abort every worker launched without --model.
+  local full_prompt=""
+  local -a model_args=()
+  if [[ "$CLI" != "claude" ]]; then
+    full_prompt="$(cat "$resolved_prompt")"$'\n\n'"$prompt"
+    [[ -n "$MODEL" ]] && model_args=(--model "$MODEL")
+  fi
+
+  # Non-claude CLIs run a single attempt (explicit break after dispatch); the
+  # rate-limit/session retry loop only applies to claude.
+  local exit_code=0
+  local terminal_failure_recorded=false
+  local shim_retries=0
+  local max_shim_retries=4
+  local match_output_retries=0
+  local max_match_output_retries=1
+  while true; do
+    exit_code=0
+    # Hard wall-clock cap on the worker.
+    #
+    # Without it a `claude -p` that hangs without exiting blocks this loop
+    # forever, and because the loop holds the run open, one stuck worker jams
+    # the whole nightly job: no summary is written, the tracker merge never
+    # runs, and the next scheduled job refuses to start on the PID guard. That
+    # happened on 2026-08-04, where a worker hung at 22:38 and was still alive
+    # 15 hours later with a 0-byte log.
+    #
+    # run_worker exits 124 once WORKER_TIMEOUT expires, which falls through to
+    # the normal failure path below: the offer is marked failed, retried within
+    # MAX_RETRIES, and the run continues. A jam becomes one bad offer.
+    case "$CLI" in
+      claude)
+        run_worker claude "${claude_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+        ;;
+      opencode)
+        if command -v opencode &>/dev/null; then
+          run_worker opencode run ${model_args[@]+"${model_args[@]}"} "$full_prompt" > "$log_file" 2>&1 || exit_code=$?
+        else
+          run_worker ollama launch opencode ${model_args[@]+"${model_args[@]}"} -y -- run "$full_prompt" > "$log_file" 2>&1 || exit_code=$?
+        fi
+        ;;
+      gemini)
+        run_worker gemini ${model_args[@]+"${model_args[@]}"} -p "$full_prompt" > "$log_file" 2>&1 || exit_code=$?
+        ;;
+      qwen)
+        run_worker qwen ${model_args[@]+"${model_args[@]}"} -p "$full_prompt" > "$log_file" 2>&1 || exit_code=$?
+        ;;
+      grok)
+        run_worker grok --always-approve --output-format plain ${model_args[@]+"${model_args[@]}"} -p "$full_prompt" > "$log_file" 2>&1 || exit_code=$?
+        ;;
+    esac
+
+    if [[ $exit_code -eq 124 ]]; then
+      echo "    ⏱️  Worker exceeded ${WORKER_TIMEOUT}s — killed. Treating as a failed attempt."
+    fi
+
+    # In match mode, check if worker result JSON is malformed or missing required
+    # fields (parsed_status or parsed_score). If so, retry once before finalizing
+    # so a transient formatting glitch does not permanently fail or bypass gates.
+    if [[ "${MODE:-full}" == "match" && $exit_code -eq 0 ]]; then
+      local worker_check_json
+      worker_check_json=$(awk '
+        /^```json[[:space:]]*$/ { in_block=1; block=""; next }
+        in_block && /^```[[:space:]]*$/ { in_block=0; last=block; next }
+        in_block { block = block $0 "\n" }
+        END { printf "%s", last }
+      ' "$log_file" 2>/dev/null || true)
+      local check_status="" check_score=""
+      if [[ -n "$worker_check_json" ]]; then
+        local check_parsed
+        check_parsed=$(printf '%s' "$worker_check_json" | node -e '
+          let data = "";
+          process.stdin.on("data", d => data += d);
+          process.stdin.on("end", () => {
+            try {
+              const obj = JSON.parse(data);
+              const status = typeof obj.status === "string" ? obj.status : "";
+              const score = typeof obj.score === "number" ? String(obj.score) : "";
+              process.stdout.write(status + "\x1f" + score);
+            } catch {
+              process.stdout.write("");
+            }
+          });
+        ' 2>/dev/null || true)
+        if [[ -n "$check_parsed" ]]; then
+          IFS=$'\x1f' read -r check_status check_score <<< "$check_parsed"
+        fi
+      fi
+      if [[ -z "$check_status" || ( "$check_status" != "needs_confirmation" && "$check_status" != "skipped" && "$check_status" != "failed" && -z "$check_score" ) ]]; then
+        if (( match_output_retries < max_match_output_retries && retries < MAX_RETRIES )); then
+          match_output_retries=$((match_output_retries + 1))
+          retries=$((retries + 1))
+          # Move the malformed attempt's artifacts aside first. Left in place,
+          # a retry with another slug leaves two reports on one number, and a
+          # retry that writes no report would pass the report-file check on the
+          # stale one. Same quarantine as the confirmation-hold path below.
+          local retry_quarantine="$LOGS_DIR/quarantine" retry_artifact
+          shopt -s nullglob
+          for retry_artifact in "$REPORTS_DIR/$report_num-"*.md "$TRACKER_DIR/$id.tsv"; do
+            [[ "$retry_artifact" == *-RESERVED.md ]] && continue
+            mkdir -p "$retry_quarantine"
+            mv "$retry_artifact" "$retry_quarantine/$id-match-retry-${retry_artifact##*/}"
+          done
+          shopt -u nullglob
+          echo "    ⚠️  Malformed or missing match mode JSON summary (attempt $retries/$MAX_RETRIES); retrying once..."
+          sleep 2
+          continue
+        fi
+      fi
+    fi
+
+    # Non-claude CLIs run a single attempt: the session-limit and rate-limit
+    # detection below greps generic phrases (429, quota, session limit) that
+    # another CLI's log could match by coincidence and pause or retry the batch.
+    if [[ "$CLI" != "claude" ]]; then
+      break
+    fi
+
+    if [[ $exit_code -eq 0 ]]; then
+      break
+    fi
+
+    # Check for Claude Code npm shim swap (exit code 127 + command not found)
+    if [[ $exit_code -eq 127 ]] && grep -qE "(claude: command not found|claude:.*not found|cannot find.*claude)" "$log_file" && (( shim_retries < max_shim_retries )); then
+      shim_retries=$((shim_retries + 1))
+      echo "    ⏳ Claude command not found (shim swap detected). Retrying in 30s (attempt $shim_retries/$max_shim_retries)..."
+      sleep 30
+      continue
+    fi
+
+    if is_session_limit_log "$log_file"; then
+      mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
+      echo "    ⏸️  Session/rate limit reached; pausing batch without consuming retry budget."
+      terminal_failure_recorded=true
+      break
+    fi
+
+    if is_rate_limit_log "$log_file" && (( retries < MAX_RETRIES )); then
+      if (( RATE_LIMIT_SLEEP <= 0 )); then
+        mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
+        echo "    ⏸️  Rate limited and --rate-limit-sleep is 0; pausing batch without consuming retry budget."
+        terminal_failure_recorded=true
+        break
+      fi
+      local retry_delay
+      retry_delay=$(rate_limit_delay "$log_file" "$retries")
+      if [[ "$retry_delay" == pause ]]; then
+        mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
+        echo "    ⏸️  Retry-After exceeds --rate-limit-sleep; pausing batch without consuming retry budget."
+        terminal_failure_recorded=true
+        break
+      fi
+      : > "$THROTTLE_FILE"
+      retries=$((retries + 1))
+      local retry_completed_at
+      retry_completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      update_state_retrying "$id" "$url" "rate_limited" "$started_at" "$retry_completed_at" "$report_num" "-" "rate-limit; retrying after ${retry_delay}s" "$retries" || true
+      echo "    ⏳ Rate limited (attempt $retries/$MAX_RETRIES). Waiting ${retry_delay}s before retry..."
+      sleep "$retry_delay"
+      continue
+    fi
+
+    break
+  done
+
+  # Cleanup resolved prompt and pre-fetched JD file
+  rm -f "$resolved_prompt" "$jd_file"
 
   local completed_at
   completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
   if [[ $exit_code -eq 0 ]]; then
-    # Try to extract score from worker output
+    # Resolve what the worker ACTUALLY produced, rather than trusting the
+    # reserved number and a single loose regex (see resolve_worker_result).
     local score="-"
-    local score_match
-   score_match=$(sed -nE 's/.*"score":[[:space:]]*([0-9.]+).*/\1/p' "$log_file" 2>/dev/null | head -1 || true)
-    if [[ -n "$score_match" ]]; then
-      score="$score_match"
+    local actual_report_num="$report_num"
+    local _resolved
+    _resolved=$(resolve_worker_result "$log_file" "$report_num" "$id")
+    actual_report_num="${_resolved%%$'\t'*}"
+    score="${_resolved##*$'\t'}"
+    [[ -n "$actual_report_num" ]] || actual_report_num="$report_num"
+    [[ -n "$score" ]] || score="-"
+
+    if [[ "$actual_report_num" != "$report_num" ]]; then
+      echo "    ⚠️  #$id: worker wrote report $actual_report_num, not the reserved $report_num — recording the actual one."
+      report_num="$actual_report_num"
+    fi
+
+    # Extract only the LAST ```json fenced block in the log -- that's the
+    # worker's one authoritative final result (batch-prompt.md Step 6), not
+    # arbitrary text anywhere else in stdout/stderr -- and parse it as real
+    # JSON so an unrelated line merely containing the substring
+    # `"status": "failed"` can never falsely flip a successful run.
+    local worker_result_json
+    worker_result_json=$(awk '
+      /^```json[[:space:]]*$/ { in_block=1; block=""; next }
+      in_block && /^```[[:space:]]*$/ { in_block=0; last=block; next }
+      in_block { block = block $0 "\n" }
+      END { printf "%s", last }
+    ' "$log_file" 2>/dev/null || true)
+
+    # Parse status, error, AND score from the same authoritative JSON object
+    # in one pass -- score extraction used to be a separate sed regex over
+    # the whole log (`.*"score":...`), which grabbed the first match
+    # anywhere in the log rather than the one from this final result object,
+    # producing a spurious score "-" whenever an earlier line in the log
+    # (reasoning text, an intermediate example, Block D's "Comp score: 4/5"
+    # mention, etc.) matched first. Reading it from the same parsed object
+    # as status/error fixes both by construction -- there's only one place
+    # left to look.
+    # score and reserved_num were set above (resolve_worker_result and the
+    # reservation); the defaults only matter when this block runs on its own,
+    # as the result-handling tests do. reserved_num is the sentinel to release
+    # even after report_num was repointed at the report the worker wrote.
+    local worker_failed_match="" worker_error_match="" score="${score:--}"
+    local parsed_status="" parsed_error="" parsed_score=""
+    local reserved_num="${reserved_num:-$report_num}"
+    if [[ -n "$worker_result_json" ]]; then
+      local parsed
+      parsed=$(printf '%s' "$worker_result_json" | node -e '
+        let data = "";
+        process.stdin.on("data", d => data += d);
+        process.stdin.on("end", () => {
+          try {
+            const obj = JSON.parse(data);
+            const status = typeof obj.status === "string" ? obj.status : "";
+            const message = status === "needs_confirmation" ? obj.question : obj.error;
+            const error = typeof message === "string" ? message.replace(/[\x00-\x1f\x7f]/g, " ") : "";
+            const score = typeof obj.score === "number" ? String(obj.score) : "";
+            process.stdout.write(status + "\x1f" + error + "\x1f" + score);
+          } catch {
+            process.stdout.write("");
+          }
+        });
+      ' 2>/dev/null || true)
+      if [[ -n "$parsed" ]]; then
+        # \x1f (US), not \t: tab is IFS *whitespace*, so bash collapses runs of it
+        # and strips leading/trailing ones. On the common path -- a worker that
+        # succeeded, so `error` is empty -- the two tabs around that empty field
+        # collapse into one, `score` slides into parsed_error, and parsed_score
+        # comes back empty. The `elif` below then never fires and every
+        # successful offer records score "-". A non-whitespace delimiter gets
+        # one-field-per-unit splitting with empty fields preserved.
+        IFS=$'\x1f' read -r parsed_status parsed_error parsed_score <<< "$parsed"
+        if [[ "$parsed_status" == "failed" ]]; then
+          worker_failed_match="failed"
+          worker_error_match="$parsed_error"
+        elif [[ -n "$parsed_score" ]]; then
+          # The final result object is authoritative over the loose log regex
+          # resolve_worker_result falls back on.
+          score="$parsed_score"
+        fi
+      fi
+    fi
+
+    # In match mode, enforce valid JSON output and required fields. If malformed
+    # or missing parsed_status or parsed_score (and not a human-confirmation hold
+    # or dealbreaker skip), treat as a failed worker attempt so it cannot be
+    # recorded as completed with score "-" or bypass --min-score.
+    if [[ "${MODE:-full}" == "match" && -z "$worker_failed_match" ]]; then
+      if [[ -z "$worker_result_json" || -z "$parsed" || -z "$parsed_status" ]]; then
+        worker_failed_match="failed"
+        worker_error_match="malformed or missing match mode JSON summary (parsed_status missing)"
+      elif [[ "$parsed_status" != "needs_confirmation" && "$parsed_status" != "skipped" ]] && { [[ -z "$parsed_score" ]] || ! is_decimal_number "$score"; }; then
+        worker_failed_match="failed"
+        worker_error_match="missing or invalid match mode score: $score"
+      fi
+    fi
+
+    # A human gate is not a failure or a successful evaluation (#4359).
+    # Keep it out of retries and release the unused report reservation.
+    if [[ "$parsed_status" == "needs_confirmation" ]]; then
+      local question="${parsed_error:-Which agency did this posting come through?}"
+      # A malformed/misattributed handoff stays held, never becomes retryable
+      # and never supplies an agency answer for a different posting.
+      # A local:jds/ input reaches the worker as its frontmatter URL
+      # ($report_url), so the worker echoes that back; accept either.
+      if ! node -e '
+        const result = JSON.parse(process.argv[1]);
+        process.exit(result.reason === "agency_confirmation" &&
+          (result.url === process.argv[2] || result.url === process.argv[4]) &&
+          String(result.id) === process.argv[3] ? 0 : 1);
+      ' "$worker_result_json" "$url" "$id" "${report_url:-$url}"; then
+        question="Invalid confirmation handoff identity/reason; parent must inspect the job log and ask for this URL"
+      fi
+      local tracker_artifact="$TRACKER_DIR/$id.tsv"
+      local -a report_artifacts=()
+      if [[ -n "$report_num" && "$report_num" != "-" ]]; then
+        shopt -s nullglob
+        local candidate
+        # The reservation sentinel ({num}-RESERVED.md) is the parent's own file,
+        # not a worker artifact (same exclusion as the report-file check below).
+        for candidate in "$REPORTS_DIR/$report_num-"*.md; do
+          [[ "$candidate" == *-RESERVED.md ]] || report_artifacts+=("$candidate")
+        done
+        shopt -u nullglob
+      fi
+      if [[ -f "$tracker_artifact" || ${#report_artifacts[@]} -gt 0 ]]; then
+        local quarantine_dir="$LOGS_DIR/quarantine"
+        mkdir -p "$quarantine_dir"
+        if [[ -f "$tracker_artifact" ]]; then
+          mv "$tracker_artifact" "$quarantine_dir/$id-tracker.tsv"
+        fi
+        local report_artifact
+        for report_artifact in ${report_artifacts[@]+"${report_artifacts[@]}"}; do
+          mv "$report_artifact" "$quarantine_dir/$id-${report_artifact##*/}"
+        done
+        question="Worker violated the confirmation hold by writing artifacts; inspect the quarantined tracker/report before answering"
+        update_state_retrying "$id" "$url" "needs_confirmation" "$started_at" "$completed_at" "-" "-" "$question" "$retries" || true
+        echo "    ERROR: confirmation hold produced artifacts; reservation kept and tracker merge skipped." >&2
+        return 2
+      fi
+      local hold_rc=0
+      update_state_retrying "$id" "$url" "needs_confirmation" "$started_at" "$completed_at" "-" "-" "$question" "$retries" || hold_rc=$?
+      release_report_num "$reserved_num"
+      echo "    Needs confirmation: $url — $question (resume in the parent session after an explicit answer)"
+      if (( hold_rc == 2 )); then
+        echo "    ERROR: confirmation hold could not be persisted; stop and repair state before rerunning this posting." >&2
+        return 2
+      fi
+      return 0
+    fi
+
+    # A dealbreaker hit is a finished skip, not a hold (batch-prompt.md Step
+    # 1.6). The worker writes one SKIP row quoting the rule and the JD line and
+    # no report. Accept it only when the handoff names this posting and the row
+    # proves it; anything else is quarantined and retried like a failure.
+    if [[ "$parsed_status" == "skipped" ]]; then
+      local skip_tracker="$TRACKER_DIR/$id.tsv" skip_rule=""
+      local -a skip_reports=()
+      if [[ -n "$report_num" && "$report_num" != "-" ]]; then
+        shopt -s nullglob
+        local skip_candidate
+        for skip_candidate in "$REPORTS_DIR/$report_num-"*.md; do
+          [[ "$skip_candidate" == *-RESERVED.md ]] || skip_reports+=("$skip_candidate")
+        done
+        shopt -u nullglob
+      fi
+      if (( ${#skip_reports[@]} == 0 )); then
+        skip_rule=$(node -e '
+          const fs = require("fs");
+          const [json, url, id, tsv, reserved, reportUrl] = process.argv.slice(1);
+          const flat = (s) => String(s).replace(/[\x00-\x1f\x7f]+/g, " ").replace(/ +/g, " ").trim();
+          // A local:jds/ input reaches the worker as its frontmatter URL
+          // (reportUrl), so the worker echoes that back; accept either.
+          const isThisPosting = (u) => u === url || u === reportUrl;
+          const result = JSON.parse(json);
+          if (result.reason !== "dealbreaker" || !isThisPosting(result.url) || String(result.id) !== id) process.exit(1);
+          if (typeof result.rule !== "string" || !flat(result.rule)) process.exit(1);
+          const lines = fs.readFileSync(tsv, "utf8").replace(/\r\n/g, "\n").split("\n").filter(Boolean);
+          if (lines.length !== 2) process.exit(1);
+          const head = lines[0].split("\t");
+          const row = lines[1].split("\t");
+          const field = (name) => row[head.indexOf(name)] ?? "";
+          if (field("status") !== "SKIP" || !isThisPosting(field("url")) || !field("notes").startsWith("Dealbreaker: \"")) process.exit(1);
+          // merge-tracker keeps the TSV num as the row id, so it must be the
+          // number this runner reserved (zero padding aside).
+          if (!/^\d+$/.test(field("num")) || Number(field("num")) !== Number(reserved)) process.exit(1);
+          process.stdout.write(flat(result.rule));
+        ' "$worker_result_json" "$url" "$id" "$skip_tracker" "$report_num" "${report_url:-$url}" 2>/dev/null) || skip_rule=""
+      fi
+      if [[ -n "$skip_rule" ]]; then
+        # Keep the reservation. The SKIP row uses this number and no report
+        # file holds it, so releasing now would hand it to the next job before
+        # the merge. merge_tracker releases it once the row is in the tracker.
+        # rc 2: nothing was recorded and the job runs again as pending, so it
+        # is not a discard yet.
+        local skip_state_rc=0
+        update_state_retrying "$id" "$url" "skipped" "$started_at" "$completed_at" "$report_num" "-" "dealbreaker: \"$skip_rule\"" "$retries" || skip_state_rc=$?
+        if (( skip_state_rc != 2 )); then
+          log_discard "$id" "$url" "dealbreaker: \"$skip_rule\""
+        fi
+        echo "    ⏭️  Skipped (dealbreaker): $url — \"$skip_rule\""
+        return 0
+      fi
+      local skip_quarantine="$LOGS_DIR/quarantine"
+      mkdir -p "$skip_quarantine"
+      [[ -f "$skip_tracker" ]] && mv "$skip_tracker" "$skip_quarantine/$id-tracker.tsv"
+      local skip_report
+      for skip_report in ${skip_reports[@]+"${skip_reports[@]}"}; do
+        mv "$skip_report" "$skip_quarantine/$id-${skip_report##*/}"
+      done
+      if (( retries < MAX_RETRIES )); then
+        retries=$((retries + 1))
+      fi
+      update_state_retrying "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "dealbreaker skip without a valid SKIP tracker row for this posting, or with a report; artifacts quarantined" "$retries" || true
+      release_report_num "$reserved_num"
+      echo "    ❌ Failed (invalid dealbreaker skip, attempt $retries): artifacts moved to $skip_quarantine"
+      return 0
+    fi
+
+    if [[ -n "$worker_failed_match" ]]; then
+      [[ -z "$worker_error_match" ]] && worker_error_match="worker reported status:failed (exit code 0)"
+      # A posting that is gone (404/410, "closed"/"removed") will never come
+      # back, but "failed" kept it eligible for retry — and the nightly
+      # recovery pass raises the retry cap past every recorded count, so dead
+      # postings were re-run every night without end (#3483 hit attempt 8).
+      # Record it as terminal "skipped" instead. Matched against the worker's
+      # full error text, before truncation.
+      if grep -qiE 'HTTP[[:space:]]*(404|410)|404 Not Found|410 Gone|posting (appears to be |is |was |likely |has been )?(closed|removed|expired)|no longer (accepting|available|open)' <<< "$worker_error_match"; then
+        local closed_state_rc=0
+        update_state_retrying "$id" "$url" "skipped" "$started_at" "$completed_at" "$report_num" "-" "posting-closed: ${worker_error_match:0:160}" "$retries" || closed_state_rc=$?
+        if (( closed_state_rc != 2 )); then
+          log_discard "$id" "$url" "posting-closed: ${worker_error_match:0:160}"
+        fi
+        release_report_num "$reserved_num"
+        echo "    ⏭️  #$id: posting closed (${worker_error_match:0:120}) — recording as skipped, not retried."
+        return 0
+      fi
+      if (( retries < MAX_RETRIES )); then
+        retries=$((retries + 1))
+      fi
+      update_state_retrying "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$worker_error_match" "$retries" || true
+      release_report_num "$reserved_num"
+      echo "    ❌ Failed (worker-reported, attempt $retries): $worker_error_match"
+      return 0
+    fi
+
+    # A worker can exit 0, self-report a non-"failed" status (or no parseable
+    # JSON at all), and STILL never actually write the report file it claims
+    # -- exit code and JSON status alone are not proof a report exists. Found
+    # 2026-07-30: offer id 6/report 049 was marked "completed" this way with
+    # no file on disk, silently freeing that number for a second, unrelated
+    # offer to claim (a real collision). Verify the file before trusting
+    # "completed" -- fail closed, not open.
+    # The reservation sentinel ({num}-RESERVED.md) must NOT count as the
+    # report: it is created before the worker runs, so an unfiltered glob
+    # matches it and the guard is defeated every single time (found 2026-09-22:
+    # 16 no-op workers recorded as "completed" with score "-").
+    if ! has_report_file "$report_num"; then
+      local why="worker exited cleanly but wrote no report file for report number $report_num"
+      echo "    ❌ #$id: exited 0 but $why — recording as failed, not completed."
+      if (( retries < MAX_RETRIES )); then
+        retries=$((retries + 1))
+      fi
+      update_state_retrying "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$why" "$retries" || true
+      release_report_num "$reserved_num"
+      return 0
+    fi
+    if [[ "$score" == "-" ]]; then
+      echo "    ⚠️  #$id: completed but no score could be resolved from the log or report $report_num."
     fi
 
     # Check min-score gate
-    if [[ "$score" != "-" && -n "$score" ]] && (( $(echo "$MIN_SCORE > 0" | bc -l) )); then
-      if (( $(echo "$score < $MIN_SCORE" | bc -l) )); then
-        update_state "$id" "$url" "skipped" "$started_at" "$completed_at" "$report_num" "$score" "below-min-score" "$retries"
+    if is_decimal_number "$score" && LC_ALL=C awk -v min="$MIN_SCORE" 'BEGIN{exit !(min > 0)}'; then
+      # LC_ALL=C: under a non-English locale awk parses "4.5" as 4, so the
+      # MIN_SCORE comparison would silently run on truncated integers.
+      if LC_ALL=C awk -v score="$score" -v min="$MIN_SCORE" 'BEGIN{exit !(score < min)}'; then
+        local score_state_rc=0
+        update_state_retrying "$id" "$url" "skipped" "$started_at" "$completed_at" "$report_num" "$score" "below-min-score" "$retries" || score_state_rc=$?
+        if (( score_state_rc != 2 )); then
+          log_discard "$id" "$url" "below-min-score"
+        fi
+        release_report_num "$reserved_num"
         echo "    ⏭️  Skipped (score: $score < min-score: $MIN_SCORE)"
+        return 0
+      fi
+    fi
+
+    # Defensive guard: in match mode, an offer must never complete without a valid numeric score.
+    if [[ "${MODE:-full}" == "match" ]] && ! is_decimal_number "$score"; then
+      if (( retries < MAX_RETRIES )); then
+        retries=$((retries + 1))
+      fi
+      update_state_retrying "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "missing or invalid numeric score in match mode: $score" "$retries" || true
+      release_report_num "$reserved_num"
+      echo "    ❌ Failed (invalid match mode score: $score, attempt $retries)"
+      return 0
+    fi
+
+    update_state_retrying "$id" "$url" "completed" "$started_at" "$completed_at" "$report_num" "$score" "-" "$retries" || true
+    release_report_num "$reserved_num"
+    echo "    ✅ Completed (score: $score, report: $report_num)"
+  elif [[ "$terminal_failure_recorded" == "false" ]]; then
+    if (( retries < MAX_RETRIES )); then
+      retries=$((retries + 1))
+    fi
+    local error_msg
+    error_msg=$(tail -5 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c1-200 || echo "Unknown error (exit code $exit_code)")
+    update_state_retrying "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries" || true
+    release_report_num "$reserved_num"
+    echo "    ❌ Failed (attempt $retries, exit code $exit_code)"
+  fi
+}
+
+# Recover orphan rows in batch-state.tsv where status=processing but the
+# worker's log JSON shows it actually completed. This happens when
+# acquire_state_lock returns non-zero (mkdir race on burst completions,
+# stale lock timeout) and the update_state call inside process_offer fails
+# silently — the caller doesn't check the return code and the row stays
+# "processing" forever. Without this sweep, the user has to patch state
+# manually and the slot is wasted until they do.
+#
+# Called periodically during the parallel wait loop AND once at end-of-batch
+# (before merge_tracker) so anything still slipping through gets caught.
+sweep_orphans() {
+  local phase="${1:-sweep}"
+  local patched=0
+  local processing_ids
+  processing_ids=$(awk -F'\t' 'NR>1 && $3=="processing" {print $1}' "$STATE_FILE" 2>/dev/null)
+  [[ -z "$processing_ids" ]] && return 0
+
+  # Workers that completed within the last (lock_timeout + buffer) seconds might
+  # still be queuing for the state lock — patching their state now would race
+  # with their own update_state call and inflate the recovered count with
+  # non-orphans. Past this window the worker has either succeeded (state row
+  # already updated, we'd skip it) or given up (timed out / crashed), so any
+  # row still in `processing` is a genuine orphan worth recovering.
+  #
+  # The freshness gate is bypassed for the "end-of-batch" phase: at that point
+  # every worker has been reaped (main() waited on every spawned pid), so there
+  # is no remaining lock-queue race to avoid. Leaving the gate active here
+  # would leave just-completed orphans behind for a future invocation.
+  local orphan_min_age=$((STATE_LOCK_TIMEOUT_SECONDS + 30))
+  local now_epoch
+  now_epoch=$(date +%s)
+
+  for id in $processing_ids; do
+    # Find the most recent log for this id (logs are named {report_num}-{id}.log).
+    # ls fails with a non-zero exit when the glob matches nothing; under
+    # `set -euo pipefail` that would kill the script, so swallow with `|| log=""`
+    # and let the empty-string check below handle it.
+    local log
+    log=$(ls -t "$LOGS_DIR"/*-"${id}".log 2>/dev/null | head -1) || log=""
+    [[ -z "$log" ]] && continue
+    # Only recover if the worker JSON shows completion. Empty / partial logs
+    # (silent worker death) stay as "processing" so the human can decide
+    # whether to mark them failed and retry.
+    # Completion signal, most reliable first:
+    #   1. a report on disk carrying this offer's Batch ID — authoritative,
+    #      and survives a worker log that never captured its JSON (which is
+    #      exactly what stranded Bankjoy #1341 on 2026-08-11)
+    #   2. the worker's own JSON status, matched whitespace-tolerantly.
+    #      The old check was the literal '"status": "completed"' with exactly
+    #      one space, so a worker emitting '"status":"completed"' was silently
+    #      skipped and its offer re-evaluated.
+    local swept_report
+    swept_report=$(find_existing_report_for_offer "$id")
+    if [[ -z "$swept_report" ]] \
+      && ! grep -qE '"status"[[:space:]]*:[[:space:]]*"completed"' "$log"; then
+      continue
+    fi
+
+    # Freshness check: skip rows where the worker MAY still be holding/queuing
+    # for the state lock. Skipped entirely at end-of-batch (all workers reaped).
+    if [[ "$phase" != "end-of-batch" ]]; then
+      local log_epoch
+      log_epoch=$(date -r "$log" +%s 2>/dev/null || echo 0)
+      local log_age=$((now_epoch - log_epoch))
+      if (( log_age < orphan_min_age )); then
         continue
       fi
     fi
 
-    update_state "$id" "$url" "completed" "$started_at" "$completed_at" "$report_num" "$score" "-" "$retries"
-    echo "    ✅ Completed (score: $score, report: $report_num)"
-  else
-    retries=$((retries + 1))
-    local error_msg
-    error_msg=$(tail -5 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c1-200 || echo "Unknown error (exit code $exit_code)")
-    update_state "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries"
-    echo "    ❌ Failed (attempt $retries, exit code $exit_code)"
+    local recovered_score recovered_report recovered_ts
+    # Whitespace-tolerant, and falling back to the report on disk when the log
+    # carried no usable JSON. Without the fallback a promoted row could land
+    # with an empty report number and score.
+    recovered_score=$(sed -nE 's/.*"score"[[:space:]]*:[[:space:]]*"?([0-9]+(\.[0-9]+)?)"?.*/\1/p' "$log" | tail -1)
+    recovered_report=$(sed -nE 's/.*"report_num"[[:space:]]*:[[:space:]]*"?([0-9]+)"?.*/\1/p' "$log" | tail -1)
+    if [[ -n "$swept_report" && -f "$swept_report" ]]; then
+      [[ -n "$recovered_report" ]] || recovered_report=$(basename "$swept_report" | sed -nE 's/^([0-9]+)-.*/\1/p')
+      if ! is_decimal_number "${recovered_score:-}"; then
+        recovered_score=$(sed -nE 's@^\*\*Score:\*\*[[:space:]]*([0-9]+(\.[0-9]+)?)/5.*@\1@p' "$swept_report" | head -1)
+      fi
+    fi
+    is_decimal_number "${recovered_score:-}" || recovered_score="-"
+    [[ -n "$recovered_report" ]] || recovered_report="-"
+    recovered_ts=$(date -u -r "$log" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Preserve started_at + url + retries from the existing row
+    local existing
+    existing=$(awk -F'\t' -v id="$id" '$1==id {print; exit}' "$STATE_FILE")
+    local existing_url existing_started existing_retries
+    IFS=$'\t' read -r _ existing_url _ existing_started _ _ _ _ existing_retries <<<"$existing"
+
+    # Compare-and-set: only write if the row is still "processing" under
+    # the lock. Between this loop's snapshot and now, a worker may have
+    # legitimately patched it to "skipped" / "failed" / "completed";
+    # blindly writing "completed" would clobber that. update_state_if_processing
+    # returns 1 if the row changed underneath us; treat that as a quiet skip.
+    if update_state_if_processing "$id" "$existing_url" "$existing_started" "$recovered_ts" "$recovered_report" "$recovered_score" "${existing_retries:-0}"; then
+      echo "    🔧 [${phase}] recovered orphan #${id} (score: ${recovered_score}, report: ${recovered_report})"
+      patched=$((patched + 1))
+    fi
+  done
+
+  if (( patched > 0 )); then
+    echo "    [${phase}] recovered ${patched} orphan(s) total"
   fi
 }
 
@@ -398,9 +2397,26 @@ merge_tracker() {
   echo ""
   echo "=== Merging tracker additions ==="
   node "$PROJECT_DIR/merge-tracker.mjs"
+  # A dealbreaker SKIP row holds its report number until it is merged. The
+  # tracker row now holds it for reserve-report-num.mjs, so drop the sentinel.
+  if [[ -f "$STATE_FILE" ]]; then
+    local mid mstatus mnum merror
+    while IFS=$'\t' read -r mid _ mstatus _ _ mnum _ merror _; do
+      if [[ "$mid" != "id" && "$mstatus" == "skipped" && "$merror" == dealbreaker:* ]]; then
+        release_report_num "$mnum"
+      fi
+    done < "$STATE_FILE"
+  fi
+  echo ""
+  echo "=== Reconciling pipeline.md ==="
+  node "$PROJECT_DIR/reconcile-pipeline.mjs" || echo "⚠️  Pipeline reconcile had issues (see above)"
   echo ""
   echo "=== Verifying pipeline integrity ==="
   node "$PROJECT_DIR/verify-pipeline.mjs" || echo "⚠️  Verification found issues (see above)"
+}
+
+report_progress() {
+  echo "=== Progress: $1/$2 offers finished, $((SECONDS - BATCH_START))s elapsed ==="
 }
 
 # Print summary
@@ -413,42 +2429,200 @@ print_summary() {
     return
   fi
 
-  local total=0 completed=0 failed=0 pending=0
+  local total=0 completed=0 skipped=0 failed=0 pending=0 needs_confirmation=0
   local score_sum=0 score_count=0
+  local -a dealbreaker_lines=()
 
-  while IFS=$'\t' read -r sid _ sstatus _ _ _ sscore _ _; do
+  while IFS=$'\t' read -r sid surl sstatus _ _ _ sscore serror _; do
     [[ "$sid" == "id" ]] && continue
     total=$((total + 1))
     case "$sstatus" in
       completed) completed=$((completed + 1))
-        if [[ "$sscore" != "-" && -n "$sscore" ]]; then
-          score_sum=$(echo "$score_sum + $sscore" | bc 2>/dev/null || echo "$score_sum")
+        if is_decimal_number "$sscore"; then
+          score_sum=$(LC_ALL=C awk -v sum="$score_sum" -v score="$sscore" 'BEGIN{print sum + score}' 2>/dev/null || echo "$score_sum")
           score_count=$((score_count + 1))
         fi
         ;;
+      skipped) skipped=$((skipped + 1))
+        [[ "$serror" == dealbreaker:* ]] && dealbreaker_lines+=("#$sid $surl — $serror")
+        ;;
       failed) failed=$((failed + 1)) ;;
+      needs_confirmation) needs_confirmation=$((needs_confirmation + 1)) ;;
       *) pending=$((pending + 1)) ;;
     esac
   done < "$STATE_FILE"
 
-  echo "Total: $total | Completed: $completed | Failed: $failed | Pending: $pending"
+  echo "Total: $total | Completed: $completed | Skipped: $skipped | Failed: $failed | Pending: $pending | Needs confirmation: $needs_confirmation"
+
+  if (( ${#dealbreaker_lines[@]} > 0 )); then
+    echo "Dealbreaker skips: ${#dealbreaker_lines[@]} (SKIP rows merged; to evaluate one anyway, rerun it in a session and say \"evaluate anyway\")"
+    local dealbreaker_line
+    for dealbreaker_line in "${dealbreaker_lines[@]}"; do
+      echo "  $dealbreaker_line"
+    done
+  fi
 
   if (( score_count > 0 )); then
     local avg
-    avg=$(echo "scale=1; $score_sum / $score_count" | bc 2>/dev/null || echo "N/A")
+    # LC_ALL=C: under e.g. a German locale awk formats "%.1f" as "4,5"
+    # instead of "4.5", and a decimal comma breaks every downstream parser.
+    avg=$(LC_ALL=C awk -v sum="$score_sum" -v count="$score_count" 'BEGIN{printf "%.1f", sum / count}' 2>/dev/null || echo "N/A")
     echo "Average score: $avg/5 ($score_count scored)"
+  fi
+
+  if [[ -f "$BATCH_DIR/aggregate-tokens.mjs" ]]; then
+    if ! node "$BATCH_DIR/aggregate-tokens.mjs"; then
+      echo "Warning: token aggregation failed." >&2
+    fi
+  fi
+}
+
+print_status_table() {
+  # $1 = "full" forces the per-job table whatever STATUS_FULL says (--watch).
+  local force_full="${1:-}"
+  if [[ ! -f "$STATE_FILE" ]]; then
+    echo "No state file found at $STATE_FILE"
+    return
+  fi
+
+  local total=0 completed=0 processing=0 failed=0 pending=0 skipped=0 rate_limited=0 paused_rate_limit=0 needs_confirmation=0
+  local score_sum=0 score_count=0
+
+  # Read first line to skip header
+  local header=true
+  while IFS=$'\t' read -r sid surl sstatus sstarted scompleted sreport sscore serror sretries || [[ -n "$sid" ]]; do
+    if [[ "$header" == "true" ]]; then
+      header=false
+      continue
+    fi
+    [[ -z "$sid" ]] && continue
+    sstatus="${sstatus%$'\r'}"
+    sscore="${sscore%$'\r'}"
+    serror="${serror%$'\r'}"
+    sreport="${sreport%$'\r'}"
+    total=$((total + 1))
+    case "$sstatus" in
+      completed)
+        completed=$((completed + 1))
+        if is_decimal_number "$sscore"; then
+          score_sum=$(LC_ALL=C awk -v sum="$score_sum" -v score="$sscore" 'BEGIN{print sum + score}' 2>/dev/null || echo "$score_sum")
+          score_count=$((score_count + 1))
+        fi
+        ;;
+      processing) processing=$((processing + 1)) ;;
+      needs_confirmation) needs_confirmation=$((needs_confirmation + 1)) ;;
+      failed) failed=$((failed + 1)) ;;
+      skipped) skipped=$((skipped + 1)) ;;
+      rate_limited) rate_limited=$((rate_limited + 1)) ;;
+      paused_rate_limit) paused_rate_limit=$((paused_rate_limit + 1)) ;;
+      *) pending=$((pending + 1)) ;;
+    esac
+  done < "$STATE_FILE"
+
+  echo "=== Batch Progress ==="
+  echo "Total: $total | Completed: $completed | Processing: $processing | Failed: $failed | Pending: $pending | Skipped: $skipped | Rate Limited: $rate_limited | Paused: $paused_rate_limit | Needs confirmation: $needs_confirmation"
+  if (( score_count > 0 )); then
+    local avg
+    # LC_ALL=C: under e.g. a German locale awk formats "%.1f" as "4,5"
+    # instead of "4.5", and a decimal comma breaks every downstream parser.
+    avg=$(LC_ALL=C awk -v sum="$score_sum" -v count="$score_count" 'BEGIN{printf "%.1f", sum / count}' 2>/dev/null || echo "N/A")
+    echo "Average score: $avg/5 ($score_count scored)"
+  fi
+
+  if [[ "$force_full" != "full" && "$STATUS_FULL" != "true" ]]; then
+    return
+  fi
+  echo ""
+
+  # Format the per-job table:
+  # Columns: ID, Status, Report, Score, Target (URL or explanation)
+  printf "%-4s | %-17s | %-6s | %-5s | %-40s\n" "ID" "Status" "Report" "Score" "URL / Detail"
+  printf "%-4s+%-19s+%-8s+%-7s+%-42s\n" "----" "-------------------" "--------" "-------" "------------------------------------------"
+
+  header=true
+  while IFS=$'\t' read -r sid surl sstatus sstarted scompleted sreport sscore serror sretries || [[ -n "$sid" ]]; do
+    if [[ "$header" == "true" ]]; then
+      header=false
+      continue
+    fi
+    [[ -z "$sid" ]] && continue
+    sstatus="${sstatus%$'\r'}"
+    sscore="${sscore%$'\r'}"
+    serror="${serror%$'\r'}"
+    sreport="${sreport%$'\r'}"
+    local target="$surl"
+    if [[ "$sstatus" == "needs_confirmation" ]]; then
+      target="$surl — Needs confirmation: $serror"
+    elif [[ "$sstatus" == "failed" && -n "$serror" && "$serror" != "-" ]]; then
+      target="Error: $serror"
+    fi
+    # Trim target to fit nicely (e.g. 50 chars)
+    if [[ "$sstatus" != "needs_confirmation" ]] && (( ${#target} > 50 )); then
+      target="${target:0:47}..."
+    fi
+    printf "%-4s | %-17s | %-6s | %-5s | %-50s\n" "$sid" "$sstatus" "$sreport" "$sscore" "$target"
+  done < "$STATE_FILE"
+}
+
+watch_status() {
+  local active_pid=""
+  if [[ -f "$LOCK_FILE" ]]; then
+    active_pid=$(cat "$LOCK_FILE" 2>/dev/null || true)
+  fi
+
+  if [[ -n "$active_pid" ]] && kill -0 "$active_pid" 2>/dev/null; then
+    echo "Watching batch-runner (PID $active_pid)... Press Ctrl+C to stop."
+    while kill -0 "$active_pid" 2>/dev/null; do
+      clear || printf "\033[c"
+      echo "=== Watching Batch Progress (PID $active_pid) ==="
+      print_status_table full
+      sleep 2
+    done
+    echo ""
+    echo "=== Batch runner process (PID $active_pid) has finished ==="
+  else
+    echo "No active batch-runner detected."
+  fi
+
+  echo "Showing final status:"
+  print_status_table full
+
+  # Chain verify-pipeline.mjs
+  if [[ -f "$PROJECT_DIR/verify-pipeline.mjs" ]]; then
+    echo ""
+    echo "=== Running pipeline verification ==="
+    node "$PROJECT_DIR/verify-pipeline.mjs" || echo "⚠️  Verification found issues"
   fi
 }
 
 # Main
 main() {
+  if [[ "$STATUS_ONLY" == "true" ]]; then
+    check_status_prerequisites
+    print_status_table
+    exit 0
+  fi
+
+  if [[ "$WATCH_MODE" == "true" ]]; then
+    check_status_prerequisites
+    watch_status
+    exit 0
+  fi
+
   check_prerequisites
+
+  resolve_worker_model
 
   if [[ "$DRY_RUN" == "false" ]]; then
     acquire_lock
+    rm -f "$PAUSE_FILE" "$THROTTLE_FILE"
   fi
 
   init_state
+
+  if [[ "$DRY_RUN" == "false" ]]; then
+    reconcile_recovery_records
+  fi
 
   # Count input offers (skip header, ignore blank lines)
   local total_input
@@ -461,15 +2635,59 @@ main() {
   fi
 
   echo "=== career-ops batch runner ==="
-  echo "Parallel: $PARALLEL | Max retries: $MAX_RETRIES"
+  if [[ "${MODE:-full}" == "match" ]]; then
+    echo "Mode: match (single-pass CV evaluation)"
+  fi
+  if (( LIMIT > 0 )); then
+    echo "Parallel: $PARALLEL | Max retries: $MAX_RETRIES | Limit: $LIMIT"
+  else
+    echo "Parallel: $PARALLEL | Max retries: $MAX_RETRIES"
+  fi
+  if [[ "$RESOLVED_SPEND_TIER" == "override" ]]; then
+    echo "CLI: $CLI | Model: $RESOLVED_MODEL (explicit --model override)"
+  elif [[ "$RESOLVED_SPEND_TIER" == "cli-default" ]]; then
+    echo "CLI: $CLI | Model: $CLI default"
+  else
+    echo "CLI: $CLI | Model: $RESOLVED_MODEL (spend_tier=${RESOLVED_SPEND_TIER})"
+  fi
   echo "Input: $total_input offers"
   echo ""
+
+  # Sweep orphans BEFORE selecting work, not just during and after the run.
+  #
+  # A row left as "processing" by a previous run (worker finished, state write
+  # lost to a lock timeout, or the run was killed mid-flight) is selected as
+  # pending here and re-evaluated from scratch — even though its report was
+  # already written. That produced a genuine duplicate on 2026-08-06: offer
+  # #1277 wrote report 3122 at 22:00, the row stayed "processing", and the
+  # 04:00 recovery re-ran the same offer into report 3128. Two reports, two
+  # evaluations paid for, one of them orphaned with no tracker row.
+  #
+  # sweep_orphans only promotes rows whose worker log JSON shows completion, so
+  # running it first converts exactly those rows to "completed" and drops them
+  # out of the pending set. Genuinely incomplete rows (empty or partial log)
+  # are left alone and still get re-processed below, which is what we want.
+  if [[ "$DRY_RUN" != "true" ]]; then
+    sweep_orphans "startup"
+  fi
 
   # Build list of offers to process
   local -a pending_ids=()
   local -a pending_urls=()
   local -a pending_sources=()
   local -a pending_notes=()
+
+  # --company: resolve the matching ids ONCE (batch/company-scope.mjs), then skip
+  # every other row before --limit is counted.
+  local scope_ids=""
+  if [[ -n "$SCOPE_COMPANY" ]]; then
+    if ! scope_ids=$(node "$BATCH_DIR/company-scope.mjs" --input "$INPUT_FILE" --company "$SCOPE_COMPANY"); then
+      echo "ERROR: could not resolve --company scope (company-scope.mjs failed)." >&2
+      exit 1
+    fi
+    scope_ids=" $(echo "$scope_ids" | tr '\n' ' ') "
+    echo "Scope: company=$SCOPE_COMPANY ($(echo "$scope_ids" | wc -w | tr -d ' ') matching row(s))"
+  fi
 
   while IFS=$'\t' read -r id url source notes; do
     [[ "$id" == "id" ]] && continue  # skip header
@@ -483,10 +2701,24 @@ main() {
       continue
     fi
 
+    if [[ -n "$SCOPE_COMPANY" && "$scope_ids" != *" $id "* ]]; then
+      continue
+    fi
+
     local status
     status=$(get_status "$id")
 
-    if [[ "$RETRY_FAILED" == "true" ]]; then
+    # No command-line retry flag constitutes a user's agency answer.
+    if [[ "$status" == "needs_confirmation" ]]; then
+      echo "HOLD #$id: needs confirmation in the parent session ($url)"
+      continue
+    fi
+
+    if [[ "$RESUME_PAUSED" == "true" ]]; then
+      if [[ "$status" != "paused_rate_limit" ]]; then
+        continue
+      fi
+    elif [[ "$RETRY_FAILED" == "true" ]]; then
       # Only process failed offers
       if [[ "$status" != "failed" ]]; then
         continue
@@ -499,8 +2731,12 @@ main() {
         continue
       fi
     else
-      # Skip completed offers
-      if [[ "$status" == "completed" ]]; then
+      # Skip terminal offers
+      if [[ "$status" == "completed" || "$status" == "skipped" ]]; then
+        continue
+      fi
+      # Paused rate-limit offers resume explicitly with --resume-paused.
+      if [[ "$status" == "paused_rate_limit" ]]; then
         continue
       fi
       # Skip failed offers that hit retry limit (unless --retry-failed)
@@ -512,6 +2748,10 @@ main() {
           continue
         fi
       fi
+    fi
+
+    if (( LIMIT > 0 )) && (( ${#pending_ids[@]} >= LIMIT )); then
+      break
     fi
 
     pending_ids+=("$id")
@@ -544,37 +2784,100 @@ main() {
     exit 0
   fi
 
+  # --skip-pdf must not start a painter, even when the parent shell already opted in.
+  if [[ "$SKIP_PDF" == "true" ]]; then
+    unset CAREER_OPS_PDF_SHARED
+  else
+    export CAREER_OPS_PDF_SHARED=1
+    PDF_SERVER_OWNER=1
+  fi
+
   # Process offers
+  BATCH_START=$SECONDS
+  local done_jobs=0
   if (( PARALLEL <= 1 )); then
     # Sequential processing
     for i in "${!pending_ids[@]}"; do
+      JOB_POS="$((i + 1))/$pending_count"
       process_offer "${pending_ids[$i]}" "${pending_urls[$i]}" "${pending_sources[$i]}" "${pending_notes[$i]}"
+      done_jobs=$((done_jobs + 1))
+      report_progress "$done_jobs" "$pending_count"
+      if [[ "$BATCH_PAUSED" == "true" || -f "$PAUSE_FILE" ]]; then
+        echo "=== Batch paused: session/rate limit reached. Resume later with --resume-paused. ==="
+        break
+      fi
     done
   else
     # Parallel processing with job control
     local running=0
+    local parallel_rc=0 worker_rc=0
     local -a pids=()
     local -a pid_ids=()
+    local last_sweep=$SECONDS
 
     for i in "${!pending_ids[@]}"; do
-      # Wait if we're at parallel limit
-      while (( running >= PARALLEL )); do
+      if [[ "$BATCH_PAUSED" == "true" || -f "$PAUSE_FILE" ]]; then
+        echo "=== Batch paused: session/rate limit reached. Waiting for running workers, not scheduling new offers. ==="
+        break
+      fi
+
+      # Wait if we're at parallel limit. The throttle check opens every pass,
+      # so it also runs after the sleep below: a rate limit recorded while this
+      # loop slept drops the run to one worker before the next offer starts,
+      # not after it.
+      while :; do
+        if (( PARALLEL > 1 )) && [[ -f "${THROTTLE_FILE:-}" ]]; then
+          PARALLEL=1
+          echo "=== Rate limited: running the remaining offers on 1 worker. ==="
+        fi
+        if (( running < PARALLEL )); then
+          break
+        fi
         # Wait for any child to finish
         for j in "${!pids[@]}"; do
           if ! kill -0 "${pids[$j]}" 2>/dev/null; then
-            wait "${pids[$j]}" 2>/dev/null || true
+            worker_rc=0
+            wait "${pids[$j]}" 2>/dev/null || worker_rc=$?
+            if (( worker_rc != 0 )); then
+              parallel_rc=$worker_rc
+            fi
             unset 'pids[j]'
             unset 'pid_ids[j]'
             running=$((running - 1))
+            done_jobs=$((done_jobs + 1))
+            report_progress "$done_jobs" "$pending_count"
           fi
         done
         # Compact arrays
-        pids=("${pids[@]}")
-        pid_ids=("${pid_ids[@]}")
+        pids=(${pids[@]+"${pids[@]}"})
+        pid_ids=(${pid_ids[@]+"${pid_ids[@]}"})
+        if (( parallel_rc != 0 )); then
+          break
+        fi
+
+        # Periodic orphan sweep — recovers slots where a worker finished
+        # but its state row didn't update (lock race). Without this, the
+        # main loop counts those slots as "in flight" forever and effective
+        # parallelism drops over time. Runs from the orchestrator thread,
+        # not from workers, so no extra lock contention.
+        if (( ORPHAN_SWEEP_INTERVAL_SECONDS > 0 && SECONDS - last_sweep >= ORPHAN_SWEEP_INTERVAL_SECONDS )); then
+          sweep_orphans "mid-run"
+          last_sweep=$SECONDS
+        fi
+
+        if [[ "$BATCH_PAUSED" == "true" || -f "$PAUSE_FILE" ]]; then
+          echo "=== Batch paused: session/rate limit reached. Waiting for running workers, not scheduling new offers. ==="
+          break
+        fi
         sleep 1
       done
 
+      if (( parallel_rc != 0 )) || [[ "$BATCH_PAUSED" == "true" || -f "$PAUSE_FILE" ]]; then
+        break
+      fi
+
       # Launch worker in background
+      JOB_POS="$((i + 1))/$pending_count"
       process_offer "${pending_ids[$i]}" "${pending_urls[$i]}" "${pending_sources[$i]}" "${pending_notes[$i]}" &
       pids+=($!)
       pid_ids+=("${pending_ids[$i]}")
@@ -582,16 +2885,33 @@ main() {
     done
 
     # Wait for remaining workers
-    for pid in "${pids[@]}"; do
-      wait "$pid" 2>/dev/null || true
+    for pid in ${pids[@]+"${pids[@]}"}; do
+      worker_rc=0
+      wait "$pid" 2>/dev/null || worker_rc=$?
+      if (( worker_rc != 0 )); then
+        parallel_rc=$worker_rc
+      fi
+      done_jobs=$((done_jobs + 1))
+      report_progress "$done_jobs" "$pending_count"
     done
+    if (( parallel_rc != 0 )); then
+      echo "ERROR: a parallel worker failed fatally; tracker merge skipped. Inspect the worker log and repair state before rerunning." >&2
+      return "$parallel_rc"
+    fi
   fi
+
+  # Final orphan sweep — catch anything that slipped past the periodic check.
+  # Runs in both sequential and parallel modes for consistency. Cheap when
+  # there's nothing to recover.
+  sweep_orphans "end-of-batch"
 
   # Merge tracker additions
   merge_tracker
 
   # Print summary
   print_summary
+
+  exit 0
 }
 
 main "$@"

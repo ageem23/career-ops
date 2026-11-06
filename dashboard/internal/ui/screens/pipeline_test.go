@@ -4,9 +4,26 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/santifer/career-ops/dashboard/internal/data"
 	"github.com/santifer/career-ops/dashboard/internal/model"
 	"github.com/santifer/career-ops/dashboard/internal/theme"
 )
+
+func tabIndexForFilter(t *testing.T, filter string) int {
+	t.Helper()
+
+	for i, tab := range getPipelineTabs() {
+		if tab.filter == filter {
+			return i
+		}
+	}
+
+	t.Fatalf("expected pipeline tabs to include filter %q", filter)
+	return -1
+}
 
 func TestWithReloadedDataPreservesStateAndSelection(t *testing.T) {
 	initialApps := []model.CareerApplication{
@@ -15,6 +32,7 @@ func TestWithReloadedDataPreservesStateAndSelection(t *testing.T) {
 			Role:       "Backend Engineer",
 			Status:     "Evaluated",
 			Score:      4.2,
+			HasScore:   true,
 			ReportPath: "reports/001-acme.md",
 		},
 		{
@@ -22,6 +40,7 @@ func TestWithReloadedDataPreservesStateAndSelection(t *testing.T) {
 			Role:       "Platform Engineer",
 			Status:     "Applied",
 			Score:      4.6,
+			HasScore:   true,
 			ReportPath: "reports/002-beta.md",
 		},
 	}
@@ -49,6 +68,7 @@ func TestWithReloadedDataPreservesStateAndSelection(t *testing.T) {
 			Role:       "AI Engineer",
 			Status:     "Interview",
 			Score:      4.8,
+			HasScore:   true,
 			ReportPath: "reports/003-gamma.md",
 		},
 	}
@@ -83,14 +103,777 @@ func TestRenderAppLineIncludesDateColumn(t *testing.T) {
 	)
 
 	line := pm.renderAppLine(model.CareerApplication{
-		Date:    "2026-04-13",
-		Company: "Anthropic",
-		Role:    "Forward Deployed Engineer",
-		Status:  "Applied",
-		Score:   4.5,
+		Number:   42,
+		Date:     "2026-04-13",
+		Company:  "Anthropic",
+		Role:     "Forward Deployed Engineer",
+		Status:   "Applied",
+		Score:    4.5,
+		HasScore: true,
 	}, false)
 
 	if !strings.Contains(line, "2026-04-13") {
 		t.Fatalf("expected rendered line to include date column, got %q", line)
+	}
+	if !strings.Contains(line, "#42") {
+		t.Fatalf("expected rendered line to include tracker number marker, got %q", line)
+	}
+
+	// With ledger history the DATE column shows the latest status change,
+	// not the tracker's evaluation date.
+	line = pm.renderAppLine(model.CareerApplication{
+		Number:     42,
+		Date:       "2026-04-13",
+		StatusDate: "2026-05-20",
+		Company:    "Anthropic",
+		Role:       "Forward Deployed Engineer",
+		Status:     "Interview",
+		Score:      4.5,
+		HasScore:   true,
+	}, false)
+	if !strings.Contains(line, "2026-05-20") || strings.Contains(line, "2026-04-13") {
+		t.Fatalf("expected DATE column to show the status-change date over the tracker date, got %q", line)
+	}
+}
+
+func TestColumnHeaderReadsDate(t *testing.T) {
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), nil, model.PipelineMetrics{}, "..", 120, 40)
+	header := pm.renderColumnHeader()
+	if !strings.Contains(header, "DATE") || strings.Contains(header, "APPLIED") {
+		t.Fatalf("expected the date column header to read DATE, not APPLIED, got %q", header)
+	}
+}
+
+func TestSearchFiltersByCompanyRoleAndNotes(t *testing.T) {
+	apps := []model.CareerApplication{
+		{Company: "Stripe", Role: "Backend Engineer", Status: "Evaluated", Score: 4.6, HasScore: true, Notes: "payments infra"},
+		{Company: "Anthropic", Role: "AI Safety Engineer", Status: "Applied", Score: 4.8, HasScore: true, Notes: "policy work"},
+		{Company: "Acme Corp", Role: "Senior PM, Voice AI", Status: "Evaluated", Score: 4.2, HasScore: true, Notes: "Series B in Madrid"},
+		{Company: "Globex", Role: "Platform Engineer", Status: "Applied", Score: 3.9, HasScore: true, Notes: "remote-first"},
+	}
+
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), apps, model.PipelineMetrics{Total: len(apps)}, "..", 120, 40)
+	pm.activeTab = tabIndexForFilter(t, filterAll)
+
+	// Match by company substring (case-insensitive).
+	pm.searchQuery = "stripe"
+	pm.applyFilterAndSort()
+	if len(pm.filtered) != 1 || pm.filtered[0].Company != "Stripe" {
+		t.Fatalf("expected 1 match for 'stripe', got %+v", pm.filtered)
+	}
+
+	// Match by role substring.
+	pm.searchQuery = "voice ai"
+	pm.applyFilterAndSort()
+	if len(pm.filtered) != 1 || pm.filtered[0].Company != "Acme Corp" {
+		t.Fatalf("expected 1 match for 'voice ai', got %+v", pm.filtered)
+	}
+
+	// Match by notes substring.
+	pm.searchQuery = "madrid"
+	pm.applyFilterAndSort()
+	if len(pm.filtered) != 1 || pm.filtered[0].Company != "Acme Corp" {
+		t.Fatalf("expected 1 match for notes 'madrid', got %+v", pm.filtered)
+	}
+
+	// Empty query restores everything.
+	pm.searchQuery = ""
+	pm.applyFilterAndSort()
+	if len(pm.filtered) != len(apps) {
+		t.Fatalf("expected empty query to restore all rows, got %d/%d", len(pm.filtered), len(apps))
+	}
+}
+
+func TestSearchComposesWithActiveTab(t *testing.T) {
+	apps := []model.CareerApplication{
+		{Company: "Stripe", Role: "Backend Engineer", Status: "Evaluated", Score: 4.6, HasScore: true},
+		{Company: "Stripe", Role: "Frontend Engineer", Status: "Applied", Score: 4.5, HasScore: true},
+		{Company: "Anthropic", Role: "AI Engineer", Status: "Applied", Score: 4.8, HasScore: true},
+	}
+
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), apps, model.PipelineMetrics{Total: len(apps)}, "..", 120, 40)
+	pm.activeTab = tabIndexForFilter(t, filterApplied)
+	pm.searchQuery = "stripe"
+	pm.applyFilterAndSort()
+
+	if len(pm.filtered) != 1 || pm.filtered[0].Role != "Frontend Engineer" {
+		t.Fatalf("expected applied+stripe to leave only Frontend Engineer, got %+v", pm.filtered)
+	}
+}
+
+func TestSearchIsCaseInsensitive(t *testing.T) {
+	apps := []model.CareerApplication{
+		{Company: "Anthropic", Role: "AI Engineer", Status: "Evaluated", Score: 4.8, HasScore: true},
+	}
+
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), apps, model.PipelineMetrics{Total: len(apps)}, "..", 120, 40)
+	for _, q := range []string{"anthropic", "ANTHROPIC", "AnThRoPiC"} {
+		pm.searchQuery = q
+		pm.applyFilterAndSort()
+		if len(pm.filtered) != 1 {
+			t.Fatalf("expected case-insensitive match for %q, got %d rows", q, len(pm.filtered))
+		}
+	}
+}
+
+func TestOpenURLKeyFlashesWhenApplicationHasNoURL(t *testing.T) {
+	apps := []model.CareerApplication{
+		{Company: "Acme", Role: "Triage Engineer", Status: "Evaluated", Score: 4.0, HasScore: true},
+	}
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), apps, model.PipelineMetrics{Total: 1}, "..", 120, 40)
+	pm.viewMode = "flat"
+	pm.applyFilterAndSort()
+
+	updated, cmd := pm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	if cmd != nil {
+		t.Fatal("expected no open command when the application has no URL")
+	}
+	if updated.flash != "No URL found for this application" {
+		t.Fatalf("flash = %q, want missing-URL notice", updated.flash)
+	}
+}
+
+func TestOpenURLKeyEmitsTrackerURL(t *testing.T) {
+	const jobURL = "https://jobs.example.com/triage"
+	apps := []model.CareerApplication{
+		{Company: "Acme", Role: "Triage Engineer", Status: "Evaluated", Score: 4.0, HasScore: true, JobURL: jobURL},
+	}
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), apps, model.PipelineMetrics{Total: 1}, "..", 120, 40)
+	pm.viewMode = "flat"
+	pm.applyFilterAndSort()
+
+	_, cmd := pm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	if cmd == nil {
+		t.Fatal("expected an open command for the tracker URL")
+	}
+	msg, ok := cmd().(PipelineOpenURLMsg)
+	if !ok {
+		t.Fatalf("command returned %T, want PipelineOpenURLMsg", cmd())
+	}
+	if msg.URL != jobURL {
+		t.Fatalf("opened URL = %q, want %q", msg.URL, jobURL)
+	}
+}
+
+func TestSearchEnterCommitsAndEscClearsCommittedQuery(t *testing.T) {
+	apps := []model.CareerApplication{
+		{Company: "Stripe", Role: "Backend Engineer", Status: "Evaluated", Score: 4.6, HasScore: true},
+		{Company: "Anthropic", Role: "AI Engineer", Status: "Evaluated", Score: 4.8, HasScore: true},
+	}
+
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), apps, model.PipelineMetrics{Total: len(apps)}, "..", 120, 40)
+
+	// Open input and type "stripe".
+	pm, _ = pm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	if !pm.searchInput {
+		t.Fatal("expected `/` to open search input")
+	}
+	for _, r := range "stripe" {
+		pm, _ = pm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	if pm.searchQuery != "stripe" {
+		t.Fatalf("expected query to live-update to 'stripe', got %q", pm.searchQuery)
+	}
+	if len(pm.filtered) != 1 || pm.filtered[0].Company != "Stripe" {
+		t.Fatalf("expected live filter to leave only Stripe, got %+v", pm.filtered)
+	}
+
+	// Enter commits — input closes, query stays.
+	pm, _ = pm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if pm.searchInput {
+		t.Fatal("expected Enter to close input")
+	}
+	if pm.searchQuery != "stripe" {
+		t.Fatalf("expected Enter to keep committed query, got %q", pm.searchQuery)
+	}
+
+	// Esc on a committed query clears the search and restores the full list.
+	pm, _ = pm.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if pm.searchQuery != "" {
+		t.Fatalf("expected Esc to clear committed query, got %q", pm.searchQuery)
+	}
+	if len(pm.filtered) != len(apps) {
+		t.Fatalf("expected Esc to restore full list, got %d/%d", len(pm.filtered), len(apps))
+	}
+}
+
+func TestSearchEscInInputCancelsAndClears(t *testing.T) {
+	// Use multiple rows so the test catches a regression where Esc clears the query
+	// but forgets to re-apply the filter — the visible count would stay at 1
+	// otherwise even though the underlying state went stale.
+	apps := []model.CareerApplication{
+		{Company: "Stripe", Role: "Backend Engineer", Status: "Evaluated", Score: 4.6, HasScore: true},
+		{Company: "Globex", Role: "Platform Engineer", Status: "Evaluated", Score: 4.0, HasScore: true},
+		{Company: "Anthropic", Role: "AI Engineer", Status: "Evaluated", Score: 4.8, HasScore: true},
+	}
+
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), apps, model.PipelineMetrics{Total: len(apps)}, "..", 120, 40)
+	pm.searchInput = true
+	pm.searchQuery = "stri"
+	pm.applyFilterAndSort()
+	if len(pm.filtered) != 1 {
+		t.Fatalf("setup expected 1 row matching 'stri', got %d", len(pm.filtered))
+	}
+
+	pm, _ = pm.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if pm.searchInput {
+		t.Fatal("expected Esc in input mode to close input")
+	}
+	if pm.searchQuery != "" {
+		t.Fatalf("expected Esc in input mode to clear in-progress query, got %q", pm.searchQuery)
+	}
+	if len(pm.filtered) != len(apps) {
+		t.Fatalf("expected Esc to re-expand filtered list to %d rows, got %d", len(apps), len(pm.filtered))
+	}
+}
+
+func TestSearchResetsCursorOnQueryChange(t *testing.T) {
+	apps := []model.CareerApplication{
+		{Company: "Acme", Role: "Backend Engineer", Status: "Evaluated", Score: 4.0, HasScore: true},
+		{Company: "Beta", Role: "Frontend Engineer", Status: "Evaluated", Score: 4.1, HasScore: true},
+		{Company: "Gamma", Role: "AI Engineer", Status: "Evaluated", Score: 4.2, HasScore: true},
+	}
+
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), apps, model.PipelineMetrics{Total: len(apps)}, "..", 120, 40)
+	pm.cursor = 2
+
+	pm, _ = pm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	pm, _ = pm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+
+	if pm.cursor != 0 {
+		t.Fatalf("expected cursor to reset to 0 on query change, got %d", pm.cursor)
+	}
+	if pm.scrollOffset != 0 {
+		t.Fatalf("expected scrollOffset to reset to 0 on query change, got %d", pm.scrollOffset)
+	}
+}
+
+func TestSearchStatePreservedAcrossReload(t *testing.T) {
+	initial := []model.CareerApplication{
+		{Company: "Stripe", Role: "Backend", Status: "Evaluated", Score: 4.6, HasScore: true},
+		{Company: "Acme", Role: "AI", Status: "Evaluated", Score: 4.0, HasScore: true},
+	}
+
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), initial, model.PipelineMetrics{Total: len(initial)}, "..", 120, 40)
+	pm.searchQuery = "stripe"
+	pm.applyFilterAndSort()
+
+	refreshed := append([]model.CareerApplication{}, initial...)
+	refreshed = append(refreshed, model.CareerApplication{Company: "Globex", Role: "Platform", Status: "Applied", Score: 4.3, HasScore: true})
+
+	reloaded := pm.WithReloadedData(refreshed, model.PipelineMetrics{Total: len(refreshed)})
+
+	if reloaded.searchQuery != "stripe" {
+		t.Fatalf("expected refresh to preserve search query, got %q", reloaded.searchQuery)
+	}
+	if len(reloaded.filtered) != 1 || reloaded.filtered[0].Company != "Stripe" {
+		t.Fatalf("expected refresh+search to keep filter applied, got %+v", reloaded.filtered)
+	}
+}
+
+func TestRejectedAndDiscardedTabsFilterCorrectly(t *testing.T) {
+	apps := []model.CareerApplication{
+		{
+			Company:    "Acme",
+			Role:       "Backend Engineer",
+			Status:     "Rejected",
+			Score:      3.4,
+			HasScore:   true,
+			ReportPath: "reports/001-acme.md",
+		},
+		{
+			Company:    "Beta",
+			Role:       "Platform Engineer",
+			Status:     "Discarded",
+			Score:      2.1,
+			HasScore:   true,
+			ReportPath: "reports/002-beta.md",
+		},
+		{
+			Company:    "Gamma",
+			Role:       "AI Engineer",
+			Status:     "Applied",
+			Score:      4.6,
+			HasScore:   true,
+			ReportPath: "reports/003-gamma.md",
+		},
+	}
+
+	pm := NewPipelineModel(
+		theme.NewTheme("catppuccin-mocha"),
+		apps,
+		model.PipelineMetrics{Total: len(apps)},
+		"..",
+		120,
+		40,
+	)
+
+	pm.activeTab = tabIndexForFilter(t, filterRejected)
+	pm.applyFilterAndSort()
+	if len(pm.filtered) != 1 || pm.filtered[0].Status != "Rejected" {
+		t.Fatalf("expected rejected tab to isolate rejected rows, got %+v", pm.filtered)
+	}
+
+	pm.activeTab = tabIndexForFilter(t, filterDiscarded)
+	pm.applyFilterAndSort()
+	if len(pm.filtered) != 1 || pm.filtered[0].Status != "Discarded" {
+		t.Fatalf("expected discarded tab to isolate discarded rows, got %+v", pm.filtered)
+	}
+}
+
+func TestRespondedTabFiltersCorrectly(t *testing.T) {
+	apps := []model.CareerApplication{
+		{
+			Company:    "Acme",
+			Role:       "Backend Engineer",
+			Status:     "Responded",
+			Score:      4.2,
+			HasScore:   true,
+			ReportPath: "reports/001-acme.md",
+		},
+		{
+			Company:    "Beta",
+			Role:       "Platform Engineer",
+			Status:     "Applied",
+			Score:      3.8,
+			HasScore:   true,
+			ReportPath: "reports/002-beta.md",
+		},
+		{
+			Company:    "Gamma",
+			Role:       "AI Engineer",
+			Status:     "Interview",
+			Score:      4.6,
+			HasScore:   true,
+			ReportPath: "reports/003-gamma.md",
+		},
+	}
+
+	pm := NewPipelineModel(
+		theme.NewTheme("catppuccin-mocha"),
+		apps,
+		model.PipelineMetrics{Total: len(apps)},
+		t.TempDir(),
+		120,
+		40,
+	)
+
+	pm.activeTab = tabIndexForFilter(t, filterResponded)
+	pm.applyFilterAndSort()
+	if len(pm.filtered) != 1 || pm.filtered[0].Status != "Responded" {
+		t.Fatalf("expected responded tab to isolate responded rows, got %+v", pm.filtered)
+	}
+}
+
+// The tab row follows the funnel order used by statusGroupOrder, where a
+// responded posting sits between interview and applied.
+func TestRespondedTabSitsBetweenInterviewAndApplied(t *testing.T) {
+	interview := tabIndexForFilter(t, filterInterview)
+	responded := tabIndexForFilter(t, filterResponded)
+	applied := tabIndexForFilter(t, filterApplied)
+
+	if !(interview < responded && responded < applied) {
+		t.Fatalf(
+			"expected tab order interview < responded < applied, got %d, %d, %d",
+			interview, responded, applied,
+		)
+	}
+}
+
+func TestAssessmentTabFiltersCorrectly(t *testing.T) {
+	apps := []model.CareerApplication{
+		{Company: "AirAsia", Role: "Data Engineer", Status: "Assessment"},
+		{Company: "AirAsia", Role: "Data Engineer", Status: "Interview"},
+	}
+	pm := NewPipelineModel(
+		theme.NewTheme("catppuccin-mocha"),
+		apps,
+		model.PipelineMetrics{Total: len(apps)},
+		t.TempDir(),
+		120,
+		40,
+	)
+
+	pm.activeTab = tabIndexForFilter(t, filterAssessment)
+	pm.applyFilterAndSort()
+	if len(pm.filtered) != 1 || data.NormalizeStatus(pm.filtered[0].Status) != "assessment" {
+		t.Fatalf("expected assessment tab to isolate assessment rows, got %+v", pm.filtered)
+	}
+}
+
+// Regression: with no committed search query, Esc must NOT close the screen.
+// The help bar advertises only `q quit`, so Esc quitting silently was a bug
+// that surfaced as accidental exits when users hit Esc to "back out" of the UI.
+func TestEscWithoutQueryIsNoOp(t *testing.T) {
+	apps := []model.CareerApplication{
+		{Company: "Stripe", Role: "Backend Engineer", Status: "Evaluated", Score: 4.6, HasScore: true},
+	}
+
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), apps, model.PipelineMetrics{Total: len(apps)}, "..", 120, 40)
+	if pm.searchQuery != "" {
+		t.Fatalf("setup expected empty search query, got %q", pm.searchQuery)
+	}
+
+	pm, cmd := pm.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd != nil {
+		// PipelineClosedMsg used to fire here; ensure it doesn't anymore.
+		if msg := cmd(); msg != nil {
+			if _, ok := msg.(PipelineClosedMsg); ok {
+				t.Fatalf("expected Esc with no query to be a no-op, got PipelineClosedMsg")
+			}
+			t.Fatalf("expected Esc with no query to return nil cmd, got %T", msg)
+		}
+	}
+	if pm.searchInput {
+		t.Fatal("Esc with no query should not toggle searchInput")
+	}
+}
+
+// Regression: typing during search input must not synchronously fan out to
+// loadCurrentReport. Reading reports per keystroke caused visible UI lag, so
+// the load is deferred to commit (Enter) / cancel (Esc) instead.
+func TestSearchTypingDoesNotLoadReports(t *testing.T) {
+	apps := []model.CareerApplication{
+		{Company: "Stripe", Role: "Backend Engineer", Status: "Evaluated", Score: 4.6, HasScore: true, ReportPath: "reports/001-stripe.md"},
+		{Company: "Anthropic", Role: "AI Engineer", Status: "Evaluated", Score: 4.8, HasScore: true, ReportPath: "reports/002-anthropic.md"},
+	}
+
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), apps, model.PipelineMetrics{Total: len(apps)}, "..", 120, 40)
+
+	pm, _ = pm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	if !pm.searchInput {
+		t.Fatal("expected `/` to open search input")
+	}
+
+	// Typing must not trigger PipelineLoadReportMsg.
+	for _, r := range "stri" {
+		var cmd tea.Cmd
+		pm, cmd = pm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		if cmd != nil {
+			if msg := cmd(); msg != nil {
+				if _, ok := msg.(PipelineLoadReportMsg); ok {
+					t.Fatalf("typing rune %q should not emit PipelineLoadReportMsg", string(r))
+				}
+			}
+		}
+	}
+
+	// Backspace must not trigger PipelineLoadReportMsg either.
+	pm, cmd := pm.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	if cmd != nil {
+		if msg := cmd(); msg != nil {
+			if _, ok := msg.(PipelineLoadReportMsg); ok {
+				t.Fatal("Backspace during search input should not emit PipelineLoadReportMsg")
+			}
+		}
+	}
+
+	// Ctrl+U must not trigger PipelineLoadReportMsg either.
+	pm, cmd = pm.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	if cmd != nil {
+		if msg := cmd(); msg != nil {
+			if _, ok := msg.(PipelineLoadReportMsg); ok {
+				t.Fatal("Ctrl+U during search input should not emit PipelineLoadReportMsg")
+			}
+		}
+	}
+}
+
+func previewModelWith(t *testing.T, app model.CareerApplication) PipelineModel {
+	t.Helper()
+
+	pm := NewPipelineModel(
+		theme.NewTheme("catppuccin-mocha"),
+		[]model.CareerApplication{app},
+		model.PipelineMetrics{Total: 1},
+		"..",
+		120,
+		40,
+	)
+	pm.applyFilterAndSort()
+	pm.cursor = 0
+	return pm
+}
+
+// TestPreviewTruncatesTldrToTerminalCells verifies visible truncation across terminal widths and wide runes.
+// @param t The Go test context.
+// @returns No value.
+func TestPreviewTruncatesTldrToTerminalCells(t *testing.T) {
+	tests := []struct {
+		name       string
+		width      int
+		tldr       string
+		wantSuffix string
+	}{
+		{name: "latin at 80 columns", width: 80, tldr: strings.Repeat("a", 120), wantSuffix: "..."},
+		{name: "latin at 120 columns", width: 120, tldr: strings.Repeat("a", 120), wantSuffix: "..."},
+		{name: "latin at 160 columns", width: 160, tldr: strings.Repeat("a", 120), wantSuffix: strings.Repeat("a", 120)},
+		{name: "wide runes at 80 columns", width: 80, tldr: strings.Repeat("界", 117) + "...", wantSuffix: "..."},
+		{name: "wide runes at 120 columns", width: 120, tldr: strings.Repeat("界", 117) + "...", wantSuffix: "..."},
+		{name: "wide runes at 160 columns", width: 160, tldr: strings.Repeat("界", 117) + "...", wantSuffix: "..."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := model.CareerApplication{
+				Company:    "Acme",
+				Role:       "Agent Engineer",
+				ReportPath: "reports/001-acme.md",
+			}
+			pm := previewModelWith(t, app)
+			pm.width = tt.width
+			pm.reportCache[app.ReportPath] = reportSummary{tldr: tt.tldr}
+
+			var tldrLine string
+			for _, line := range strings.Split(ansi.Strip(pm.renderPreview()), "\n") {
+				if strings.Contains(line, "TL;DR: ") {
+					tldrLine = line
+					break
+				}
+			}
+			if tldrLine == "" {
+				t.Fatal("expected preview to include the cached TL;DR")
+			}
+			if got := ansi.StringWidth(tldrLine); got > tt.width {
+				t.Fatalf("TL;DR line is %d cells, wider than terminal width %d: %q", got, tt.width, tldrLine)
+			}
+			if !strings.HasSuffix(strings.TrimRight(tldrLine, " "), tt.wantSuffix) {
+				t.Fatalf("TL;DR line should end with %q, got %q", tt.wantSuffix, tldrLine)
+			}
+		})
+	}
+}
+
+func TestPreviewKeepsDiscardReasonWhenTlDrIsCached(t *testing.T) {
+	app := model.CareerApplication{
+		Company:    "Acme",
+		Role:       "Backend Engineer",
+		Status:     "Descartado 2026-03-12",
+		Notes:      "took too long to respond",
+		ReportPath: "reports/001-acme.md",
+	}
+	pm := previewModelWith(t, app)
+	pm.reportCache[app.ReportPath] = reportSummary{tldr: "great team, fast pace"}
+
+	preview := pm.renderPreview()
+
+	if !strings.Contains(preview, "great team, fast pace") {
+		t.Fatalf("expected preview to keep the cached TL;DR, got %q", preview)
+	}
+	// Regression for #787: before the Outcome line, a cached TL;DR replaced the
+	// notes entirely and the discard reason disappeared from the preview.
+	if !strings.Contains(preview, "took too long to respond") {
+		t.Fatalf("expected preview to keep the discard reason alongside the TL;DR, got %q", preview)
+	}
+	if !strings.Contains(preview, "Descartado 2026-03-12") {
+		t.Fatalf("expected preview to show the closing status, got %q", preview)
+	}
+}
+
+func TestPreviewOutcomeShownWithoutReportSummary(t *testing.T) {
+	pm := previewModelWith(t, model.CareerApplication{
+		Company: "Beta",
+		Role:    "Platform Engineer",
+		Status:  "SKIP",
+		Notes:   "geo blocker",
+	})
+
+	preview := pm.renderPreview()
+
+	if !strings.Contains(preview, "Outcome:") || !strings.Contains(preview, "geo blocker") {
+		t.Fatalf("expected outcome line with notes for skipped app, got %q", preview)
+	}
+	if strings.Count(preview, "geo blocker") != 1 {
+		t.Fatalf("expected notes to appear exactly once, got %q", preview)
+	}
+}
+
+func TestPreviewOutcomeOmittedForActiveApps(t *testing.T) {
+	app := model.CareerApplication{
+		Company:    "Gamma",
+		Role:       "AI Engineer",
+		Status:     "Applied 2026-04-01",
+		Notes:      "warm intro via referral",
+		ReportPath: "reports/003-gamma.md",
+	}
+	pm := previewModelWith(t, app)
+	pm.reportCache[app.ReportPath] = reportSummary{tldr: "strong fit"}
+
+	preview := pm.renderPreview()
+
+	if strings.Contains(preview, "Outcome:") {
+		t.Fatalf("expected no outcome line for an active app, got %q", preview)
+	}
+}
+
+func TestPreviewOutcomeForStatusWithoutNotes(t *testing.T) {
+	pm := previewModelWith(t, model.CareerApplication{
+		Company: "Delta",
+		Role:    "SRE",
+		Status:  "**Rejected** 2026-05-02",
+	})
+
+	preview := pm.renderPreview()
+
+	if !strings.Contains(preview, "Rejected 2026-05-02") {
+		t.Fatalf("expected outcome to show the bare closing status, got %q", preview)
+	}
+	if strings.Contains(preview, "Loading preview...") {
+		t.Fatalf("expected outcome line to replace the loading placeholder, got %q", preview)
+	}
+}
+
+func TestWithReloadedDataPreservesCursorWhenAppRemoved(t *testing.T) {
+	initialApps := []model.CareerApplication{
+		{
+			Company:    "Acme",
+			Role:       "Backend Engineer",
+			Status:     "Applied",
+			Score:      4.2,
+			HasScore:   true,
+			ReportPath: "reports/001-acme.md",
+		},
+		{
+			Company:    "Beta",
+			Role:       "Platform Engineer",
+			Status:     "Applied",
+			Score:      4.6,
+			HasScore:   true,
+			ReportPath: "reports/002-beta.md",
+		},
+		{
+			Company:    "Gamma",
+			Role:       "AI Engineer",
+			Status:     "Applied",
+			Score:      4.8,
+			HasScore:   true,
+			ReportPath: "reports/003-gamma.md",
+		},
+	}
+
+	pm := NewPipelineModel(
+		theme.NewTheme("catppuccin-mocha"),
+		initialApps,
+		model.PipelineMetrics{Total: len(initialApps)},
+		"..",
+		120,
+		40,
+	)
+	pm.activeTab = tabIndexForFilter(t, filterApplied)
+	pm.applyFilterAndSort()
+	pm.cursor = 1
+
+	refreshedApps := []model.CareerApplication{
+		initialApps[0],
+		{
+			Company:    "Beta",
+			Role:       "Platform Engineer",
+			Status:     "Rejected", // Changed!
+			Score:      4.6,
+			HasScore:   true,
+			ReportPath: "reports/002-beta.md",
+		},
+		initialApps[2],
+	}
+
+	reloaded := pm.WithReloadedData(refreshedApps, model.PipelineMetrics{Total: len(refreshedApps)})
+
+	if got := len(reloaded.filtered); got != 2 {
+		t.Fatalf("expected 2 filtered apps after refresh, got %d", got)
+	}
+	if reloaded.cursor < 0 || reloaded.cursor >= len(reloaded.filtered) {
+		t.Fatalf("expected cursor to be within [0, %d], got %d", len(reloaded.filtered)-1, reloaded.cursor)
+	}
+}
+
+// Regression: the viewer status path starts the discard reason picker (or the
+// hired celebration) on the pipeline model and then immediately reloads data.
+// WithReloadedData must carry that in-progress flow state over — wiping it
+// meant picking Discarded/SKIP from the report viewer never showed the reason
+// picker and never persisted the status change.
+func TestWithReloadedDataPreservesDiscardAndHiredFlow(t *testing.T) {
+	apps := []model.CareerApplication{
+		{
+			Company:      "Acme",
+			Role:         "Backend Engineer",
+			Status:       "Evaluated",
+			Score:        4.2,
+			HasScore:     true,
+			ReportPath:   "reports/001-acme.md",
+			ReportNumber: "1",
+		},
+	}
+
+	pm := NewPipelineModel(theme.NewTheme("catppuccin-mocha"), apps, model.PipelineMetrics{Total: len(apps)}, "..", 120, 40)
+	pm.applyFilterAndSort()
+
+	pm, _ = pm.StartDiscardReasonFlow(apps[0], "SKIP")
+	pm.discardCursor = 2
+	pm.discardCustomInput = true
+	pm.discardCustomText = "typed"
+	pm.hiredApp = apps[0]
+	pm.hiredStep = 1
+
+	reloaded := pm.WithReloadedData(apps, model.PipelineMetrics{Total: len(apps)})
+
+	if !reloaded.discardPicker {
+		t.Fatal("discardPicker = false, want true (reason picker must survive reload)")
+	}
+	if reloaded.discardPendingStatus != "SKIP" {
+		t.Fatalf("discardPendingStatus = %q, want SKIP", reloaded.discardPendingStatus)
+	}
+	if reloaded.discardPendingApp.Company != "Acme" {
+		t.Fatalf("discardPendingApp lost: %+v", reloaded.discardPendingApp)
+	}
+	if len(reloaded.discardOptions) == 0 {
+		t.Fatal("discardOptions were wiped by reload")
+	}
+	if reloaded.discardCursor != 2 || !reloaded.discardCustomInput || reloaded.discardCustomText != "typed" {
+		t.Fatalf("discard cursor/custom-input lost: cursor=%d customInput=%v customText=%q",
+			reloaded.discardCursor, reloaded.discardCustomInput, reloaded.discardCustomText)
+	}
+	if reloaded.discardPredictedCount != pm.discardPredictedCount {
+		t.Fatalf("discardPredictedCount = %d, want %d", reloaded.discardPredictedCount, pm.discardPredictedCount)
+	}
+	if reloaded.hiredStep != 1 || reloaded.hiredApp.Company != "Acme" {
+		t.Fatalf("hired flow lost: step=%d app=%+v", reloaded.hiredStep, reloaded.hiredApp)
+	}
+}
+
+func TestGetStatusPairsPinsCurrentStatusToFront(t *testing.T) {
+	base := getStatusPairs("")
+
+	ordered := getStatusPairs("applied")
+	if ordered[0].Canonical != "Applied" {
+		t.Fatalf("ordered[0].Canonical = %q, want Applied", ordered[0].Canonical)
+	}
+	if len(ordered) != len(base) {
+		t.Fatalf("len(ordered) = %d, want %d (no entries added or dropped)", len(ordered), len(base))
+	}
+
+	// The rest of the list keeps its original relative order.
+	var restGotWithoutApplied []string
+	for _, pair := range ordered[1:] {
+		restGotWithoutApplied = append(restGotWithoutApplied, pair.Canonical)
+	}
+	var restWant []string
+	for _, pair := range base {
+		if pair.Canonical != "Applied" {
+			restWant = append(restWant, pair.Canonical)
+		}
+	}
+	if strings.Join(restGotWithoutApplied, ",") != strings.Join(restWant, ",") {
+		t.Fatalf("rest of list reordered: got %v, want %v", restGotWithoutApplied, restWant)
+	}
+}
+
+func TestGetStatusPairsUnrecognizedStatusFallsBackToStaticOrder(t *testing.T) {
+	base := getStatusPairs("")
+	got := getStatusPairs("some-unmapped-status")
+
+	for i := range base {
+		if got[i].Canonical != base[i].Canonical {
+			t.Fatalf("got[%d].Canonical = %q, want %q (static order)", i, got[i].Canonical, base[i].Canonical)
+		}
 	}
 }

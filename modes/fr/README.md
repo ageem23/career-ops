@@ -9,7 +9,7 @@ Utilise `modes/fr/` si au moins une de ces conditions est remplie :
 - Tu postules principalement a des **offres d'emploi en francais** (Welcome to the Jungle, Indeed FR, APEC, Pole emploi / France Travail, LinkedIn FR, sites carrieres)
 - Ton **CV est en francais** ou tu alternes entre FR et EN selon l'offre
 - Tu as besoin de reponses et lettres de motivation en **francais tech naturel**, pas traduit par une machine
-- Tu dois gerer des **specificites contractuelles francophones** : convention collective, RTT, mutuelle, prevoyance, 13e mois, periode d'essai, preavis, cheques-dejeuner, interessement/participation
+- Tu dois gerer des **specificites contractuelles francophones** : convention collective, RTT, mutuelle, prevoyance, 13e mois, periode d'essai, preavis, cheques-dejeuner, interessement/participation, portage salarial
 
 Si la plupart de tes offres sont en anglais, reste sur les modes standard dans `modes/`. Les modes anglais fonctionnent pour les offres francophones, mais ne connaissent pas les specificites du marche francophone en detail.
 
@@ -29,7 +29,7 @@ Ajoute dans `config/profile.yml` :
 
 ```yaml
 language:
-  primary: fr
+  output: fr
   modes_dir: modes/fr
 ```
 
@@ -42,11 +42,11 @@ Cette premiere iteration couvre les quatre modes a plus fort impact :
 | Fichier | Traduit depuis | Role |
 |---------|----------------|------|
 | `_shared.md` | `modes/_shared.md` (EN) | Contexte partage, archetypes, regles globales, specificites marche francophone |
-| `offre.md` | `modes/oferta.md` (ES) | Evaluation complete d'une offre (Blocs A-F) |
+| `offre.md` | `modes/oferta.md` (ES) | Evaluation complete d'une offre (Blocs A-H) |
 | `postuler.md` | `modes/apply.md` (EN) | Assistant live pour remplir les formulaires de candidature |
 | `pipeline.md` | `modes/pipeline.md` (ES) | Inbox d'URLs / Second Brain pour les offres collectees |
 
-Les autres modes (`scan`, `batch`, `pdf`, `tracker`, `auto-pipeline`, `deep`, `contacto`, `ofertas`, `project`, `training`) restent en EN/ES. Leur contenu est surtout du tooling, des chemins et des commandes -- il doit rester independant de la langue.
+Les autres modes (`scan`, `batch`, `pdf`, `tracker`, `outcome`, `auto-pipeline`, `deep`, `contacto`, `ofertas`, `project`, `training`) restent en EN/ES. Leur contenu est surtout du tooling, des chemins et des commandes -- il doit rester independant de la langue.
 
 ## Ce qui reste en anglais
 
@@ -102,5 +102,5 @@ Pour ameliorer une traduction ou ajouter un mode :
 1. Ouvre une Issue avec ta proposition (voir `CONTRIBUTING.md`)
 2. Respecte le lexique ci-dessus pour garder le ton coherent
 3. Traduis de maniere idiomatique -- pas de traduction mot a mot
-4. Conserve les elements structurels (Blocs A-F, tableaux, blocs de code, instructions outils) a l'identique
+4. Conserve les elements structurels (Blocs A-H, tableaux, blocs de code, instructions outils) a l'identique
 5. Teste avec une vraie offre francophone (Welcome to the Jungle, APEC, Indeed FR) avant de soumettre la PR
