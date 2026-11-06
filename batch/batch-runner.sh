@@ -2075,11 +2075,14 @@ process_offer() {
       local question="${parsed_error:-Which agency did this posting come through?}"
       # A malformed/misattributed handoff stays held, never becomes retryable
       # and never supplies an agency answer for a different posting.
+      # A local:jds/ input reaches the worker as its frontmatter URL
+      # ($report_url), so the worker echoes that back; accept either.
       if ! node -e '
         const result = JSON.parse(process.argv[1]);
         process.exit(result.reason === "agency_confirmation" &&
-          result.url === process.argv[2] && String(result.id) === process.argv[3] ? 0 : 1);
-      ' "$worker_result_json" "$url" "$id"; then
+          (result.url === process.argv[2] || result.url === process.argv[4]) &&
+          String(result.id) === process.argv[3] ? 0 : 1);
+      ' "$worker_result_json" "$url" "$id" "${report_url:-$url}"; then
         question="Invalid confirmation handoff identity/reason; parent must inspect the job log and ask for this URL"
       fi
       local tracker_artifact="$TRACKER_DIR/$id.tsv"
@@ -2138,22 +2141,25 @@ process_offer() {
       if (( ${#skip_reports[@]} == 0 )); then
         skip_rule=$(node -e '
           const fs = require("fs");
-          const [json, url, id, tsv, reserved] = process.argv.slice(1);
+          const [json, url, id, tsv, reserved, reportUrl] = process.argv.slice(1);
           const flat = (s) => String(s).replace(/[\x00-\x1f\x7f]+/g, " ").replace(/ +/g, " ").trim();
+          // A local:jds/ input reaches the worker as its frontmatter URL
+          // (reportUrl), so the worker echoes that back; accept either.
+          const isThisPosting = (u) => u === url || u === reportUrl;
           const result = JSON.parse(json);
-          if (result.reason !== "dealbreaker" || result.url !== url || String(result.id) !== id) process.exit(1);
+          if (result.reason !== "dealbreaker" || !isThisPosting(result.url) || String(result.id) !== id) process.exit(1);
           if (typeof result.rule !== "string" || !flat(result.rule)) process.exit(1);
           const lines = fs.readFileSync(tsv, "utf8").replace(/\r\n/g, "\n").split("\n").filter(Boolean);
           if (lines.length !== 2) process.exit(1);
           const head = lines[0].split("\t");
           const row = lines[1].split("\t");
           const field = (name) => row[head.indexOf(name)] ?? "";
-          if (field("status") !== "SKIP" || field("url") !== url || !field("notes").startsWith("Dealbreaker: \"")) process.exit(1);
+          if (field("status") !== "SKIP" || !isThisPosting(field("url")) || !field("notes").startsWith("Dealbreaker: \"")) process.exit(1);
           // merge-tracker keeps the TSV num as the row id, so it must be the
           // number this runner reserved (zero padding aside).
           if (!/^\d+$/.test(field("num")) || Number(field("num")) !== Number(reserved)) process.exit(1);
           process.stdout.write(flat(result.rule));
-        ' "$worker_result_json" "$url" "$id" "$skip_tracker" "$report_num" 2>/dev/null) || skip_rule=""
+        ' "$worker_result_json" "$url" "$id" "$skip_tracker" "$report_num" "${report_url:-$url}" 2>/dev/null) || skip_rule=""
       fi
       if [[ -n "$skip_rule" ]]; then
         # Keep the reservation. The SKIP row uses this number and no report
