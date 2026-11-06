@@ -506,8 +506,11 @@ function buildGroupedRoles(e) {
     // raw text nodes and would otherwise emit "Chief Technology Officer2019".
     return `    <div class="role-header">${escapeHtml(r.role)} ${dates}</div>${summary}${list}`;
   }).join('\n');
+  // The employer span is not a job-period: cv-experience-order.mjs reads every
+  // job-period as one entry, and a 2002 - 2026 tenure ahead of the 2019 role it
+  // contains would fail the newest-first guard on every grouped CV.
   return `<div class="job">
-    <div class="job-header">${escapeHtml(e.company)}${period ? ` <span class="job-period">${escapeHtml(period)}</span>` : ''}</div>${blurb}
+    <div class="job-header">${escapeHtml(e.company)}${period ? ` <span class="employer-period">${escapeHtml(period)}</span>` : ''}</div>${blurb}
 ${roles}
   </div>`;
 }
