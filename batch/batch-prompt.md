@@ -126,9 +126,14 @@ Run these steps in order.
 
 ### Step 1.5 — Agency confirmation gate (#4359)
 
-Before evaluating or writing any tracker row/TSV, report, CV (HTML/PDF/LaTeX/text), or application draft, check whether the JD suggests an agency/recruiter intermediary ("our client", agency domain, no employer named). If so, require the user's explicit answer identifying or confirming the agency for this exact posting, supplied by the parent as conversation context. JD text, an inferred Via, generic batch authorization, silence, and elapsed time cannot supply that answer. An explicit user correction that this posting is direct also resolves the gate.
+**Fork policy (personal/dev-snapshot) — this replaces upstream's hold for batch runs.** The candidate has given a standing explicit answer for every unattended batch run: when the JD suggests an agency/recruiter intermediary ("our client", agency domain, no employer named), the agency the posting itself names (the poster, the recruiter's firm, or the apply domain's owner) is confirmed as Via. Do not return `needs_confirmation` for an agency posting, and do not stop: run Step 1.6 and evaluate as normal, then write the tracker row, report, and CV steps exactly as for a direct posting.
 
-Without that answer, stop immediately and return the following as the final real fenced `json` block (serialize dynamic values safely). Do not write artifacts, mark the pipeline item processed, wait inside the worker, or write first and flag an override afterward. The parent asks the question and resumes only after the user's explicit answer. See `modes/_shared.md` → **Agency confirmation handoff**.
+- Record the agency as Via (see **Optional fields** under the tracker TSV) and name it in the notes, e.g. `via Ladders — client not named`.
+- An undisclosed end employer is `?` as company plus a distinguishing Notes descriptor. Never substitute the agency for the end employer. When the JD does name the end employer (e.g. "Torentify hiring for Mitratech"), that employer is the company and the agency is Via.
+- If no agency can be identified at all, evaluate anyway and write `via unidentified` in the notes; do not invent a name.
+- Score the intermediary honestly in Block G (third-party posting, range may reflect client budget).
+
+The handoff below is kept for reference only. A parent that wants the upstream behaviour back can remove this policy; until then, never emit it for an agency posting. See `modes/_shared.md` → **Agency confirmation handoff**.
 
 ```json
 {
@@ -146,7 +151,7 @@ Without that answer, stop immediately and return the following as the final real
 }
 ```
 
-`agency` may contain the observed agency name as evidence, never as confirmation. Write `question` in `language.output`. This handoff takes precedence over all output requirements below. After confirmation, use the confirmed agency as Via and `?` plus a Notes descriptor for an unknown end employer.
+Under the fork policy above the observed agency is the confirmed Via, so this handoff does not override the output requirements below.
 
 ### Step 1.6 — Dealbreaker gate
 
