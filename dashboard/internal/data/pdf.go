@@ -208,6 +208,12 @@ func LoadPDFManifest(careerOpsPath string) PDFManifest {
 // every candidate would silently fall back to mtime ordering.
 var rePDFDate = regexp.MustCompile(`(\d{4}-\d{2}-\d{2})(?:-(?:cv|cover))?\.pdf$`)
 
+// reOverflowDraft matches the sibling draft generate-pdf.mjs writes when a
+// render runs over its page budget: {name}.overflow.pdf, then .overflow-2.pdf
+// and so on when that name is taken. The draft is the version the budget
+// rejected, kept for inspection only, and is never the PDF to open (#6377).
+var reOverflowDraft = regexp.MustCompile(`\.overflow(-\d+)?\.pdf$`)
+
 // ResolvePDFs returns candidate PDF paths (relative to careerOpsPath) for an
 // application, best match first.
 //
@@ -244,6 +250,9 @@ func ResolvePDFs(careerOpsPath string, app model.CareerApplication, manifest PDF
 	var matches []string
 	for _, p := range globbed {
 		base := strings.ToLower(filepath.Base(p))
+		if reOverflowDraft.MatchString(base) {
+			continue
+		}
 		if matchesCompanySlug(base, slug) {
 			if rel, err := filepath.Rel(careerOpsPath, p); err == nil {
 				matches = append(matches, filepath.ToSlash(rel))

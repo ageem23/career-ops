@@ -113,6 +113,8 @@ PAUSE_FILE="$BATCH_DIR/batch-runner.paused"
 THROTTLE_FILE="$BATCH_DIR/batch-runner.throttled"
 STATE_LOCK_DIR="$BATCH_DIR/.batch-state.lock"
 STATE_LOCK_PID_FILE="$STATE_LOCK_DIR/pid"
+STATE_LOCK_FLOCK_FILE="$BATCH_DIR/.batch-state.flock"
+STATE_LOCK_FLOCK=0
 STATE_LOCK_TIMEOUT_SECONDS=60
 # Persisted high-water mark for report numbers. Reconciled once per run against
 # the reports directory and batch-state.tsv; read/incremented per reservation so
@@ -156,6 +158,7 @@ RATE_LIMIT_SLEEP=300
 WORKER_TIMEOUT="${WORKER_TIMEOUT:-1800}"
 THIN_ACTION=webfetch   # webfetch | skip | browser-extract: what to do when the JD is still empty after the prefetch and the ATS API fallback
 BATCH_PAUSED=false
+EVIDENCE_FRESHNESS_JSON=""   # set once per run by check_evidence_freshness
 STATUS_ONLY=false
 STATUS_FULL=true
 WATCH_MODE=false
@@ -598,6 +601,10 @@ release_state_lock() {
 }
 
 run_with_state_lock() {
+  if [[ "$STATE_LOCK_FLOCK" == "1" ]]; then
+    run_with_state_flock "$@" || return $?
+    return 0
+  fi
   acquire_state_lock || return $?
 
   local status=0
@@ -608,6 +615,53 @@ run_with_state_lock() {
   fi
 
   release_state_lock
+  return "$status"
+}
+
+# The mkdir lock is only as atomic as mkdir(1). On Ubuntu 26.04 mkdir is uutils
+# coreutils, and before uutils 0.11.0 it checks that the directory is absent,
+# then creates it, and exits 0 when a racing mkdir made it in between. Two
+# workers both took the lock, reserved the same report number and rewrote
+# batch-state.tsv together, with nothing printed (#6362). flock(1) leaves the
+# excluding to the kernel. main() calls this once, before any worker starts,
+# so every worker takes the same lock. Without flock (stock macOS, Git Bash)
+# mkdir(1) is atomic and the mkdir lock stays, as it does on a file system
+# that refuses flock.
+select_state_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  if { flock -x -n 9; } 2>/dev/null 9>>"$STATE_LOCK_FLOCK_FILE"; then
+    STATE_LOCK_FLOCK=1
+  else
+    echo "WARN: flock cannot lock $STATE_LOCK_FLOCK_FILE; using the mkdir state lock." >&2
+  fi
+}
+
+# Polls every 0.1s up to STATE_LOCK_TIMEOUT_SECONDS, like the mkdir lock
+# (BusyBox flock has no -w). The lock lives on fd 9, open only inside this
+# function, so the workers, their CLI and the PDF painter never inherit it. A
+# program started inside the critical section does inherit it, and holds the
+# lock until it exits (9>&- would not stop that: bash saves fd 9 to another
+# descriptor that the program still gets), so start nothing long-lived there.
+# The lock file is never removed: a worker waiting on the old file and one
+# locking a new one would both get in.
+run_with_state_flock() {
+  local status=1 waited=0
+  local max_waits=$((STATE_LOCK_TIMEOUT_SECONDS * 10))
+  {
+    while true; do
+      if flock -x -n 9; then
+        status=0
+        "$@" || status=$?
+        break
+      fi
+      if (( waited >= max_waits )); then
+        echo "ERROR: Timed out waiting for state lock at $STATE_LOCK_FLOCK_FILE" >&2
+        break
+      fi
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+  } 9>>"$STATE_LOCK_FLOCK_FILE"
   return "$status"
 }
 
@@ -764,8 +818,12 @@ log_discard() {
 }
 
 
+# The mode a plain redirect gives a new file (0644 under umask 022). mktemp
+# creates 0600, and the state file keeps the mode it has always had.
+STATE_FILE_MODE=$(printf '%o' "$(( 0666 & ~0$(umask) ))")
+
 # Update or insert state for an offer.
-# Caller must hold STATE_LOCK_DIR while this runs.
+# Caller must hold the state lock (run_with_state_lock) while this runs.
 update_state_unlocked() {
   local id="$1" url="$2" status="$3" started="$4" completed="$5" report_num="$6" score="$7" error="$8" retries="$9"
 
@@ -783,7 +841,12 @@ update_state_unlocked() {
     init_state
   fi
 
-  local tmp="$STATE_FILE.tmp"
+  # A tmp file of its own per rewrite, beside the state file so mv stays a
+  # rename. With one shared $STATE_FILE.tmp, two rewrites that overlapped
+  # truncated and renamed each other's file: rows doubled and mv failed (#6362).
+  local tmp
+  tmp=$(mktemp "$STATE_FILE.tmp.XXXXXX") || return 1
+  chmod "$STATE_FILE_MODE" "$tmp" 2>/dev/null || true
   local row
   row=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "$id" "$url" "$status" "$started" "$completed" "$report_num" "$score" "$error" "$retries")
@@ -801,7 +864,10 @@ update_state_unlocked() {
     END { if (!found) print ENVIRON["STATE_ROW"] }
   ' "$STATE_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
 
-  mv "$tmp" "$STATE_FILE"
+  if ! mv -f "$tmp" "$STATE_FILE"; then
+    rm -f "$tmp"
+    return 1
+  fi
 }
 
 update_state() {
@@ -1392,6 +1458,7 @@ process_offer() {
   # requirements, which together exceed 80 stripped words.
   local prefetch_min_words=80
   local jd_prefetch_words=0
+  local jd_rescue_closed_note=""
   local jd_raw_file=""
   local curl_status=0
   if command -v curl >/dev/null 2>&1; then
@@ -1498,7 +1565,18 @@ process_offer() {
       # is thin or the rescued JD is longer, and it fails open (any failure leaves
       # the stripped text as is, and the checks below decide as before).
       if [[ -f "$BATCH_DIR/jd-rescue.mjs" && -s "$jd_raw_file" ]]; then
-        if _rs_line=$(node "$BATCH_DIR/jd-rescue.mjs" "$url" "$jd_raw_file" "$jd_file" "$jd_prefetch_words" 2>/dev/null); then
+        _rs_rc=0
+        _rs_line=$(node "$BATCH_DIR/jd-rescue.mjs" "$url" "$jd_raw_file" "$jd_file" "$jd_prefetch_words" "${current_url:-$url}" 2>/dev/null) || _rs_rc=$?
+        if [[ "$_rs_rc" -eq 3 ]]; then
+          # The ATS says the posting is closed: terminal, even though the page text may look like a JD.
+          jd_rescue_closed_note="posting closed (jd-rescue): $(printf '%s' "${_rs_line#*$'\t'}" | tr -c '[:print:]' ' ' | sed 's/^closed://; s/  */ /g')"
+          : > "$jd_file"
+          jd_prefetch_words=0
+        elif [[ "$_rs_rc" -eq 4 ]]; then
+          # The download landed on a different page than the offer URL: its text is not this posting's.
+          : > "$jd_file"
+          jd_prefetch_words=0
+        elif [[ "$_rs_rc" -eq 0 ]]; then
           IFS=$'\t' read -r _rs_words _rs_method <<< "$_rs_line"
           _rs_words="${_rs_words//[^0-9]/}"
           _rs_words="${_rs_words:-0}"
@@ -1578,15 +1656,28 @@ process_offer() {
   # text inside a shell command the worker composes. fetch-jd.mjs only talks to
   # the known ATS API hosts it resolves from the URL, so a private or unknown
   # host is a miss (exit 1), not a request.
+  local jd_closed_note="$jd_rescue_closed_note"
   local jd_api_words=0
-  if [[ ! -s "$jd_file" && -f "$PROJECT_DIR/fetch-jd.mjs" ]]; then
-    local jd_api_tmp
+  if [[ ! -s "$jd_file" && -z "$jd_closed_note" && -f "$PROJECT_DIR/fetch-jd.mjs" ]]; then
+    local jd_api_tmp jd_api_rc=0
     jd_api_tmp="$(mktemp "${TMPDIR:-/tmp}/batch-jd-api.XXXXXX")"
-    if node "$PROJECT_DIR/fetch-jd.mjs" "$url" > "$jd_api_tmp" 2>/dev/null; then
+    node "$PROJECT_DIR/fetch-jd.mjs" "$url" > "$jd_api_tmp" 2>/dev/null || jd_api_rc=$?
+    if [[ "$jd_api_rc" -eq 3 ]]; then
+      # Exit 3: the posting's own data says it is closed (validThrough in the past,
+      # closure text on the page, an ATS delisting flag). Do not fall back to
+      # WebFetch, which could read the JD from the page and score a closed role.
+      # The evidence is page text, so keep it to one short printable line.
+      jd_closed_note="posting closed (fetch-jd): $(head -c 160 "$jd_api_tmp" | tr -c '[:print:]' ' ' | sed 's/^CLOSED_POSTING //; s/  */ /g')"
+    elif [[ "$jd_api_rc" -eq 0 ]]; then
       jd_api_words=$(wc -w < "$jd_api_tmp" 2>/dev/null) || jd_api_words=0
       jd_api_words="${jd_api_words//[^0-9]/}"
       jd_api_words="${jd_api_words:-0}"
-      if [[ "$jd_api_words" -ge "$prefetch_min_words" ]]; then
+      if grep -q 'Job description truncated here: the posting is longer than' "$jd_api_tmp" 2>/dev/null; then
+        # fetch-jd.mjs marked this text as cut short. Scoring and archiving it
+        # would treat a partial JD as the whole posting, so leave the JD file
+        # empty and let the existing thin-JD handling decide what happens next.
+        echo "    ℹ️  JD prefetch: fetch-jd.mjs returned a truncated JD — not used as the full posting"
+      elif [[ "$jd_api_words" -ge "$prefetch_min_words" ]]; then
         cat "$jd_api_tmp" > "$jd_file"
         echo "    ℹ️  JD prefetch: ${jd_api_words} words from the ATS API (fetch-jd.mjs)"
       fi
@@ -1599,7 +1690,11 @@ process_offer() {
   # 'webfetch', changes nothing: the worker is told to WebFetch. Detection only
   # here; the skip is recorded after the "Processing offer" line below.
   local jd_thin_skip=0 jd_thin_note="" jd_thin_retryable=0
-  if [[ ! -s "$jd_file" && "$THIN_ACTION" != "webfetch" ]]; then
+  if [[ -n "$jd_closed_note" ]]; then
+    # A closed posting is terminal ('skipped', not retryable) whatever --thin-action says.
+    jd_thin_skip=1
+    jd_thin_note="$jd_closed_note"
+  elif [[ ! -s "$jd_file" && "$THIN_ACTION" != "webfetch" ]]; then
     if [[ "$THIN_ACTION" == "browser-extract" && -f "$PROJECT_DIR/browser-extract.mjs" ]]; then
       # Real-browser read: zero model tokens, ~5-15s of Chromium. Success is
       # compact JSON on stdout, a failure is exit 1 with a JSON error on stderr.
@@ -1781,6 +1876,17 @@ process_offer() {
     done
   fi
 
+
+  # The run-wide evidence freshness result (Step 1.7). The same text for every
+  # offer, so it keeps the resolved prompt byte-identical across the run.
+  if [[ -n "$EVIDENCE_FRESHNESS_JSON" ]]; then
+    {
+      printf '\n\n---\n\n'
+      printf '## Runtime: GitHub evidence freshness\n\n'
+      printf 'The runner ran `node evidence-freshness.mjs` once for this batch run. Its JSON output:\n\n'
+      printf '%s\n' "$EVIDENCE_FRESHNESS_JSON" | sed 's/^/    /'
+    } >> "$resolved_prompt"
+  fi
 
   # Build the launch command for the configured CLI.
   # For claude the model is resolved once per run from spend_tier unless --model
@@ -2392,6 +2498,26 @@ sweep_orphans() {
   fi
 }
 
+# GitHub evidence freshness (#5674): one check for the whole run, not one per
+# worker. The check makes a `gh search prs` call and its answer is the same for
+# every offer, so the runner makes it once and every worker reads the result
+# from its prompt. It is opt-in: with evidence_freshness.enabled not true it
+# reports status "disabled" without any network call, and workers get nothing.
+check_evidence_freshness() {
+  [[ -f "$PROJECT_DIR/evidence-freshness.mjs" ]] || return 0
+  local out status
+  out=$(node "$PROJECT_DIR/evidence-freshness.mjs" 2>/dev/null) || return 0
+  status=$(printf '%s\n' "$out" | sed -n 's/^  "status": "\(.*\)",$/\1/p')
+  [[ -z "$status" || "$status" == "disabled" ]] && return 0
+  EVIDENCE_FRESHNESS_JSON="$out"
+  if printf '%s\n' "$out" | grep -q '^  "stale": true,$'; then
+    echo "GitHub evidence: stale (checked once for this run; see each report header)"
+  else
+    echo "GitHub evidence: $status (checked once for this run)"
+  fi
+  echo ""
+}
+
 # Merge tracker additions into applications.md
 merge_tracker() {
   echo ""
@@ -2616,6 +2742,7 @@ main() {
   if [[ "$DRY_RUN" == "false" ]]; then
     acquire_lock
     rm -f "$PAUSE_FILE" "$THROTTLE_FILE"
+    select_state_lock
   fi
 
   init_state
@@ -2784,6 +2911,7 @@ main() {
     exit 0
   fi
 
+  check_evidence_freshness
   # --skip-pdf must not start a painter, even when the parent shell already opted in.
   if [[ "$SKIP_PDF" == "true" ]]; then
     unset CAREER_OPS_PDF_SHARED
