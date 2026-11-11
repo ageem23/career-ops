@@ -43,6 +43,10 @@ const args = process.argv.slice(2);
 let port = 3000;
 let host = "127.0.0.1";
 let autoOpen = true;
+// --prod builds the app and serves it with `next start` instead of `next dev`.
+// Dev mode compiles each page on first visit and runs React's development
+// checks on every render, which roughly doubles a large Pipeline page's load.
+let prod = false;
 
 for (let i = 0; i < args.length; i++) {
   const arg = args[i];
@@ -84,12 +88,15 @@ for (let i = 0; i < args.length; i++) {
     host = val;
   } else if (arg === "--no-open" || arg === "--noopen") {
     autoOpen = false;
+  } else if (arg === "--prod") {
+    prod = true;
   } else if (arg === "--help" || arg === "-h") {
     console.log("Usage: npm run ui [options]");
     console.log("Options:");
     console.log("  --port=<num>    Port to listen on (default: 3000)");
     console.log("  --host=<addr>   Host interface to bind to (default: 127.0.0.1)");
     console.log("  --no-open       Do not open the browser automatically");
+    console.log("  --prod          Build once, then serve the faster production build (npm run ui:prod)");
     process.exit(0);
   }
 }
@@ -114,7 +121,7 @@ console.log("\x1b[32m✓\x1b[0m Data root resolved: " + dataRoot);
 
 // Plan Next.js run and resolve bind host from CAREER_OPS_WEB_ALLOWED_HOSTS
 const plan = planNextRun({
-  command: "dev",
+  command: prod ? "start" : "dev",
   extra: host !== "127.0.0.1" ? ["-H", host, "-p", String(port)] : ["-p", String(port)],
   envValue: process.env.CAREER_OPS_WEB_ALLOWED_HOSTS,
 });
@@ -200,7 +207,25 @@ const childEnv = {
 // Spawn Next.js server directly via node executable (no shell parsing, avoiding shell escaping issues)
 const isWindows = process.platform === "win32";
 const serverScript = path.join(webDir, "server.mjs");
-const serverArgs = [serverScript, "dev", "-p", String(port)];
+// Built on every --prod launch, so the served build always matches the
+// checkout (a stale .next would hide fixes merged since the last build).
+if (prod) {
+  console.log("\x1b[1mBuilding the production web UI (next build)...\x1b[0m\n");
+  const webRequire = createRequire(path.join(webDir, "package.json"));
+  const nextManifest = webRequire.resolve("next/package.json");
+  const nextEntry = path.join(path.dirname(nextManifest), webRequire(nextManifest).bin.next);
+  const build = spawnSync(process.execPath, [nextEntry, "build"], {
+    cwd: webDir,
+    env: { ...childEnv, NEXT_TELEMETRY_DISABLED: "1" },
+    stdio: "inherit",
+  });
+  if (build.error || build.status !== 0) {
+    console.error(`\x1b[31mError:\x1b[0m next build failed${build.error ? `: ${build.error.message}` : ` with code ${build.status}`}. Run \`npm run ui\` for dev mode.`);
+    process.exit(1);
+  }
+}
+
+const serverArgs = [serverScript, prod ? "start" : "dev", "-p", String(port)];
 if (bindHost !== "127.0.0.1") {
   serverArgs.push("-H", bindHost);
 }

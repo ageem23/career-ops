@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { parsePdfManifestRows, pdfIndexEntryForReport, pdfPathForReport, reportNumberFromCell } from "../../src/lib/apply/cv-selection.mjs";
+import { parsePdfManifestRows, pdfIndexEntriesByReport, pdfIndexEntryForReport, pdfPathForReport, reportNumberFromCell } from "../../src/lib/apply/cv-selection.mjs";
 
 test("reportNumberFromCell only accepts markdown report links", () => {
   assert.equal(reportNumberFromCell("[010]"), null);
@@ -137,4 +137,31 @@ test("parsePdfManifestRows extracts structured entries and defaults missing kind
   assert.equal(rows[2].kind, "cv");
   assert.equal(rows[3].kind, "cv");
   assert.equal(rows[4].kind, "unknown");
+});
+
+// The Pipeline list asks for every tracker row's CV at once. Its one-pass map
+// must give each report the same answer pdfIndexEntryForReport gives alone:
+// first row of the wanted kind wins, empty path stays null, partial ids skip.
+test("pdfIndexEntriesByReport agrees with pdfIndexEntryForReport for every report", () => {
+  const index = [
+    "# report\tpdf\thtml\tformat\tdate\tkind",
+    "010\toutput/cover-010-acme.pdf\t\thtml\t2026-08-01\tcover",
+    "010\toutput/cv-010-acme.pdf\toutput/cv-010-acme.html\thtml\t2026-08-01\tcv",
+    "010\toutput/cv-010-acme-v2.pdf\t\thtml\t2026-08-02\tcv",
+    "011\t",
+    "012-stale\toutput/wrong.pdf",
+    "013\toutput/cover-013-acme.pdf",
+    "014\toutput/thing.pdf\t\t\t\tportfolio",
+  ].join("\n");
+
+  for (const kind of ["cv", "cover"]) {
+    const entries = pdfIndexEntriesByReport(index, kind);
+    for (const n of [10, 11, 12, 13, 14, 15]) {
+      const one = pdfIndexEntryForReport(index, n, kind);
+      const many = entries.get(n);
+      assert.deepEqual(many ? { found: true, ...many } : { found: false, path: null, html: null }, one, `${kind} ${n}`);
+    }
+  }
+  assert.deepEqual([...pdfIndexEntriesByReport(index).keys()], [10, 11]);
+  assert.deepEqual(pdfIndexEntriesByReport(index).get(10), { path: "output/cv-010-acme.pdf", html: "output/cv-010-acme.html" });
 });

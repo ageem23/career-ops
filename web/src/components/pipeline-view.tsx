@@ -467,8 +467,29 @@ export function PipelineView({
     });
   }, []);
 
-  function downloadCsv() {
-    const url = URL.createObjectURL(new Blob([trackerCsv(filtered)], { type: "text/csv;charset=utf-8" }));
+  // The page sends rows without Notes (see app/pipeline/page.tsx), so the
+  // export fetches them first. If that fails, the file is not downloaded:
+  // a CSV with every note silently blank would read as "no notes".
+  const [csvBusy, setCsvBusy] = useState(false);
+  const [csvError, setCsvError] = useState("");
+  async function downloadCsv() {
+    if (csvBusy) return;
+    setCsvBusy(true);
+    setCsvError("");
+    let notes: Map<string, string>;
+    try {
+      const res = await fetch("/api/tracker/notes", { cache: "no-store" });
+      if (!res.ok) throw new Error(String(res.status));
+      const body = (await res.json()) as { rows?: [string, string][] };
+      notes = new Map(Array.isArray(body.rows) ? body.rows : []);
+    } catch {
+      setCsvError("Could not load notes for the CSV. Try again.");
+      setCsvBusy(false);
+      return;
+    }
+    const rows = filtered.map((r) => ({ ...r, notes: notes.get(applicationKey(r)) ?? "" }));
+    setCsvBusy(false);
+    const url = URL.createObjectURL(new Blob([trackerCsv(rows)], { type: "text/csv;charset=utf-8" }));
     const link = document.createElement("a");
     link.href = url;
     link.download = trackerCsvFilename(tab, new Date());
@@ -675,13 +696,15 @@ export function PipelineView({
             <button
               type="button"
               onClick={downloadCsv}
-              disabled={isPending || filtered.length === 0}
+              disabled={isPending || csvBusy || filtered.length === 0}
+              aria-busy={csvBusy}
               title={`Download the ${filtered.length} row${filtered.length === 1 ? "" : "s"} shown as a CSV file`}
               className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border border-border bg-surface/60 px-3 py-2 text-sm text-muted transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-brand/40 disabled:cursor-not-allowed disabled:opacity-50 max-sm:min-h-[44px] max-sm:min-w-[44px] max-sm:justify-center max-sm:px-0"
             >
               <Download aria-hidden="true" className="size-4" />
-              <span className="max-sm:sr-only">Download CSV</span>
+              <span className="max-sm:sr-only">{csvBusy ? "Preparing CSV" : "Download CSV"}</span>
             </button>
+            {csvError && <span role="alert" className="text-xs text-red-500">{csvError}</span>}
           </div>
         )}
       </div>
