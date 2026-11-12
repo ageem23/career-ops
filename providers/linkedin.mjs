@@ -93,6 +93,9 @@ const SELECTORS = {
 // confirms the panel switched to the clicked card. Kept outside SELECTORS,
 // which is passed whole into page.evaluate and must stay serializable.
 const panelAboutForJob = id => `[componentkey="JobDetails_AboutTheJob_${id}"]`;
+// How long to wait for that section's skeleton to fill with text. Only slow
+// cards pay it; a loaded card resolves on the first poll.
+const JD_TEXT_TIMEOUT_MS = 20_000;
 
 const NOISE_LABELS = new Set([
   'more', 'show more', 'see more',
@@ -422,10 +425,15 @@ async function getCardJobIds(page) {
   ), { sel: SELECTORS.listingCard, prefix: SELECTORS.cardComponentKeyPrefix });
 }
 
-async function clickCard(page, index) {
-  return page.evaluate(({ sel, link, idx }) => {
-    const cards = document.querySelectorAll(sel);
-    const card = cards[idx];
+async function clickCard(page, index, jobId) {
+  return page.evaluate(({ sel, link, idx, id, prefix }) => {
+    // Locate the card by job id when known: the list can re-render while the
+    // searches run, and an index taken earlier can then point at a different
+    // card than the id the panel wait is keyed on.
+    const byId = id
+      ? document.querySelector(`div[data-job-id="${id}"], div[role="button"][componentkey="${prefix}${id}"]`)
+      : null;
+    const card = byId || document.querySelectorAll(sel)[idx];
     if (!card) return false;
     // Prefer the inner /jobs/view/ link — clicking the bare wrapper sometimes
     // hits a non-clickable parent on certain LinkedIn variants. The link click
@@ -433,7 +441,10 @@ async function clickCard(page, index) {
     const a = card.querySelector(link);
     (a || card).click();
     return true;
-  }, { sel: SELECTORS.listingCard, link: SELECTORS.cardJobsViewLink, idx: index });
+  }, {
+    sel: SELECTORS.listingCard, link: SELECTORS.cardJobsViewLink, idx: index,
+    id: jobId || null, prefix: SELECTORS.cardComponentKeyPrefix,
+  });
 }
 
 async function extractDetailFromPanel(page, jobId) {
@@ -445,6 +456,21 @@ async function extractDetailFromPanel(page, jobId) {
   const ready = jobId ? `${SELECTORS.panelCompany}, ${panelAboutForJob(jobId)}` : SELECTORS.panelCompany;
   await page.waitForSelector(ready, { state: 'visible', timeout: 5000 }).catch(() => {});
 
+  // Redesigned layout: the job-keyed JD section mounts first as a grey
+  // skeleton (empty placeholder bars, no text) and fills in later. The wait
+  // above passes on the skeleton, so with five searches loading at once
+  // ~15-30% of cards were read while still empty and dropped as "No JD text"
+  // (reproduced 2026-11-12: 16/125 empty at read time, 15 of them full 10s
+  // later). Wait for the section to mount AND hold text. The classic layout
+  // (div[data-job-id] cards) has no keyed section, so it is not waited on.
+  if (jobId) {
+    await page.waitForFunction(id => {
+      if (document.querySelector('div[data-job-id]')) return true;
+      const el = document.querySelector(`[componentkey="JobDetails_AboutTheJob_${id}"]`);
+      return !!el && (el.innerText || '').replace(/^\s*About the job\s*/, '').trim().length > 0;
+    }, jobId, { timeout: JD_TEXT_TIMEOUT_MS, polling: 250 }).catch(() => {});
+  }
+
   // Expand description if collapsed (best-effort; some panels render fully
   // expanded already, in which case the button isn't present).
   await page.evaluate(sel => {
@@ -453,7 +479,7 @@ async function extractDetailFromPanel(page, jobId) {
   }, SELECTORS.panelMoreButton);
   await sleep(500);
 
-  return page.evaluate(({ sel, noiseLabels, minLen }) => {
+  return page.evaluate(({ sel, noiseLabels, minLen, aboutKey }) => {
     // Redesigned layout: document.title is "<title> | <company> | LinkedIn"
     // and tracks the selected card — the company's only plain-text source.
     const docParts = document.title.split(' | ');
@@ -475,11 +501,16 @@ async function extractDetailFromPanel(page, jobId) {
     const applyEl = document.querySelector(sel.panelApply);
     const applicationUrl = applyEl?.href?.trim() ?? '';
 
-    const jdEl = document.querySelector(sel.panelJdContent);
+    // Prefer the section keyed to the clicked job, so a stale panel can never
+    // hand back another posting's description under this job's id.
+    const jdEl = (aboutKey && document.querySelector(aboutKey)) || document.querySelector(sel.panelJdContent);
     const jdText = (jdEl?.innerText?.trim() ?? '').replace(/^About the job\s*/, '');
 
     return { title, company, applicationUrl, jdText, url: window.location.href };
-  }, { sel: SELECTORS, noiseLabels: [...NOISE_LABELS], minLen: MIN_TITLE_LENGTH });
+  }, {
+    sel: SELECTORS, noiseLabels: [...NOISE_LABELS], minLen: MIN_TITLE_LENGTH,
+    aboutKey: jobId ? panelAboutForJob(jobId) : null,
+  });
 }
 
 
@@ -583,7 +614,7 @@ async function runSearch(page, entry) {
         seenJobIds.add(jobId);
       }
 
-      if (!await clickCard(page, i)) {
+      if (!await clickCard(page, i, jobId)) {
         warn(`  ✗ Could not click card ${i}`);
         continue;
       }
