@@ -13,6 +13,7 @@ import { editSaveStatus, inflightEdits, postWroteEdits, shouldPutAfterPost, shou
 import { SectionCard } from "./section-card";
 import { CvPreview } from "./cv-preview";
 import { CoverageMeter } from "./coverage-meter";
+import { AssistPanel } from "./assist-panel";
 
 type Loaded = { ok: true; reportNum: string; company: string; file: string; tree: BlockTree; doc: StudioDoc; edits: StudioEdits; stale: boolean; hasBase: boolean };
 type LoadState = { kind: "loading" } | { kind: "error"; reason: string } | { kind: "ready"; data: Loaded };
@@ -95,6 +96,16 @@ function Studio({ n, data }: { n: string; data: Loaded }) {
     editsRef.current = prev;
     dispatchEdit({ type: "replace", edits: prev });
   }, []);
+  // A prompt's changes land as one edit, so one Undo reverses the whole
+  // request. Applied to the latest edits, not the ones the request started
+  // from: the candidate may have clicked something while it ran.
+  const applyAssist = useCallback(
+    (actions: StudioAction[]) => {
+      const next = actions.reduce((e, a) => studioReducer(e, a, doc), latestEdits.current);
+      if (next !== latestEdits.current) recordEdit({ type: "replace", edits: next });
+    },
+    [doc, recordEdit],
+  );
   const [save, setSave] = useState<SaveState>({ kind: "idle" });
   const [autosaveError, setAutosaveError] = useState<string | null>(null);
   const resolved = useMemo(() => resolveStudio(doc, edits), [doc, edits]);
@@ -313,7 +324,8 @@ function Studio({ n, data }: { n: string; data: Loaded }) {
             <SectionCard key={s.id} n={n} section={s} edits={edits} hidden={resolved.view.hidden} dispatch={recordEdit} siblings={all.map((x) => x.id)} first={k === 0} last={k === all.length - 1} />
           ))}
         </div>
-        <div className="lg:sticky lg:top-4 lg:self-start">
+        <div className="space-y-4 lg:sticky lg:top-4 lg:self-start">
+          <AssistPanel n={n} edits={edits} onApply={applyAssist} />
           <CvPreview html={html} />
         </div>
       </div>

@@ -34,6 +34,12 @@ import { cvDiskState } from "@/lib/cv-disk-state.mjs";
 import { reportSpendActions } from "@/lib/report-spend-actions.mjs";
 import { applyPostingUrl } from "@/lib/posting-url.mjs";
 import { PageFrame } from "@/components/page-frame";
+import { DeepPromptActions } from "@/components/deep-prompt-actions";
+import { ResearchPanel } from "@/components/research-panel";
+import type { ReviewSidecar } from "@/lib/research-server";
+import { extractDeepPrompt } from "@/lib/deep-prompt.mjs";
+import { CvGateCard } from "@/components/cv-gate-card";
+import type { CvGateState } from "@/lib/cv-gate-server";
 
 // Progressive disclosure of the report. Current oferta.md writes letter F as
 // Interview Plan (STAR+R), not a verdict — never promote by letter (#3416).
@@ -56,6 +62,9 @@ export function ReportView({
   backHref = "/pipeline",
   applyHref,
   reportNum = null,
+  deepResearchUrl = "",
+  research = null,
+  cvGate = null,
 }: {
   id: string;
   app: Application | null;
@@ -75,6 +84,12 @@ export function ReportView({
   backHref?: string;
   applyHref?: string;
   reportNum?: number | null;
+  /** config/profile.yml deep_research.claude_url; "" opens a prefilled claude.ai chat. */
+  deepResearchUrl?: string;
+  /** Filed deep research and its review (research-server.ts researchContext). */
+  research?: { rel: string | null; text: string | null; review: ReviewSidecar | null } | null;
+  /** A tailored CV the content gates refused, awaiting the candidate's call (cv-gate-server.ts). */
+  cvGate?: CvGateState | null;
 }) {
   const meta = report ? parseReport(report) : null;
   const field = (label: string) => meta?.fields.find((f) => f.label === label)?.value;
@@ -91,6 +106,7 @@ export function ReportView({
   const spend = reportSpendActions(Boolean(report));
   const company = app ? companyPresentation(app) : null;
   const companyName = company?.label ?? app?.company ?? meta?.title ?? id;
+  const deepPrompt = extractDeepPrompt(report);
 
   return (
     <PageFrame className="max-w-3xl xl:max-w-5xl 2xl:max-w-[1600px]">
@@ -172,7 +188,7 @@ export function ReportView({
               <div className="mt-4 flex flex-wrap items-center gap-2.5 print:hidden">
                 {app && <StatusSelect n={id} current={app.status} />}
                 {spend.generateCv && (
-                  <GeneratePdfButton n={id} company={app?.company || meta?.title || id} onDisk={disk.exists} />
+                  <GeneratePdfButton n={id} company={app?.company || meta?.title || id} onDisk={disk.exists} gatePending={!!cvGate} />
                 )}
                 {app && report && <CoverDraftButton n={id} company={companyName} />}
                 {spend.checklist && applyHref && (
@@ -185,6 +201,7 @@ export function ReportView({
                 )}
                 <MarkPdfReadyButton reportNum={reportNum} ready={disk.exists} trackerMarked={trackerMarkedPdf} />
                 <ApplyButton n={id} url={applyUrl} company={companyName} pdfReady={disk.exists} quiet={quietApply} />
+                {deepPrompt && <DeepPromptActions prompt={deepPrompt} claudeUrl={deepResearchUrl} />}
                 {coverReady && (
                   <a
                     href={`/api/cover-pdf?application=${encodeURIComponent(id)}`}
@@ -198,11 +215,28 @@ export function ReportView({
                 {disk.note && <p className="basis-full text-sm text-muted">{disk.note}</p>}
               </div>
             );
+            const gateCard = cvGate && (
+              <div className="print:hidden">
+                <CvGateCard n={id} company={app?.company || meta?.title || id} error={cvGate.error} rows={cvGate.rows} />
+              </div>
+            );
+            const researchPanel = (deepPrompt || research?.text != null) && (
+              <ResearchPanel
+                n={id}
+                company={companyName}
+                currentScore={score ?? ""}
+                researchRel={research?.rel ?? null}
+                research={research?.text ?? null}
+                review={research?.review ?? null}
+              />
+            );
             if (sections.length === 0) {
               return (
                 <div className="mt-8 max-w-4xl">
                   {callout}
                   {actions}
+                  {gateCard}
+                  {researchPanel}
                   {app && canDelete && (
                     <div className="mt-8 border-t border-border pt-4 print:hidden">
                       <DeleteFromTracker n={id} />
@@ -219,6 +253,8 @@ export function ReportView({
               <div className="mt-8 max-w-4xl">
                 {callout}
                 {actions}
+                {gateCard}
+                {researchPanel}
                 {app && canDelete && (
                   <div className="mt-8 border-t border-border pt-4 print:hidden">
                     <DeleteFromTracker n={id} />

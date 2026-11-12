@@ -244,8 +244,12 @@ export function splitSections(body) {
   const sections = [];
   /** @type {{ heading: string, letter: string | null, lines: string[] } | null} */
   let cur = null;
+  // A "## " line inside a ``` fence is content, not a section break: the Deep
+  // Research Prompt section embeds a prompt scaffold with its own "## " title.
+  let inFence = false;
   for (const line of normalizeNewlines(body).split("\n")) {
-    const h = line.match(/^##\s+(.*)$/);
+    if (/^\s*```/.test(line)) inFence = !inFence;
+    const h = inFence ? null : line.match(/^##\s+(.*)$/);
     if (h) {
       if (cur) sections.push({ heading: cur.heading, letter: cur.letter, content: cur.lines.join("\n").trim() });
       const heading = h[1].trim();

@@ -124,6 +124,8 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
     persister.current?.save(jobs);
   }, [jobs]);
 
+  const startRef = useRef<((opts: StartOpts) => string | null) | null>(null);
+
   const patch = useCallback((id: string, fn: (j: Job) => Job) => {
     setJobs((js) => js.map((j) => (j.id === id ? fn(j) : j)));
   }, []);
@@ -239,7 +241,18 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
             }
           });
           if (completion.status === "error") {
-            finish("error", completion.message);
+            // The fact gate refused a first CV attempt: start ONE repair run,
+            // which rewrites only the flagged bullets. A refused repair carries
+            // no retry hint (and is marked here too), so this never loops.
+            const repair = completion.retry === "fact-check" && opts.kind === "pdf" && opts.brief?.repair !== "fact-check";
+            finish("error", repair ? `The CV checks refused some lines; started one automatic repair run. ${completion.message}` : completion.message);
+            if (repair) {
+              startRef.current?.({
+                ...opts,
+                subtitle: "repair: rewording the lines the CV checks flagged",
+                brief: { ...(opts.brief ?? {}), repair: "fact-check" },
+              });
+            }
             return;
           }
           doneTokens = completion.tokens ?? 0;
@@ -263,6 +276,12 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
     },
     [patch],
   );
+
+  // startJob calls itself for the fact-check repair run; a ref avoids a
+  // self-referencing useCallback.
+  useEffect(() => {
+    startRef.current = startJob;
+  }, [startJob]);
 
   const removeJob = useCallback((id: string) => setJobs((js) => js.filter((j) => j.id !== id)), []);
   const clearFinished = useCallback(() => setJobs((js) => js.filter((j) => j.status === "running")), []);

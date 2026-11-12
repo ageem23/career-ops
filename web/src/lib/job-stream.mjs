@@ -1,7 +1,10 @@
 /**
  * @typedef {{ type: "text", text: string } | { type: "tool", name: string } | { type: "status", label: string }} JobProgress
- * @typedef {{ status: "done", tokens?: number, costUsd?: number, reportN?: number } | { status: "gated", reason: (typeof EVALUATION_GATE_REASONS)[number], message: string, confirmationRequired: boolean, tokens?: number, costUsd?: number } | { status: "error", message: string }} JobCompletion
+ * @typedef {{ status: "done", tokens?: number, costUsd?: number, reportN?: number } | { status: "gated", reason: (typeof EVALUATION_GATE_REASONS)[number], message: string, confirmationRequired: boolean, tokens?: number, costUsd?: number } | { status: "error", message: string, retry?: "fact-check" }} JobCompletion
  */
+
+/** Repairs the server may name on an error event. "fact-check": a tailored CV the fact gate refused. */
+export const RETRY_KINDS = Object.freeze(["fact-check"]);
 
 /**
  * Read the /api/run NDJSON protocol. A closed connection is not proof that the
@@ -27,7 +30,10 @@ export async function readJobStream(stream, onProgress) {
       return { status: "error", message: "Invalid response from the local server. Check the pipeline before retrying." };
     }
     if (event?.type === "error") {
-      return { status: "error", message: typeof event.msg === "string" && event.msg ? event.msg : "Error" };
+      const message = typeof event.msg === "string" && event.msg ? event.msg : "Error";
+      // A failure the server knows how to repair names the repair; the job store
+      // decides whether to start it (once).
+      return RETRY_KINDS.includes(event.retry) ? { status: "error", message, retry: event.retry } : { status: "error", message };
     }
     if (event?.type === "gated") {
       if (!EVALUATION_GATE_REASONS.includes(event.reason)

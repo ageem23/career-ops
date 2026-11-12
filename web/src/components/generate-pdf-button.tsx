@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { FileDown, Loader2, FileText, RotateCcw, SlidersHorizontal, TriangleAlert } from "lucide-react";
@@ -15,7 +15,7 @@ const quietPill =
 
 // Fires the real career-ops `pdf` mode (worker kind "pdf") to generate an
 // ATS-optimized CV tailored to THIS offer → output/cv-… + marks the tracker.
-export function GeneratePdfButton({ n, company, onDisk }: { n: string; company: string; onDisk: boolean }) {
+export function GeneratePdfButton({ n, company, onDisk, gatePending = false }: { n: string; company: string; onDisk: boolean; gatePending?: boolean }) {
   const { jobs, startJob } = useJobs();
   const router = useRouter();
   const listQuery = pipelineQuery(useSearchParams().toString());
@@ -34,6 +34,15 @@ export function GeneratePdfButton({ n, company, onDisk }: { n: string; company: 
     () => jobs.filter((j) => j.kind === "pdf" && j.input === n).sort((a, b) => b.startedAt - a.startedAt)[0],
     [jobs, n],
   );
+  // A failed run can leave a refused CV for the review card (cv-gate-card.tsx),
+  // which is server-rendered: reload when a run ends in an error, not only on
+  // success (co-job-done above), or the card would wait for a manual refresh.
+  const status = job?.status;
+  const lastStatus = useRef(status);
+  useEffect(() => {
+    if (lastStatus.current === "running" && status === "error") router.refresh();
+    lastStatus.current = status;
+  }, [status, router]);
   const generate = () =>
     startJob({ title: `CV PDF · ${company}`, subtitle: "tailored for this role", kind: "pdf", input: n, page: `/pipeline/${n}` });
 
@@ -71,7 +80,7 @@ export function GeneratePdfButton({ n, company, onDisk }: { n: string; company: 
         >
           <RotateCcw className="size-3" />
         </button>
-        <FailureNote failure={state.failure} jobQuery={jobQuery} />
+        <FailureNote failure={state.failure} jobQuery={jobQuery} gatePending={gatePending} />
       </span>
     );
 
@@ -88,12 +97,21 @@ export function GeneratePdfButton({ n, company, onDisk }: { n: string; company: 
         <FileDown className="size-3.5" /> Generate tailored CV (PDF)
       </button>
       <CostBadge kind="spend" size="xs" />
-      <FailureNote failure={state.failure} jobQuery={jobQuery} />
+      <FailureNote failure={state.failure} jobQuery={jobQuery} gatePending={gatePending} />
     </span>
   );
 }
 
-function FailureNote({ failure, jobQuery }: { failure: PdfFailure; jobQuery: string }) {
+function FailureNote({ failure, jobQuery, gatePending }: { failure: PdfFailure; jobQuery: string; gatePending: boolean }) {
+  // The review card below the actions already explains a refused CV line by
+  // line; repeating the raw gate error here would bury the way forward.
+  if (gatePending) {
+    return (
+      <span role="status" className="inline-flex items-center gap-1 text-xs text-amber-800 dark:text-amber-400">
+        <TriangleAlert className="size-3.5 shrink-0" /> CV not saved yet. Review the flagged lines below.
+      </span>
+    );
+  }
   if (!failure) return null;
   return (
     <Link

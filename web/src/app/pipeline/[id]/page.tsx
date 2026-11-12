@@ -7,6 +7,9 @@ import { reportNumberFor } from "@/lib/apply-checklist.mjs";
 import { readCvDiskState } from "@/lib/read-cv-disk";
 import { parseReport } from "@/lib/format";
 import { missingTrackedJob } from "@/lib/job-route.mjs";
+import { readDeepResearchUrl } from "@/lib/deep-prompt-server";
+import { researchContext } from "@/lib/research-server";
+import { cvGateState } from "@/lib/cv-gate-server";
 
 export const dynamic = "force-dynamic";
 
@@ -30,6 +33,7 @@ export default async function ReportPage({ params, searchParams }: {
   const reportNum = reportNumberFor(id, app, report?.file ?? null);
   const disk = await readCvDiskState(id, companyName, (app?.pdf ?? "").includes("✅"), reportNum);
   const pdfFileReady = disk.exists;
+  const research = researchContext(id);
   return (
     <ReportView
       id={id}
@@ -43,6 +47,9 @@ export default async function ReportPage({ params, searchParams }: {
       backHref={`/pipeline${query ? `?${query}` : ""}`}
       applyHref={`/pipeline/${encodeURIComponent(id)}/apply${query ? `?${query}` : ""}`}
       reportNum={reportNum}
+      deepResearchUrl={readDeepResearchUrl()}
+      research={{ rel: research.researchRel, text: research.research, review: research.review }}
+      cvGate={report ? cvGateState(id) : null}
     />
   );
 }

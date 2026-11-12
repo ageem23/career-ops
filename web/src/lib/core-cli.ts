@@ -18,26 +18,33 @@ const CORE_CLI_TIMEOUT_MS = 30_000;
 const LOCK_WAIT_DEFAULT_MS = 10_000;
 const LOCK_WAIT_CEILING_MS = CORE_CLI_TIMEOUT_MS - 5_000;
 
-function boundedLockWait(): Record<string, string> {
+function boundedLockWait(timeoutMs = CORE_CLI_TIMEOUT_MS): Record<string, string> {
   const raw = Number(process.env.CAREER_OPS_TRACKER_LOCK_TIMEOUT_MS);
   const requested = Number.isFinite(raw) && raw > 0 ? raw : LOCK_WAIT_DEFAULT_MS;
-  const wait = String(Math.min(requested, LOCK_WAIT_CEILING_MS));
+  const ceiling = timeoutMs === CORE_CLI_TIMEOUT_MS ? LOCK_WAIT_CEILING_MS : timeoutMs - 5_000;
+  const wait = String(Math.min(requested, ceiling));
   // followup-seed.mjs takes the follow-ups lock, with its own timeout variable.
   return { CAREER_OPS_TRACKER_LOCK_TIMEOUT_MS: wait, CAREER_OPS_FOLLOWUPS_LOCK_TIMEOUT_MS: wait };
 }
 
 export type CliResult = { code: number; stdout: string; stderr: string; spawnFailed: boolean; timedOut: boolean };
 
-export function runCoreCli(script: string, args: string[], opts?: { signal?: AbortSignal }): Promise<CliResult> {
+/**
+ * `timeoutMs` raises the kill timeout for a script that is slow by design:
+ * merge-tracker.mjs reads every tracked row's report, which on a large tracker
+ * (thousands of rows, OneDrive-synced) takes longer than the 30 s default.
+ */
+export function runCoreCli(script: string, args: string[], opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<CliResult> {
+  const timeoutMs = opts?.timeoutMs && opts.timeoutMs > CORE_CLI_TIMEOUT_MS ? opts.timeoutMs : CORE_CLI_TIMEOUT_MS;
   return new Promise((resolve) => {
     execFile(
       process.execPath,
       [rootScript(script), ...args],
       {
         cwd: resolveCodeRoot(process.cwd(), process.env),
-        timeout: CORE_CLI_TIMEOUT_MS,
+        timeout: timeoutMs,
         signal: opts?.signal,
-        env: { ...process.env, ...boundedLockWait() },
+        env: { ...process.env, ...boundedLockWait(timeoutMs) },
         // windowsHide: see api/doctor/route.ts — a stale inherited console
         // kills every child with 0xC0000142 on Windows; never inherit one.
         windowsHide: true,

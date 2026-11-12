@@ -18,7 +18,7 @@
  * @typedef {{id: string, tailored: string, base: string|null, change: Change, similarity: number,
  *            keywords: {tailored: string[], base: string[]}, drivenBy: string[]}} StudioBullet
  * @typedef {{text: string, keywords: string[]}} Restorable
- * @typedef {{id: string, kind: "entry"|"tag"|"text", label: string, ownKeywords: string[],
+ * @typedef {{id: string, kind: "entry"|"role"|"tag"|"text", label: string, ownKeywords: string[],
  *            bullets: StudioBullet[], restorable: Restorable[]}} StudioItem
  * @typedef {{id: string, title: string, kind: string, items: StudioItem[]}} StudioSection
  * @typedef {{sourceHash: string, keywords: string[], fixedKeywords: string[], sections: StudioSection[]}} StudioDoc
@@ -83,6 +83,28 @@ export function alignBullets(tailored, base) {
   return { pairs, scores, unused: base.map((_, j) => j).filter((j) => !taken.has(j)) };
 }
 
+const comparableTitle = (t) => String(t ?? "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+
+/**
+ * The cv.md bullets a tailored item restates: an employer's bullets, narrowed
+ * to one role when the item is a role of a grouped employer and cv.md has
+ * that role; a bullet-only section's bullets from cv.md's section of the same
+ * title (Key Achievements).
+ */
+function originalsFor(section, item, base) {
+  if (section.kind === "highlights") {
+    return (base.lists ?? []).find((l) => comparableTitle(l.title) === comparableTitle(section.title))?.bullets ?? [];
+  }
+  if (section.kind !== "experience" || (item.kind !== "entry" && item.kind !== "role")) return [];
+  const entry = base.entries.find((e) => sameCompany(e.company, item.company ?? item.label));
+  if (!entry) return [];
+  if (item.kind === "role" && item.role && entry.roles?.length) {
+    const role = entry.roles.find((r) => comparableTitle(r.title) === comparableTitle(item.role));
+    if (role) return role.bullets;
+  }
+  return entry.bullets;
+}
+
 /**
  * @param {{tree: BlockTree, base: BaseCv, keywords: string[], sourceHash: string,
  *          keywordsIn: (text: string) => string[], itemText: (itemId: string) => string, fixedText: string}} input
@@ -106,8 +128,7 @@ export function buildStudioDoc({ tree, base, keywords, sourceHash, keywordsIn, i
         const original = base.summary;
         return { id: item.id, kind: item.kind, label: item.label, ownKeywords, bullets: [bullet(b, original, original ? similarity(b.text, original) : 0)], restorable: [] };
       }
-      const entry = item.kind === "entry" && s.kind === "experience" ? base.entries.find((e) => sameCompany(e.company, item.label)) : undefined;
-      const originals = entry?.bullets ?? [];
+      const originals = originalsFor(s, item, base);
       const { pairs, scores, unused } = alignBullets(item.bullets.map((b) => b.text), originals);
       return {
         id: item.id,

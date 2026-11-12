@@ -16,6 +16,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { dataFolderMissingMessage } from "./core/data-root.mjs";
+import { isContentGateFailure } from "./cv-gate.mjs";
 
 /**
  * @typedef {Object} PdfRunSignals
@@ -281,7 +282,117 @@ export function keepTailoredHtml(pdfPaths, warnings) {
  * @typedef {Object} RenderFailedResult
  * @property {"render-failed"} kind
  * @property {string} error
+ * @property {boolean} [factCheck] - The fact gate refused the CV, and the failed
+ *   HTML and the gate's findings were kept for one repair run (see keepForRepair).
+ * @property {{pages: number, max: number}} [pageBudget] - The CV rendered over its
+ *   page budget; the HTML was kept for the review card (no automatic repair).
  */
+
+/**
+ * The page budget a render went over, from generate-pdf.mjs's own message
+ * ("CV is 3 pages; the allowed maximum is 2 pages."), or null.
+ * @param {string} stderr
+ * @returns {{pages: number, max: number} | null}
+ */
+export function pageBudgetOf(stderr) {
+  const m = /CV is (\d+) pages?; the allowed maximum is (\d+) pages?\./.exec(String(stderr ?? ""));
+  return m ? { pages: Number(m[1]), max: Number(m[2]) } : null;
+}
+
+/** The review card's one row for an over-budget CV (same shape as cv-gate.mjs findings). */
+export function pageBudgetRow({ pages, max }) {
+  return {
+    id: "f1",
+    kind: "pages",
+    line: "",
+    words: [],
+    source: null,
+    why: `The CV came out at ${pages} pages, and your limit is ${max} (cv.max_pages in config/profile.yml). Nothing was cut.`,
+    allow: { type: "pages", value: pages, label: `Allow ${pages} pages from now on` },
+    editable: false,
+    state: "pending",
+  };
+}
+
+/** How long a kept fact-check failure stays usable by a repair run. */
+export const REPAIR_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * Where a refused CV and the gate's findings are kept for the repair run.
+ * Named outside the `cv-web-{n}.` prefix so the per-run scratch sweep does not
+ * delete them; a successful render of the same report sweeps them instead.
+ * @param {string} scratchDir
+ * @param {string} reportNum
+ */
+export function repairPaths(scratchDir, reportNum) {
+  return {
+    html: path.join(scratchDir, `cv-repair-${reportNum}.html`),
+    findings: path.join(scratchDir, `cv-repair-${reportNum}.txt`),
+    rows: path.join(scratchDir, `cv-repair-${reportNum}.json`),
+  };
+}
+
+/**
+ * Is this render failure a content gate refusing the CV: the fact gate
+ * (verify-cv-facts.mjs) or the voice check (cv-voice.mjs)? Both are fixed by
+ * changing the CV's wording, which is what makes them repairable.
+ */
+export function isFactCheckFailure(error) {
+  return isContentGateFailure(error);
+}
+
+/**
+ * Keep the refused HTML and the gate's full findings (the user-facing error is
+ * truncated; the repair worker needs every finding). Returns false when either
+ * file could not be written, so the caller does not offer a repair it cannot run.
+ * @param {{html: string, reportNum?: string}} pdfPaths
+ * @param {string} reportNum
+ * @param {string} findings
+ * @param {{rows?: object[] | null, format?: string}} [extra] - structured findings
+ *   (cv-gate.mjs) and the page format, for the review card's re-render.
+ */
+export function keepForRepair(pdfPaths, reportNum, findings, extra = {}) {
+  const target = repairPaths(path.dirname(pdfPaths.html), reportNum);
+  try {
+    fs.copyFileSync(pdfPaths.html, target.html);
+    fs.writeFileSync(target.findings, findings, "utf8");
+    const record = { error: findings, format: extra.format ?? "letter", rows: extra.rows ?? null, keptAt: new Date().toISOString() };
+    fs.writeFileSync(target.rows, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    return true;
+  } catch (err) {
+    console.error(`pdf repair: could not keep the refused CV for report #${reportNum}: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * The kept failure for a repair run, or null when there is none or it is older
+ * than REPAIR_MAX_AGE_MS (a stale one describes a CV the candidate never saw).
+ * `record` is the structured side (rows, format), null for a failure kept
+ * before rows existed.
+ * @param {string} scratchDir
+ * @param {string} reportNum
+ * @param {number} [now]
+ * @returns {{html: string, findings: string, rowsPath: string, record: {error: string, format: string, rows: object[] | null, keptAt: string} | null} | null}
+ */
+export function readRepair(scratchDir, reportNum, now = Date.now()) {
+  const target = repairPaths(scratchDir, reportNum);
+  try {
+    const age = now - fs.statSync(target.findings).mtimeMs;
+    if (age > REPAIR_MAX_AGE_MS || !fs.existsSync(target.html)) return null;
+    const findings = fs.readFileSync(target.findings, "utf8").trim();
+    if (!findings) return null;
+    let record = null;
+    try {
+      record = JSON.parse(fs.readFileSync(target.rows, "utf8"));
+    } catch {
+      record = null;
+    }
+    return { html: target.html, findings, rowsPath: target.rows, record };
+  } catch {
+    return null;
+  }
+}
 /**
  * @typedef {Object} RenderedResult
  * @property {"rendered"} kind
@@ -317,10 +428,10 @@ export function failureReason(stderr) {
  * Call after writeCvHtml for the same pdfPaths — this reads the HTML that
  * function wrote. `format` is passed in rather than read back off disk, so the two
  * no longer share a file and the only coupling left is the HTML itself.
- * @param {{spawnFn: Function, execPath: string, coreRoot: string, pdfPaths: {html: string, finalPdf: string}, format: "letter"|"a4", reportNum: string, dataRoot?: string}} args
+ * @param {{spawnFn: Function, execPath: string, coreRoot: string, pdfPaths: {html: string, finalPdf: string}, format: "letter"|"a4", reportNum: string, dataRoot?: string, collectFindings?: (htmlPath: string) => Promise<object[] | null>}} args
  * @returns {Promise<RenderResult>}
  */
-export async function renderAndMarkPdf({ spawnFn, execPath, coreRoot, pdfPaths, format, reportNum, dataRoot }) {
+export async function renderAndMarkPdf({ spawnFn, execPath, coreRoot, pdfPaths, format, reportNum, dataRoot, collectFindings }) {
   const warnings = [];
 
   // A render over a warn-only page budget exits 0 but writes nothing to the
@@ -330,11 +441,38 @@ export async function renderAndMarkPdf({ spawnFn, execPath, coreRoot, pdfPaths, 
   // delivery from the file itself.
   const render = await spawnGeneratePdf({ spawnFn, execPath, coreRoot, html: pdfPaths.html, finalPdf: pdfPaths.finalPdf, format, reportNum, dataRoot });
   if (render.delivered) keepTailoredHtml(pdfPaths, warnings);
+  const error = render.delivered ? null : undeliveredRenderError(render, pdfPaths.finalPdf);
+  // Before the sweep below, which would delete the HTML the repair run reads.
+  // collectFindings (cv-gate.mjs, injected by the caller) reruns both gates on
+  // the refused HTML for the review card; a miss there still keeps the repair.
+  let factCheck = false;
+  // Over the page budget: the content passed both gates (they run before the
+  // render), so the only decision is the candidate's: allow the length, or
+  // have Claude trim. Kept for the review card, never repaired automatically:
+  // trimming a CV cuts content the candidate may want.
+  const overBudget = error !== null ? pageBudgetOf(render.stderr) : null;
+  if (overBudget) {
+    const rows = [pageBudgetRow(overBudget)];
+    if (keepForRepair(pdfPaths, reportNum, error, { rows, format })) {
+      cleanupPdfScratch(path.dirname(pdfPaths.html), `cv-web-${reportNum}.`);
+      return { kind: "render-failed", error, pageBudget: overBudget };
+    }
+  }
+  if (error !== null && isFactCheckFailure(error)) {
+    let rows = null;
+    try {
+      rows = collectFindings ? await collectFindings(pdfPaths.html) : null;
+    } catch (err) {
+      console.error(`pdf repair: could not read the gate findings for report #${reportNum}: ${err?.message ?? err}`);
+    }
+    factCheck = keepForRepair(pdfPaths, reportNum, error, { rows, format });
+  }
   cleanupPdfScratch(path.dirname(pdfPaths.html), `cv-web-${reportNum}.`);
 
-  if (!render.delivered) {
-    return { kind: "render-failed", error: undeliveredRenderError(render, pdfPaths.finalPdf) };
+  if (error !== null) {
+    return factCheck ? { kind: "render-failed", error, factCheck: true } : { kind: "render-failed", error };
   }
+  cleanupPdfScratch(path.dirname(pdfPaths.html), `cv-repair-${reportNum}.`);
 
   // A render that exits 0 can still have written advisories to stderr, and
   // they matter to whoever asked for this PDF: the CV fact check's advisory

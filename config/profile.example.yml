@@ -464,6 +464,17 @@ cover_letter:
 # worth a closer look. Set to 5.1 to effectively disable (max score is 5.0),
 # or to 0 to embed one for every report.
 # deep_prompt_score_threshold: 3.5
+#
+# In the web UI, a report with that section shows "Copy research prompt" and
+# "Research in Claude" (copies the prompt, then opens Claude in a new tab).
+# By default that opens a new claude.ai chat with the prompt filled in. Set
+# claude_url to open somewhere else: a claude.ai project URL opens as-is (a
+# project link cannot carry a prompt, so you paste it from the clipboard), and
+# a URL containing {prompt} gets the prompt substituted, e.g.
+# "claude://claude.ai/new?q={prompt}" for the desktop app. No link can turn on
+# Research mode, so switch it on in Claude before sending.
+# deep_research:
+#   claude_url: "https://claude.ai/project/<project-id>"
 # ── Two-pass triage gate ────────────────────────────────────────────────────
 #
 # Used by `/career-ops pipeline`. Before running the full A-G evaluation on

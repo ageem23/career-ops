@@ -107,9 +107,11 @@ test("parseBaseCv reads the summary and each entry's bullets from cv.md", () => 
   assert.deepEqual(parseBaseCv(CV_MD, cvMarkdown), {
     summary: "Full-stack AI engineer building production ML systems.",
     entries: [
-      { company: "TechFin Corp", bullets: ["Led ML platform team (3 engineers), built model registry and feature store", "Designed fraud pipeline on Kafka & Flink", "Ran the on-call rotation for the model serving stack"] },
-      { company: "DataStartup Inc", bullets: ["Built NLP pipeline"] },
+      { company: "TechFin Corp", bullets: ["Led ML platform team (3 engineers), built model registry and feature store", "Designed fraud pipeline on Kafka & Flink", "Ran the on-call rotation for the model serving stack"], roles: [] },
+      { company: "DataStartup Inc", bullets: ["Built NLP pipeline"], roles: [] },
     ],
+    // Only a ## section's own bullets count as a list; Work Experience's sit under ### entries.
+    lists: [],
   });
 });
 

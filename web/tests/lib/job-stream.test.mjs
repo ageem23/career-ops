@@ -146,3 +146,10 @@ test("malformed gated events do not confirm a legitimate evaluation stop", async
     assert.equal(result.status, "error");
   }
 });
+
+test("an error naming a known repair carries it; an unknown retry value is dropped", async () => {
+  const known = await read([record({ type: "error", msg: "Fact check failed", retry: "fact-check" })]);
+  assert.deepEqual(known.result, { status: "error", message: "Fact check failed", retry: "fact-check" });
+  const unknown = await read([record({ type: "error", msg: "boom", retry: "anything" })]);
+  assert.deepEqual(unknown.result, { status: "error", message: "boom" });
+});

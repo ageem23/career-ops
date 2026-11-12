@@ -10,7 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { StringDecoder } from "node:string_decoder";
-import { mkdtempSync, writeFileSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -21,6 +21,9 @@ import {
   cleanupPdfScratch,
   renderAndMarkPdf,
   failureReason,
+  isFactCheckFailure,
+  readRepair,
+  REPAIR_MAX_AGE_MS,
 } from "../../src/lib/pdf-render.mjs";
 
 // A fake stdio stream: emits raw Buffers, or decoded strings once the code
@@ -790,10 +793,52 @@ test("renderAndMarkPdf: a failed render with advisories before the failure surfa
   });
   try {
     const result = await renderAndMarkPdf({ spawnFn, execPath: "node", coreRoot: "/root", pdfPaths, format: "letter", reportNum: "423" });
-    assert.deepEqual(result, { kind: "render-failed", error: failure });
+    // A fact-gate refusal is the repairable failure: flagged, and kept.
+    assert.deepEqual(result, { kind: "render-failed", error: failure, factCheck: true });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("renderAndMarkPdf: a fact-gate refusal keeps the refused HTML and full findings for one repair run", async () => {
+  const dir = makeScratchDir();
+  const pdfPaths = makePdfPaths(dir, "424");
+  writeFileSync(pdfPaths.html, "<html><li>refused bullet</li></html>");
+  const failure = "❌ PDF generation failed: Fact check failed for cv-web-424.html: non-metric facts absent from sources: drift=x";
+  const { spawnFn } = makeRouterSpawn({ "generate-pdf.mjs": { exitCode: 1, stderr: failure } });
+  try {
+    await renderAndMarkPdf({ spawnFn, execPath: "node", coreRoot: "/root", pdfPaths, format: "letter", reportNum: "424" });
+    // The run's own scratch is swept; the repair copy survives it.
+    assert.equal(existsSync(pdfPaths.html), false);
+    const kept = readRepair(dir, "424");
+    assert.ok(kept);
+    assert.equal(readFileSync(kept.html, "utf8"), "<html><li>refused bullet</li></html>");
+    assert.equal(kept.findings, failure);
+    // Stale after REPAIR_MAX_AGE_MS: a repair must not act on a CV nobody saw.
+    assert.equal(readRepair(dir, "424", Date.now() + REPAIR_MAX_AGE_MS + 60_000), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("renderAndMarkPdf: a non-fact-check failure is not repairable and keeps nothing", async () => {
+  const dir = makeScratchDir();
+  const pdfPaths = makePdfPaths(dir, "425");
+  writeFileSync(pdfPaths.html, "<html></html>");
+  const { spawnFn } = makeRouterSpawn({ "generate-pdf.mjs": { exitCode: 1, stderr: "❌ Chromium failed to launch" } });
+  try {
+    const result = await renderAndMarkPdf({ spawnFn, execPath: "node", coreRoot: "/root", pdfPaths, format: "letter", reportNum: "425" });
+    assert.deepEqual(result, { kind: "render-failed", error: "❌ Chromium failed to launch" });
+    assert.equal(readRepair(dir, "425"), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("isFactCheckFailure: only the fact gate's refusal", () => {
+  assert.equal(isFactCheckFailure("❌ PDF generation failed: Fact check failed for cv-web-1.html: …"), true);
+  assert.equal(isFactCheckFailure("❌ Chromium failed to launch"), false);
+  assert.equal(isFactCheckFailure(undefined), false);
 });
 
 test("failureReason: no failure marker -> whole stderr; empty -> generic message", () => {
@@ -801,3 +846,22 @@ test("failureReason: no failure marker -> whole stderr; empty -> generic message
   assert.equal(failureReason(""), "PDF rendering failed.");
 });
 
+
+test("renderAndMarkPdf: an over-budget CV is kept for the review card, with no automatic repair", async () => {
+  const dir = makeScratchDir();
+  const pdfPaths = makePdfPaths(dir, "426");
+  writeFileSync(pdfPaths.html, "<html><li>three pages of content</li></html>");
+  const stderr = "⚠️  CV is 3 pages; the allowed maximum is 2 pages. Overflow draft: /x/cv.overflow.pdf (kept)";
+  const { spawnFn } = makeRouterSpawn({ "generate-pdf.mjs": { exitCode: 0, stderr } });
+  try {
+    const result = await renderAndMarkPdf({ spawnFn, execPath: "node", coreRoot: "/root", pdfPaths, format: "a4", reportNum: "426" });
+    assert.equal(result.kind, "render-failed");
+    assert.deepEqual(result.pageBudget, { pages: 3, max: 2 });
+    assert.equal(result.factCheck, undefined, "a page budget never starts the automatic repair");
+    const kept = readRepair(dir, "426");
+    assert.equal(kept.record.format, "a4");
+    assert.deepEqual(kept.record.rows.map((r) => [r.kind, r.allow.type, r.allow.value]), [["pages", "pages", 3]]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

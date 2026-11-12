@@ -13,7 +13,8 @@ import { careerOpsRoot, readMemory, findReportFile, readInbox, readScanDates, re
 import { resolveCodeRoot } from "@/lib/core/code-root.mjs";
 import { dataFolderMissingMessage } from "@/lib/core/data-root.mjs";
 import { resolvePdfPaths, type PdfPaths } from "@/lib/pdf-paths.mjs";
-import { renderAndMarkPdf, writeCvHtml, pdfRunOutcome } from "@/lib/pdf-render.mjs";
+import { renderAndMarkPdf, writeCvHtml, pdfRunOutcome, readRepair } from "@/lib/pdf-render.mjs";
+import { collectGateFindings, findingsSummary } from "@/lib/cv-gate.mjs";
 import { createCvEnvelopeFilter, type CvEnvelope } from "@/lib/cv-envelope.mjs";
 import { createReportEnvelopeFilter } from "@/lib/report-envelope.mjs";
 import { persistEvaluation, evaluateRunOutcome, evaluationOutcomeEvent } from "@/lib/report-persist.mjs";
@@ -32,6 +33,8 @@ import { readJsonObject } from "@/lib/json-body";
 import { writeEvaluationInstructions } from "@/lib/evaluation-instructions-file.mjs";
 import { spillOversizedPrompt } from "@/lib/oversized-prompt.mjs";
 import { parseEvaluationOptions, selectedEvaluationInstructions } from "@/lib/evaluation-options.mjs";
+import { createResearchReviewFilter, parseResearchReview } from "@/lib/research-review.mjs";
+import { researchContext, saveReview } from "@/lib/research-server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -130,7 +133,7 @@ export async function POST(req: Request) {
 
   // An A–F score is meaningless without a CV to score against — the CLI would
   // hallucinate a fit narrative and still emit a VERDICT. Require cv.md first.
-  if ((kind === "evaluate" || kind === "pdf" || kind === "cover") && !fs.existsSync(path.join(careerOpsRoot(), "cv.md"))) {
+  if ((kind === "evaluate" || kind === "pdf" || kind === "cover" || kind === "research-review") && !fs.existsSync(path.join(careerOpsRoot(), "cv.md"))) {
     return new Response(
       JSON.stringify({ error: "Add your CV first so I can score this against you — drop it on the home page." }),
       { status: 400, headers: { "Content-Type": "application/json" } },
@@ -138,6 +141,16 @@ export async function POST(req: Request) {
   }
 
   const today = localISODate();
+
+  // research-review reads research the page already filed and linked from the
+  // report header. Resolved here so the worker is handed fixed paths.
+  const reviewCtx = kind === "research-review" ? researchContext(input) : undefined;
+  if (reviewCtx && (!reviewCtx.reportPath || !reviewCtx.researchRel)) {
+    return Response.json({ error: "File the deep research on the report page first, then run the review." }, { status: 400 });
+  }
+  const reviewReportFile = reviewCtx?.reportPath
+    ? path.relative(careerOpsRoot(), reviewCtx.reportPath).split(path.sep).join("/")
+    : undefined;
 
   // Precompute deterministic scratch + final paths so the agent never chooses
   // its own filenames — the backend owns naming, writing (#2185) and rendering
@@ -155,6 +168,22 @@ export async function POST(req: Request) {
     }
     pdfPaths = pathsResult.paths;
   }
+  // A repair run after the fact gate refused this report's CV: the job store
+  // asks for it once, and the failed HTML and findings come from the server's
+  // own scratch copy (never from the request), so the request can only say
+  // "repair", not what the findings were.
+  const isRepairRun = kind === "pdf" && typeof brief === "object" && brief !== null
+    && (brief as Record<string, unknown>).repair === "fact-check";
+  const kept = isRepairRun && pdfPaths ? readRepair(path.dirname(pdfPaths.html), pdfPaths.reportNum) : null;
+  // The error text names only what stopped the render; the rows (both gates,
+  // re-run on the refused HTML) name every line, so one repair settles them all.
+  const keptRows = Array.isArray(kept?.record?.rows) ? kept.record.rows : null;
+  const cvRepair = kept && pdfPaths
+    ? {
+        failedHtml: path.relative(careerOpsRoot(), kept.html).split(path.sep).join("/"),
+        findings: keptRows?.length ? `${kept.findings}\nEvery flagged line:\n${findingsSummary(keptRows)}` : kept.findings,
+      }
+    : undefined;
 
   const coverRequest = kind === "cover" ? parseCoverRequest({ input, brief, root: careerOpsRoot(), findReportFile }) : undefined;
   if (coverRequest && !coverRequest.ok) {
@@ -231,8 +260,10 @@ export async function POST(req: Request) {
       userTemplatesDir,
       // The worker's cwd is the data root; modes, templates and scripts live in the checkout.
       codeRoot,
-      reportFile: pdfPaths?.reportFile ?? (coverRequest?.ok ? coverRequest.reportFile : undefined),
+      reportFile: pdfPaths?.reportFile ?? (coverRequest?.ok ? coverRequest.reportFile : reviewReportFile),
       coverBrief: coverRequest?.ok ? coverRequest.brief : undefined,
+      researchReview: reviewCtx?.researchRel ? { researchFile: reviewCtx.researchRel, status: reviewCtx.app?.status ?? "" } : undefined,
+      cvRepair,
       profile: profileRef(careerOpsRoot()),
       evaluationInstructions: instructionFile?.reference,
       prefetchedJd,
@@ -419,6 +450,8 @@ export async function POST(req: Request) {
       // for the backend while holding the body out of the run log.
       const cvFilter = kind === "pdf" ? createCvEnvelopeFilter() : null;
       const reportFilter = kind === "evaluate" ? createReportEnvelopeFilter() : null;
+      // research-review's proposals arrive in a <<research-review>> JSON envelope.
+      const reviewFilter = kind === "research-review" ? createResearchReviewFilter() : null;
       // Assistant-authored text only, before report-body filtering. Tools/JDs
       // cannot directly declare a gated outcome. Process integrity is checked
       // first at close, before this text can be treated as a terminal stop.
@@ -433,7 +466,7 @@ export async function POST(req: Request) {
       // ignored by the client's switch, so this is safe for older tabs too.
       const sendAgentText = (text: string) => {
         if (kind === "evaluate") evaluationText += text;
-        const filter = cvFilter ?? reportFilter;
+        const filter = cvFilter ?? reportFilter ?? reviewFilter;
         const visible = filter ? filter.push(text) : text;
         if (visible) send({ type: "text", text: visible });
       };
@@ -564,9 +597,18 @@ export async function POST(req: Request) {
             pdfPaths: paths,
             format,
             reportNum: paths.reportNum,
+            collectFindings: (htmlPath: string) => collectGateFindings({
+              coreRoot: resolveCodeRoot(process.cwd(), process.env),
+              dataRoot: careerOpsRoot(),
+              htmlPath,
+              html: fs.readFileSync(/* turbopackIgnore: true */ htmlPath, "utf8"),
+            }),
           });
           if (result.kind === "render-failed") {
-            send({ type: "error", msg: result.error.slice(0, 1500) });
+            // A refused CV from a first attempt can be repaired once; a refused
+            // repair is final, so it carries no retry hint.
+            const retry = result.factCheck && !isRepairRun ? { retry: "fact-check" } : {};
+            send({ type: "error", msg: result.error.slice(0, 1500), ...retry });
             return;
           }
           // Non-fatal issues (a defaulted page format, a tracker row not marked) still
@@ -674,6 +716,30 @@ export async function POST(req: Request) {
           } else {
             evaluatePersistPromise = persistEval(envelope.markdown);
             return;
+          }
+          return close();
+        }
+
+        if (kind === "research-review") {
+          const tail = reviewFilter?.flush();
+          if (tail) send({ type: "text", text: tail });
+          const baseErr = noOutputMessage();
+          if (baseErr) {
+            send({ type: "error", msg: baseErr });
+          } else if (!cleanExit || sawError) {
+            send({ type: "error", msg: "The research review hit an error before finishing, so nothing was saved — re-run it." });
+          } else if (!reviewFilter || !reviewCtx?.researchRel) {
+            send({ type: "error", msg: "Internal error: the research review lost its context — please report this." });
+          } else {
+            const parsed = parseResearchReview(reviewFilter.text());
+            if (!parsed.ok) {
+              send({ type: "error", msg: parsed.error.slice(0, 400) });
+            } else {
+              sendWarnings(parsed.warnings);
+              const saved = saveReview(reviewCtx.researchRel, reviewCtx.reportNum, parsed.review, today);
+              if (!saved.ok) send({ type: "error", msg: saved.error.slice(0, 400) });
+              else send({ type: "done", tokens: lastTokens, costUsd: lastCostUsd });
+            }
           }
           return close();
         }

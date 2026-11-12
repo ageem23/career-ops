@@ -77,20 +77,24 @@ function ItemBlock({ item, section, siblings, first, last, ...common }: Common &
   const isHidden = hidden.has(item.id);
   const bullets = arrange(item.bullets, edits.order[item.id]);
   const restored = edits.restored[item.id] ?? [];
-  const showHeader = item.kind === "entry";
+  // A bullet-only section (Key Achievements) is one list: its section header is its header.
+  const listItem = item.kind === "entry" || item.kind === "role";
+  const showHeader = listItem && section.kind !== "highlights";
+  // A grouped employer's roles share its markup, so items there stay in place.
+  const fixed = section.items.some((i) => i.kind === "role");
   return (
     <div className={cn("py-2", isHidden && "opacity-50")}>
       {showHeader && (
         <div className="flex items-center gap-1">
           <p className="flex-1 truncate text-sm font-medium text-foreground">{item.label}</p>
-          {section.items.length > 1 && <MoveButtons parent={section.id} id={item.id} siblings={siblings} first={first} last={last} dispatch={dispatch} label={item.label} />}
+          {section.items.length > 1 && !fixed && <MoveButtons parent={section.id} id={item.id} siblings={siblings} first={first} last={last} dispatch={dispatch} label={item.label} />}
           <HideButton id={item.id} hidden={isHidden} dispatch={dispatch} label={item.label} />
         </div>
       )}
       {!isHidden && (
         <ul className="mt-1 space-y-1.5">
           {bullets.map((b, k) => (
-            <BulletRow key={b.id} bullet={b} parent={item.id} siblings={bullets.map((x) => x.id)} first={k === 0} last={k === bullets.length - 1} movable={item.kind === "entry"} {...common} />
+            <BulletRow key={b.id} bullet={b} parent={item.id} siblings={bullets.map((x) => x.id)} first={k === 0} last={k === bullets.length - 1} movable={listItem} {...common} />
           ))}
           {item.restorable.map((r, idx) =>
             restored.includes(idx) ? (
