@@ -22,7 +22,7 @@ import { resolvePdfIndexPath } from "@/lib/core/pdf-index";
 // Pure parser, no I/O — shared with the apply flow's CV resolver so the two
 // don't drift into two different definitions of "which report does this
 // index row belong to" (#2599, #2008 review).
-import { pdfIndexEntriesByReport } from "@/lib/apply/cv-selection.mjs";
+import { pdfIndexEntriesByReport, readyReportNumbers } from "@/lib/apply/cv-selection.mjs";
 // The managed-block markers and the profile read live together in one plain
 // module, so rememberFact() (the block's only WRITER) and readMemory() (its
 // reader) cannot drift apart, and so the read rule is testable from web/tests.
@@ -330,22 +330,21 @@ export async function pdfPathStatusForReport(n: string, kind: "cv" | "cover" = "
   return { status: "found", path: abs, html };
 }
 
-/** Report numbers whose indexed CV PDF exists under output/ right now, i.e.
- *  every n for which pdfPathStatusForReport(n) is "found". The pipeline list
- *  needs this for every tracker row: asking pdfPathStatusForReport once per
- *  row re-resolved the data root and re-read the manifest ~1,000 times per
- *  page load, which took 10-20 s on a synced (OneDrive) folder. Here the
- *  manifest is read once and only its own rows are stat'ed. */
-export async function pdfReadyReportNumbers(): Promise<Set<number>> {
-  const ready = new Set<number>();
+/** The members of `reports` whose indexed CV PDF exists under output/ right
+ *  now, i.e. every n in `reports` for which pdfPathStatusForReport(n) is
+ *  "found". The pipeline list needs this for every tracker row: asking
+ *  pdfPathStatusForReport once per row re-resolved the data root and re-read
+ *  the manifest once per row, which took 8 s on a 5,000-row tracker (#6974).
+ *  Here the manifest is read once, and only rows for the asked-about reports
+ *  are stat'ed: manifest rows for reports no longer in the tracker cost
+ *  nothing, and an empty tracker checks no files at all. */
+export async function pdfReadyReportNumbers(reports: ReadonlySet<number>): Promise<Set<number>> {
+  if (reports.size === 0) return new Set();
   const entries = await indexedPdfEntries("cv");
-  if (!entries) return ready;
+  if (!entries) return new Set();
   const root = careerOpsRoot();
   const outputDir = path.resolve(root, "output");
-  for (const [n, entry] of entries) {
-    if (entry.path && containedOutputFile(root, outputDir, entry.path)) ready.add(n);
-  }
-  return ready;
+  return readyReportNumbers(entries, reports, (rel: string) => containedOutputFile(root, outputDir, rel) !== null);
 }
 
 /** Parsed manifest, report number -> first entry of that kind. Reused until
