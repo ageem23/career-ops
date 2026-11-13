@@ -8,7 +8,7 @@ const PILL =
   "inline-flex items-center justify-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors max-sm:min-h-[44px]";
 
 /** navigator.clipboard needs a secure context; a LAN-IP visit is not one. */
-async function copyText(text: string): Promise<boolean> {
+export async function copyText(text: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text);
     return true;
@@ -30,12 +30,38 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
+export type PromptActionLabels = {
+  copy: string;
+  copyTitle: string;
+  open: string;
+  /** What the prompt is, for the status line ("Deep research prompt copied."). */
+  noun: string;
+  /** Where to select the prompt by hand when the clipboard refuses. */
+  fallback: string;
+};
+
+const RESEARCH_LABELS: PromptActionLabels = {
+  copy: "Copy research prompt",
+  copyTitle: "Copy the Deep Research Prompt embedded in this report",
+  open: "Research in Claude",
+  noun: "Deep research prompt",
+  fallback: "the Deep Research Prompt section below",
+};
+
 /**
- * Copy the report's embedded Deep Research Prompt, or copy it and open Claude
- * in a new tab. claude.ai has no URL switch for Research mode, so the hint
- * after opening tells the user to turn it on before sending.
+ * Copy a prompt, or copy it and open Claude in a new tab. claude.ai has no URL
+ * switch for Research mode, so the hint after opening tells the user to turn
+ * it on before sending. Defaults to the report's Deep Research Prompt.
  */
-export function DeepPromptActions({ prompt, claudeUrl = "" }: { prompt: string; claudeUrl?: string }) {
+export function DeepPromptActions({
+  prompt,
+  claudeUrl = "",
+  labels = RESEARCH_LABELS,
+}: {
+  prompt: string;
+  claudeUrl?: string;
+  labels?: PromptActionLabels;
+}) {
   const [note, setNote] = useState("");
   const [copied, setCopied] = useState(false);
 
@@ -44,7 +70,7 @@ export function DeepPromptActions({ prompt, claudeUrl = "" }: { prompt: string; 
   async function copy() {
     const ok = await copyText(prompt);
     setCopied(ok);
-    setNote(ok ? "Deep research prompt copied." : "Could not copy — select the prompt in the Deep Research Prompt section below.");
+    setNote(ok ? `${labels.noun} copied.` : `Could not copy — select the prompt in ${labels.fallback}.`);
     if (ok) setTimeout(() => setCopied(false), 2000);
   }
 
@@ -59,7 +85,7 @@ export function DeepPromptActions({ prompt, claudeUrl = "" }: { prompt: string; 
         ? "Opened Claude with the prompt filled in. Turn on Research, then send."
         : ok
           ? "Opened Claude. Paste the prompt (it's on your clipboard), turn on Research, then send."
-          : "Opened Claude. Copy the prompt from the Deep Research Prompt section below, turn on Research, then send.",
+          : `Opened Claude. Copy the prompt from ${labels.fallback}, turn on Research, then send.`,
     );
   }
 
@@ -69,11 +95,11 @@ export function DeepPromptActions({ prompt, claudeUrl = "" }: { prompt: string; 
         <button
           type="button"
           onClick={copy}
-          title="Copy the Deep Research Prompt embedded in this report"
+          title={labels.copyTitle}
           className={`${PILL} border-border text-muted hover:border-brand/40 hover:text-brand-text`}
         >
           {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-          {copied ? "Copied" : "Copy research prompt"}
+          {copied ? "Copied" : labels.copy}
         </button>
         <button
           type="button"
@@ -81,7 +107,7 @@ export function DeepPromptActions({ prompt, claudeUrl = "" }: { prompt: string; 
           title="Copy the prompt and open Claude in a new tab"
           className={`${PILL} border-brand/30 text-brand-text hover:bg-brand-soft/50`}
         >
-          <ExternalLink className="size-3.5" /> Research in Claude
+          <ExternalLink className="size-3.5" /> {labels.open}
         </button>
       </span>
       {note && (

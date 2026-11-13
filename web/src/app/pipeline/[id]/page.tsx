@@ -10,6 +10,10 @@ import { missingTrackedJob } from "@/lib/job-route.mjs";
 import { readDeepResearchUrl } from "@/lib/deep-prompt-server";
 import { researchContext } from "@/lib/research-server";
 import { cvGateState } from "@/lib/cv-gate-server";
+import { contactoPromptFor } from "@/lib/contacto-prompt-server";
+import { tasksForApp } from "@/lib/tasks-server";
+import { localISODate } from "@/lib/followups";
+import { applyPostingUrl } from "@/lib/posting-url.mjs";
 
 export const dynamic = "force-dynamic";
 
@@ -34,6 +38,9 @@ export default async function ReportPage({ params, searchParams }: {
   const disk = await readCvDiskState(id, companyName, (app?.pdf ?? "").includes("✅"), reportNum);
   const pdfFileReady = disk.exists;
   const research = researchContext(id);
+  // Same resolution as the report page's "posting" link (a tracker URL cell can be a markdown link).
+  const postingUrl =
+    applyPostingUrl(parseReport(report?.content ?? "").fields.find((f) => f.label === "URL")?.value, app?.url, app?.applyLink) || "";
   return (
     <ReportView
       id={id}
@@ -50,6 +57,9 @@ export default async function ReportPage({ params, searchParams }: {
       deepResearchUrl={readDeepResearchUrl()}
       research={{ rel: research.researchRel, text: research.research, review: research.review }}
       cvGate={report ? cvGateState(id) : null}
+      contactoPrompt={contactoPromptFor(app, postingUrl)}
+      tasks={app ? tasksForApp(app.n) : []}
+      today={localISODate()}
     />
   );
 }

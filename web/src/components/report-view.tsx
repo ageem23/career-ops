@@ -39,6 +39,8 @@ import { ResearchPanel } from "@/components/research-panel";
 import type { ReviewSidecar } from "@/lib/research-server";
 import { extractDeepPrompt } from "@/lib/deep-prompt.mjs";
 import { CvGateCard } from "@/components/cv-gate-card";
+import { OutreachPanel } from "@/components/outreach-panel";
+import type { Task } from "@/lib/tasks.mjs";
 import type { CvGateState } from "@/lib/cv-gate-server";
 
 // Progressive disclosure of the report. Current oferta.md writes letter F as
@@ -65,6 +67,9 @@ export function ReportView({
   deepResearchUrl = "",
   research = null,
   cvGate = null,
+  contactoPrompt = "",
+  tasks = [],
+  today = "",
 }: {
   id: string;
   app: Application | null;
@@ -90,6 +95,12 @@ export function ReportView({
   research?: { rel: string | null; text: string | null; review: ReviewSidecar | null } | null;
   /** A tailored CV the content gates refused, awaiting the candidate's call (cv-gate-server.ts). */
   cvGate?: CvGateState | null;
+  /** The contacto research prompt, once the application has gone out (contacto-prompt-server.ts). */
+  contactoPrompt?: string;
+  /** This application's rows in data/tasks.md. */
+  tasks?: Task[];
+  /** Local YYYY-MM-DD, for due-date badges. */
+  today?: string;
 }) {
   const meta = report ? parseReport(report) : null;
   const field = (label: string) => meta?.fields.find((f) => f.label === label)?.value;
@@ -107,6 +118,9 @@ export function ReportView({
   const company = app ? companyPresentation(app) : null;
   const companyName = company?.label ?? app?.company ?? meta?.title ?? id;
   const deepPrompt = extractDeepPrompt(report);
+  const outreachPanel = app && (contactoPrompt || tasks.length > 0) && (
+    <OutreachPanel n={id} prompt={contactoPrompt} tasks={tasks} today={today} />
+  );
 
   return (
     <PageFrame className="max-w-3xl xl:max-w-5xl 2xl:max-w-[1600px]">
@@ -237,6 +251,7 @@ export function ReportView({
                   {actions}
                   {gateCard}
                   {researchPanel}
+                  {outreachPanel}
                   {app && canDelete && (
                     <div className="mt-8 border-t border-border pt-4 print:hidden">
                       <DeleteFromTracker n={id} />
@@ -255,6 +270,7 @@ export function ReportView({
                 {actions}
                 {gateCard}
                 {researchPanel}
+                {outreachPanel}
                 {app && canDelete && (
                   <div className="mt-8 border-t border-border pt-4 print:hidden">
                     <DeleteFromTracker n={id} />
@@ -331,6 +347,7 @@ export function ReportView({
               <StatusSelect n={id} current={app.status} />
             </div>
           )}
+          {outreachPanel}
           {app && canDelete && (
             <div className="mt-8 border-t border-border pt-4 print:hidden">
               <DeleteFromTracker n={id} />

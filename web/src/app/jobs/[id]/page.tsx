@@ -1,9 +1,10 @@
 "use client";
 
-import { use } from "react";
+import { use, useEffect, useState } from "react";
+import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ArrowLeft, Loader2, Wrench, CircleDot, Check, X, CirclePause } from "lucide-react";
+import { ArrowLeft, ArrowRight, Loader2, Wrench, CircleDot, Check, X, CirclePause } from "lucide-react";
 import { evaluationGateForJob, isLegacyMissingReportMessage, jobOutputForDisplay } from "@/lib/job-gate.mjs";
 import { notFound, useSearchParams } from "next/navigation";
 import { useJobs } from "@/components/jobs/job-store";
@@ -20,6 +21,25 @@ export default function JobPage({ params }: { params: Promise<{ id: string }> })
   const job = jobs.find((j) => j.id === id);
   const query = pipelineQuery(useSearchParams().toString());
   const pipelineHref = `/pipeline${query ? `?${query}` : ""}`;
+  // The application this worker belongs to: the page it was started from
+  // (CV, cover, research runs), or for an evaluation the tracker row its
+  // report landed in — looked up, since tracker # and report # can differ.
+  const launchedFrom = /^\/pipeline\/(\d+)(?:[/?#]|$)/.exec(job?.page ?? "")?.[1] ?? null;
+  const reportN = job?.status === "done" ? job.reportN ?? null : null;
+  const [resolved, setResolved] = useState<{ report: number; n: string | null } | null>(null);
+  useEffect(() => {
+    if (launchedFrom || reportN == null) return;
+    let live = true;
+    fetch(`/api/report/app?report=${reportN}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((b) => live && setResolved({ report: reportN, n: typeof b?.n === "string" ? b.n : null }))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [launchedFrom, reportN]);
+  const appN = launchedFrom ?? (resolved && resolved.report === reportN ? resolved.n : null);
+  const appHref = appN ? `/pipeline/${appN}${query ? `?${query}` : ""}` : null;
 
   if (!ready) return <JobLoading />;
   if (missingWorker({ ready, ids: jobs.map((j) => j.id), id })) notFound();
@@ -54,6 +74,14 @@ export default function JobPage({ params }: { params: Promise<{ id: string }> })
               <Badge tone={job.result.tone}>{job.result.score}/5</Badge>
               {job.result.summary && <span className="text-sm text-muted">{job.result.summary}</span>}
             </div>
+          )}
+          {appHref && job.status !== "running" && (
+            <Link
+              href={appHref}
+              className="mt-4 inline-flex items-center gap-1.5 rounded-full bg-brand px-4 py-2 text-sm font-medium text-brand-foreground shadow-sm transition-colors hover:bg-brand-200 max-sm:min-h-[44px]"
+            >
+              Open application #{appN} <ArrowRight className="size-4" />
+            </Link>
           )}
         </div>
       </section>
