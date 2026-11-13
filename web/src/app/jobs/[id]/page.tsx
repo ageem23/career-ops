@@ -12,6 +12,7 @@ import { missingWorker } from "@/lib/job-route.mjs";
 import JobLoading from "./loading";
 import { BackLink } from "@/components/back-link";
 import { pipelineQuery } from "@/lib/pipeline-navigation.mjs";
+import { workerTabTitle } from "@/lib/tab-title.mjs";
 import { HeroGlow } from "@/components/hero-glow";
 import { Badge } from "@/components/ui/badge";
 
@@ -40,6 +41,11 @@ export default function JobPage({ params }: { params: Promise<{ id: string }> })
   }, [launchedFrom, reportN]);
   const appN = launchedFrom ?? (resolved && resolved.report === reportN ? resolved.n : null);
   const appHref = appN ? `/pipeline/${appN}${query ? `?${query}` : ""}` : null;
+  // Client page, so no generateMetadata: lead the tab with this worker's company.
+  const jobTitle = job?.title;
+  useEffect(() => {
+    if (jobTitle) document.title = workerTabTitle(jobTitle);
+  }, [jobTitle]);
 
   if (!ready) return <JobLoading />;
   if (missingWorker({ ready, ids: jobs.map((j) => j.id), id })) notFound();

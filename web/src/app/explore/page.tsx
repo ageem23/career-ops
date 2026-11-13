@@ -9,6 +9,8 @@ import { DEFAULT_FILTERS } from "@/lib/explore";
 // CAREER_OPS_ROOT) never fails — discovery seeds are best-effort.
 export const dynamic = "force-dynamic";
 
+export const metadata = { title: "Explore" };
+
 export default function ExplorePage() {
   let seed: { filters: typeof DEFAULT_FILTERS; seededFrom: string[] } = { filters: DEFAULT_FILTERS, seededFrom: [] };
   try {

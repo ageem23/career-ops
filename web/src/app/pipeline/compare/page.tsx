@@ -41,6 +41,8 @@ function column(n: string): Column | null {
   };
 }
 
+export const metadata = { title: "Compare" };
+
 export default async function ComparePage({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   const params = await searchParams;
   const { n } = params;

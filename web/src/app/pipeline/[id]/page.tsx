@@ -14,8 +14,13 @@ import { contactoPromptFor } from "@/lib/contacto-prompt-server";
 import { tasksForApp } from "@/lib/tasks-server";
 import { localISODate } from "@/lib/followups";
 import { applyPostingUrl } from "@/lib/posting-url.mjs";
+import { applicationMetadata } from "@/lib/tab-title-server";
 
 export const dynamic = "force-dynamic";
+
+export function generateMetadata({ params }: { params: Promise<{ id: string }> }) {
+  return applicationMetadata(params);
+}
 
 export default async function ReportPage({ params, searchParams }: {
   params: Promise<{ id: string }>;

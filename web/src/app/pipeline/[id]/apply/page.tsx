@@ -11,8 +11,13 @@ import { answerCopyItems, indexedPdf, pasteCopyFields, PORTAL_TIPS, reportNumber
 import { unsupportedAtsMessage, unsupportedInAppAts } from "@/lib/apply/unsupported-ats.mjs";
 import { readCvDiskState } from "@/lib/read-cv-disk";
 import { ApplyChecklist } from "@/components/apply-checklist";
+import { applicationMetadata } from "@/lib/tab-title-server";
 
 export const dynamic = "force-dynamic";
+
+export function generateMetadata({ params }: { params: Promise<{ id: string }> }) {
+  return applicationMetadata(params, "Apply");
+}
 
 function fileUnderOutput(root: string, abs: string): boolean {
   return isRegularContainedFile(abs, path.join(root, "output"));

@@ -5,10 +5,13 @@ import { AppShell } from "@/components/app-shell";
 import { RouteProgressHost } from "@/components/route-progress-host";
 import { ThemeProvider } from "@/components/theme-provider";
 import { readFollowupsEnabled } from "@/lib/followups-server";
+import { ROOT_TITLE } from "@/lib/tab-title.mjs";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "career-ops — official web experience",
+  // Short so many open tabs stay distinguishable: each page sets its own title
+  // ("Pipeline", or the company on an application) and gets " · Co" appended.
+  title: ROOT_TITLE,
   description: "The official, local-first web experience for career-ops.",
   // Home-screen / standalone (iOS): let our theme-color flow up to the status bar
   // + Dynamic Island; safe-area insets handle the layout.

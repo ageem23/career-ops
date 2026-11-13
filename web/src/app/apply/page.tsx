@@ -4,6 +4,8 @@ import { ApplyBackdropMount } from "@/components/apply/apply-backdrop-mount";
 
 export const dynamic = "force-dynamic";
 
+export const metadata = { title: "Apply" };
+
 export default function ApplyPage() {
   return (
     <div className="relative min-h-screen">

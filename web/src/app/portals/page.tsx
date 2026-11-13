@@ -19,6 +19,8 @@ function readWatched(): { watched: WatchedCompany[]; missing: boolean; error: st
   }
 }
 
+export const metadata = { title: "Portals" };
+
 export default function PortalsPage() {
   const { watched, missing, error } = readWatched();
   // Name the file the page reads, which CAREER_OPS_PORTALS can move.

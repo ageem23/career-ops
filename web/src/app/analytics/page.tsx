@@ -10,6 +10,8 @@ import { SearchInsights } from "@/components/analytics/search-insights";
 
 export const dynamic = "force-dynamic";
 
+export const metadata = { title: "Analytics" };
+
 export default async function Analytics({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   const params = await searchParams;
   // Not pipelineSummary: besides the tracker it parses all of

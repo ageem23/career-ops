@@ -9,6 +9,8 @@ import { applyInboxFit, loadFitTargets } from "@/lib/inbox-fit-profile.mjs";
 
 export const dynamic = "force-dynamic"; // always read fresh local files
 
+export const metadata = { title: "Pipeline" };
+
 // Tracker tabs show the inbox only as a count, so they get the count and not
 // the postings. The inbox is most of the page payload on a large pipeline.
 export default async function PipelinePage({ searchParams }: { searchParams: Promise<{ tab?: string | string[] }> }) {

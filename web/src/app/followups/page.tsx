@@ -5,6 +5,8 @@ import { readFollowupsEnabled } from "@/lib/followups-server";
 
 export const dynamic = "force-dynamic"; // cadence is computed fresh per request
 
+export const metadata = { title: "Follow-ups" };
+
 export default function FollowupsPage() {
   if (!readFollowupsEnabled()) {
     return (
