@@ -1,0 +1,134 @@
+# Jurisdiction-Prohibited Content Table (#2018)
+#
+# Content that employers are legally prohibited from requiring or asking for,
+# keyed by the candidate's jurisdiction. Consumed prompt-level by:
+#   - modes/oferta.md  — Block G "Jurisdiction-Prohibited Content" signal (JD text)
+#   - modes/apply.md   — Step 5c form-field warning (application forms)
+#
+# No script reads this file at runtime. Matching is agent-judged against each
+# entry's `matching` guidance — never naive keyword/regex matching. Example of
+# why: "we will never ask for your salary history" in a fraud-warning footer
+# must NOT fire the US-CA entry; a form field requesting current/past salary
+# must.
+#
+# CONTRIBUTION RULE (mandatory): no entry without a citable legal source AND an
+# effective date. The bar is "lawyer-bulletin-grade source required" — a
+# statute/regulation citation plus at least one law-firm client bulletin or
+# official government source. "Heard it somewhere" does not qualify; the
+# candidate's trust in this signal depends on the seed data being right.
+#
+# Schema per entry:
+#   jurisdiction:       key formatted {ISO 3166-1 alpha-2 country}-{region code},
+#                       e.g. CA-ON (Ontario, Canada), US-CA (California, USA)
+#   jurisdiction_name:  human-readable jurisdiction name
+#   prohibited:         what employers are prohibited from requiring/asking
+#   matching:           agent-judgment guidance — when the signal should and
+#                       should NOT fire
+#   legal_basis:        the statute/regulation (cited verbatim in output)
+#   effective:          YYYY-MM-DD the prohibition took effect (cited in output)
+#   sources:            law-firm bulletins / official sources backing the entry
+
+entries:
+  - jurisdiction: CA-ON
+    jurisdiction_name: "Ontario, Canada"
+    prohibited: >-
+      A requirement for "Canadian experience", or an equivalent requirement,
+      in a publicly advertised job posting or an associated application form.
+    matching: >-
+      Fires when the posting/form requires or prefers "Canadian experience"
+      or an equivalent formulation (e.g. "Canadian work experience required",
+      "must have experience in the Canadian market" used as a proxy for
+      work-history location rather than genuine market knowledge). Does NOT
+      fire on legitimate location/authorization content: being legally
+      entitled to work in Canada, being located in Canada, holding a
+      Canada-specific license or credential, or knowledge-of-market
+      requirements that are plausibly genuine for the role. Applies to
+      publicly advertised postings; scope exemptions exist and are not
+      verifiable from the JD — which is one reason the output states facts
+      about the posting text only.
+    legal_basis: >-
+      Ontario Employment Standards Act, 2000 amendments introduced by the
+      Working for Workers Four Act, 2024 and Working for Workers Five Act,
+      2024, together with O. Reg. 476/24
+    effective: "2026-01-01"
+    sources:
+      - "Fasken client bulletin on Ontario's job-posting requirements in force January 1, 2026"
+      - "Littler insight on Ontario's Working for Workers Four/Five Acts job-posting rules (2026)"
+      - "Hicks Morley FTR Now bulletin on the ESA job-posting requirements effective January 1, 2026"
+
+  - jurisdiction: US-CA
+    jurisdiction_name: "California, USA"
+    prohibited: >-
+      Seeking an applicant's salary history — including compensation and
+      benefits history — whether orally, in writing, personally, or through
+      an agent.
+    matching: >-
+      Fires when a posting or application-form field asks what the candidate
+      currently earns or previously earned (current salary, salary history,
+      past compensation, W-2 upload requests used to verify prior pay,
+      benefits history). Does NOT fire on questions about the candidate's
+      salary EXPECTATIONS or desired range (asking expectations is lawful,
+      and California employers must provide a pay scale on request), nor on
+      fraud-warning boilerplate stating the employer will never ask for such
+      information, nor when the candidate volunteers history unprompted.
+    legal_basis: "California Labor Code section 432.3 (AB 168, 2017)"
+    effective: "2018-01-01"
+    sources:
+      - "Ogletree Deakins analysis of California Labor Code 432.3 salary history inquiry ban (AB 168)"
+      - "Jackson Lewis guidance on California's salary history ban effective January 1, 2018"
+
+  # Norway: national law, so the key is the country code alone (as the US key in
+  # immigration-status-requirements.yml). Quoted: a YAML 1.1 parser reads a bare
+  # NO as boolean false. Verified on lovdata.no and ldo.no 2026-11-06.
+  - jurisdiction: "NO"
+    jurisdiction_name: "Norway"
+    prohibited: >-
+      Seeking, in the hiring process (including in the job advertisement, at
+      interview or in any other way), information about the applicant's
+      pregnancy, adoption or plans to have children; religion or belief;
+      ethnicity; disability; sexual orientation, gender identity or gender
+      expression; political views; or membership of a trade union. Asking for
+      health information other than what is needed to perform the tasks of the
+      position.
+    matching: >-
+      Fires when a posting or application-form field asks the applicant to
+      state any of those characteristics: for example a question about
+      pregnancy or family plans, religious affiliation, ethnic background,
+      disability, sexual orientation, party politics or union membership, or a
+      request for a general health declaration not tied to the position's
+      tasks. The cited sections give no exception for pregnancy, adoption or
+      plans to have children, or for sexual orientation, gender identity or
+      gender expression. They allow a question about ethnicity, religion,
+      belief, disability or cohabitation status (samlivsform) where the
+      information is decisive for performing the work; about cohabitation
+      status, religion or belief where the employer's purpose is to promote a
+      particular religion or belief and the position matters for that purpose;
+      and about political views or union membership where the nature of the
+      position justifies it or the employer's purpose is to promote a
+      particular political view and the position matters for that purpose. For
+      the purpose-based exceptions the requirement must be stated in the
+      advertisement. When the posting states such a reason, say so and do not
+      report a clean match.
+      Does NOT fire on an equal-opportunity statement that encourages everyone
+      to apply, on a question about whether the applicant needs accommodation
+      to perform the tasks, or on a physical or health requirement plainly tied
+      to the tasks. Treat a clearly optional, voluntary self-identification
+      question as uncertain, not as a match: the Ombud's guidance treats
+      information the applicant shares voluntarily as outside the ban, and
+      whether a form question is truly voluntary cannot be fully judged from
+      the form.
+    legal_basis: >-
+      Likestillings- og diskrimineringsloven (LOV-2017-06-16-51) § 30;
+      arbeidsmiljøloven (LOV-2005-06-17-62) § 13-4 and § 9-3
+    effective: "2018-01-01"
+    sources:
+      - "Lovdata — likestillings- og diskrimineringsloven chapter 5, § 30 Forbud mot innhenting av opplysninger i ansettelsesprosesser (lovdata.no/dokument/NL/lov/2017-06-16-51/KAPITTEL_5)"
+      - "Lovdata — arbeidsmiljøloven § 13-4 Innhenting av opplysninger ved ansettelse (current wording in force 2018-01-01) and § 9-3 Innhenting av helseopplysninger ved ansettelse (lovdata.no/dokument/NL/lov/2005-06-17-62)"
+      - "Likestillings- og diskrimineringsombudet — Diskriminerende spørsmål på jobbintervju (ldo.no/diskrimineringssituasjoner/diskriminerende-sporsmal-pa-jobbintervju/)"
+
+# Known candidate rows for contributors — NOT entries yet. Each needs its own
+# verified statute citation + effective date + matching-scope check before
+# being promoted to an entry (scopes vary a lot; verify individually):
+#   - Other US salary-history-ban jurisdictions (~20 states plus DC), e.g.
+#     US-NY (NY Labor Law 194-a), US-CO, US-IL, US-MA, US-NJ, US-WA.
+#   - Photo / age / marital-status request restrictions in several EU markets.

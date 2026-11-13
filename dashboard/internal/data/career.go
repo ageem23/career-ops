@@ -1,7 +1,11 @@
 package data
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -9,126 +13,324 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/santifer/career-ops/dashboard/internal/model"
 )
 
 var (
-	reReportLink     = regexp.MustCompile(`\[(\d+)\]\(([^)]+)\)`)
 	reScoreValue     = regexp.MustCompile(`(\d+\.?\d*)/5`)
-	reArchetype      = regexp.MustCompile(`(?i)\*\*Arquetipo(?:\s+detectado)?\*\*\s*\|\s*(.+)`)
+	reSeparatorRow   = regexp.MustCompile(`^\|\s*:?-+:?(?:\s*\|\s*:?-+:?)*\s*\|?\s*$`)
+	reArchetype      = regexp.MustCompile(`(?i)\*\*(?:Arquetipo|Archetype)(?:\s+(?:detectado|detected))?\*\*\s*\|\s*(.+)`)
 	reTlDr           = regexp.MustCompile(`(?i)\*\*TL;DR\*\*\s*\|\s*(.+)`)
 	reTlDrColon      = regexp.MustCompile(`(?i)\*\*TL;DR:\*\*\s*(.+)`)
 	reRemote         = regexp.MustCompile(`(?i)\*\*Remote\*\*\s*\|\s*(.+)`)
 	reComp           = regexp.MustCompile(`(?i)\*\*Comp\*\*\s*\|\s*(.+)`)
-	reArchetypeColon = regexp.MustCompile(`(?i)\*\*Arquetipo:\*\*\s*(.+)`)
+	reArchetypeColon = regexp.MustCompile(`(?i)\*\*(?:Arquetipo|Archetype):\*\*\s*(.+)`)
+	reArchetypeYAML  = regexp.MustCompile(`(?m)^archetype:\s*"?([^"\n]+)"?\s*$`)
 	reReportURL      = regexp.MustCompile(`(?m)^\*\*URL:\*\*\s*(https?://\S+)`)
-	reBatchID        = regexp.MustCompile(`(?m)^\*\*Batch ID:\*\*\s*(\d+)`)
+	reReportLabel    = regexp.MustCompile(`^\d+$`)
+	// Backslash escapes a markdown link destination may carry; mirrors the
+	// unescape in tracker-parse.mjs markdownLinkDestination().
+	reMarkdownDestEscape = regexp.MustCompile(`\\([\\()<> ])`)
+	reBatchID            = regexp.MustCompile(`(?m)^\*\*Batch ID:\*\*\s*(\d+)`)
+	reDiscardReasons     = regexp.MustCompile(`(?s)discard_reasons:\s*\n((?:\s*-\s*.+?\n)+)`)
+	reDiscardItem        = regexp.MustCompile(`\s*-\s*([^\n]+)`)
 )
 
+// resolveReportPath converts a report link from the tracker into a path
+// relative to careerOpsPath. Links are normally relative to the tracker
+// file's own directory (see merge-tracker.mjs link normalization, #760);
+// legacy trackers may still carry root-relative links, so fall back to the
+// raw link when the tracker-relative resolution does not exist on disk.
+func resolveReportPath(careerOpsPath, trackerPath, link string) string {
+	resolved := filepath.Join(filepath.Dir(trackerPath), link)
+	if _, err := os.Stat(resolved); err != nil {
+		legacy := filepath.Join(careerOpsPath, link)
+		if _, err2 := os.Stat(legacy); err2 == nil {
+			resolved = legacy
+		}
+	}
+	if rel, err := filepath.Rel(careerOpsPath, resolved); err == nil {
+		return rel
+	}
+	return link
+}
+
+// repoRootMarker identifies a career-ops checkout. path-resolver.mjs is chosen
+// because that file IS the Node implementation of this same resolution, so the
+// two cannot disagree about which directory is the root.
+const repoRootMarker = "path-resolver.mjs"
+
+// ancestorWithMarker returns the first directory at or above `start` that holds
+// the marker, or "" when there is none.
+//
+// Only fs.ErrNotExist is treated as "not here". Any other stat error means the
+// directory exists and could not be examined, and walking past it would anchor
+// the data root somewhere else entirely — so it is surfaced rather than
+// swallowed into a silent fallback.
+func ancestorWithMarker(start string) (string, error) {
+	dir := start
+	for {
+		_, err := os.Stat(filepath.Join(dir, repoRootMarker))
+		if err == nil {
+			return dir, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("look for %s in %s: %w", repoRootMarker, dir, err)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", nil
+		}
+		dir = parent
+	}
+}
+
+// FindRepoRoot locates the career-ops checkout independent of the working
+// directory, or "" when it cannot be found.
+//
+// AGENTS.md and DATA_CONTRACT.md both say a relative CAREER_OPS_ROOT /
+// CAREER_OPS_TRACKER is "resolved relative to the repository root", and
+// path-resolver.mjs does that with no reference to cwd at all — it resolves
+// against its own __dirname.
+//
+// Two sources, in order of reliability:
+//
+//	cwd and its ancestors     being run from anywhere inside the checkout
+//	the executable and its    a binary built in the checkout but run from
+//	ancestors                 outside it, which cwd cannot answer
+//
+// Exported so main.go uses this one rather than keeping a second search of its
+// own: CAREER_OPS_TRACKER resolves through here, and two walkers that disagree
+// would let the dashboard and its tracker land on different roots.
+func FindRepoRoot() (string, error) {
+	if cwd, err := os.Getwd(); err == nil {
+		root, statErr := ancestorWithMarker(cwd)
+		if statErr != nil {
+			return "", statErr
+		}
+		if root != "" {
+			return root, nil
+		}
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return "", nil
+	}
+	if resolved, linkErr := filepath.EvalSymlinks(exe); linkErr == nil {
+		exe = resolved
+	}
+	root, statErr := ancestorWithMarker(filepath.Dir(exe))
+	if statErr != nil {
+		return "", statErr
+	}
+	return root, nil
+}
+
+// getRepoRoot keeps the previous contract for callers that have nowhere to put
+// an error: the checkout when it can be found, cwd otherwise.
+func getRepoRoot() string {
+	if root, err := FindRepoRoot(); err == nil && root != "" {
+		return root
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return cwd
+}
+
+func resolveTrackerPath(careerOpsPath string) string {
+	if envTracker := strings.TrimSpace(os.Getenv("CAREER_OPS_TRACKER")); envTracker != "" {
+		if filepath.IsAbs(envTracker) {
+			return filepath.Clean(envTracker)
+		}
+		return filepath.Clean(filepath.Join(getRepoRoot(), envTracker))
+	}
+	dataPath := filepath.Clean(filepath.Join(careerOpsPath, "data", "applications.md"))
+	// Fall back ONLY when data/applications.md is genuinely absent. Any other
+	// stat failure means the canonical tracker IS there and could not be
+	// examined, and falling back then sends the reader to a legacy path that
+	// usually does not exist — so a permission error on the real tracker
+	// surfaced as "could not find applications.md", the same mix-up this change
+	// removes one step later in ParseApplications.
+	if _, err := os.Stat(dataPath); err == nil {
+		return dataPath
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		// Returned as the resolved path so the caller's own read reports the
+		// real error against the real file, rather than this function inventing
+		// a second error channel for a path it only computes.
+		return dataPath
+	}
+	return filepath.Clean(filepath.Join(careerOpsPath, "applications.md"))
+}
+
+// reportHeaderBytes is how much of a report the URL enrichment scans.
+const reportHeaderBytes = 1000
+
+// readFileHead returns at most the first n bytes of the file at path. A file
+// shorter than n is returned whole.
+func readFileHead(path string, n int) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	buf := make([]byte, n)
+	read, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, err
+	}
+	return buf[:read], nil
+}
+
 // ParseApplications reads applications.md and returns parsed applications.
-// It tries both {path}/applications.md and {path}/data/applications.md for compatibility.
-func ParseApplications(careerOpsPath string) []model.CareerApplication {
-	filePath := filepath.Join(careerOpsPath, "applications.md")
+//
+// The error is returned rather than folded into a nil slice because absent and
+// unreadable are different facts and the callers need to tell them apart. A
+// tracker that is not there yet is a first run; one that cannot be opened is
+// the user's whole pipeline being inaccessible, and reporting that as "no
+// applications" both loses the pipeline and makes ComputeProgressMetrics
+// report the search as failing (every rate falls to 0% and renders red).
+//
+// Callers should branch on errors.Is(err, fs.ErrNotExist). Same rule the rest
+// of the project follows for user-layer reads: ENOENT is the only failure that
+// legitimately means empty.
+func ParseApplications(careerOpsPath string) ([]model.CareerApplication, error) {
+	filePath := resolveTrackerPath(careerOpsPath)
 	content, err := os.ReadFile(filePath)
 	if err != nil {
-		// Fallback: try data/ subdirectory
-		filePath = filepath.Join(careerOpsPath, "data", "applications.md")
-		content, err = os.ReadFile(filePath)
-		if err != nil {
-			return nil
-		}
+		return nil, fmt.Errorf("read tracker %s: %w", filePath, err)
 	}
 
 	lines := strings.Split(string(content), "\n")
 	apps := make([]model.CareerApplication, 0)
 	num := 0
 
+	// Map columns by header name rather than fixed position, so a customized or
+	// reordered tracker (e.g. an inserted Location column) does not desync the
+	// reader. Falls back to the legacy fixed layout when no header is present.
+	// This matches the Node tracker tooling, which became header-aware in #954.
+	cols := resolveTrackerColumns(lines)
+	width := trackerRowWidth(cols)
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "# ") || strings.HasPrefix(line, "|---") || strings.HasPrefix(line, "| #") {
+		if line == "" || strings.HasPrefix(line, "# ") || reSeparatorRow.MatchString(line) || strings.HasPrefix(line, "| #") {
 			continue
 		}
 		if !strings.HasPrefix(line, "|") {
 			continue
 		}
-
-		// Detect delimiter: if line contains tabs, use tab-aware splitting
-		var fields []string
-		if strings.Contains(line, "\t") {
-			// Mixed format: starts with "| " then tab-separated
-			line = strings.TrimPrefix(line, "|")
-			line = strings.TrimSpace(line)
-			parts := strings.Split(line, "\t")
-			for _, p := range parts {
-				fields = append(fields, strings.TrimSpace(strings.Trim(p, "|")))
-			}
-		} else {
-			// Pure pipe format
-			line = strings.Trim(line, "|")
-			parts := strings.Split(line, "|")
-			for _, p := range parts {
-				fields = append(fields, strings.TrimSpace(p))
-			}
-		}
-
-		if len(fields) < 8 {
+		// A recognized header can start with any column (or Num instead of #).
+		// Use the same full-schema check as column detection, never a lone label.
+		if detectTrackerColumns([]string{line}) != nil {
 			continue
 		}
 
+		fields := splitTrackerRow(line)
+		// A complete row has a cell for every column the header maps, as
+		// parseTrackerRow in tracker-parse.mjs requires. The guard was a fixed 8,
+		// which got both directions wrong: a tracker narrower than that (a
+		// 7-column `# … Status | Report` layout the header detection accepts)
+		// lost every row and read as an empty pipeline with no error, and a row
+		// missing an interior cell under a wider header was read with every
+		// later column shifted one to the left.
+		if len(fields) < width {
+			continue
+		}
+		for i, field := range fields {
+			fields[i] = SanitizeTerminalText(field)
+		}
+
+		at := func(name string) string {
+			if idx, ok := cols[name]; ok && idx >= 0 && idx < len(fields) {
+				return fields[idx]
+			}
+			return ""
+		}
+
 		num++
+		trackerNumber := num
+		rawNumber := at("num")
+		missingNumber := rawNumber == "" || strings.IndexFunc(rawNumber, func(r rune) bool { return r < '0' || r > '9' }) >= 0
+		if parsedNumber, err := strconv.Atoi(rawNumber); err == nil && !missingNumber {
+			trackerNumber = parsedNumber
+		} else {
+			missingNumber = true
+		}
 		app := model.CareerApplication{
-			Number:  num,
-			Date:    fields[1],
-			Company: fields[2],
-			Role:    fields[3],
-			Status:  fields[5],
-			HasPDF:  strings.Contains(fields[6], "\u2705"),
+			Number:               trackerNumber,
+			TrackerNumberMissing: missingNumber,
+			Date:                 at("date"),
+			Company:              at("company"),
+			Role:                 at("role"),
+			JobURL:               trackerPostingURL(at("url")),
+			Status:               at("status"),
+			HasPDF:               strings.Contains(at("pdf"), "\u2705"),
+			Location:             CanonicalizeLocation(at("location")),
 		}
 
-		// Parse score (field 4 = Score column)
-		app.ScoreRaw = fields[4]
-		if sm := reScoreValue.FindStringSubmatch(fields[4]); sm != nil {
-			app.Score, _ = strconv.ParseFloat(sm[1], 64)
+		// Parse score from the Score column.
+		app.ScoreRaw = at("score")
+		if sm := reScoreValue.FindStringSubmatch(at("score")); sm != nil {
+			if score, err := strconv.ParseFloat(sm[1], 64); err == nil {
+				app.Score = score
+				app.HasScore = true
+			}
 		}
 
-		// Parse report link
-		if rm := reReportLink.FindStringSubmatch(fields[7]); rm != nil {
-			app.ReportNumber = rm[1]
-			app.ReportPath = rm[2]
+		// Parse report link. Tracker links are written relative to the
+		// tracker file itself (e.g. ../reports/... when the tracker lives in
+		// data/), so resolve against the tracker's directory and normalize
+		// back to a careerOpsPath-relative path, which is what every
+		// consumer joins against. Legacy root-relative links are kept as a
+		// fallback when the resolved file does not exist.
+		if link, ok := firstNumberedLink(at("report")); ok {
+			app.ReportNumber = link.label
+			app.ReportPath = resolveReportPath(careerOpsPath, filePath, link.target)
 		}
 
-		// Notes (field 8 if exists)
-		if len(fields) > 8 {
-			app.Notes = fields[8]
-		}
+		// Notes column, when present.
+		app.Notes = at("notes")
+
+		// Lift location / work mode / pay / last-contact out of the notes free-text
+		deriveNoteFields(&app)
 
 		apps = append(apps, app)
 	}
 
-	// Enrich with job URLs using 5-tier strategy:
+	// Enrich with job URLs using the tracker URL as tier zero, followed by the
+	// legacy 5-tier strategy for trackers that predate the URL column:
+	// 0. URL column in the tracker
 	// 1. **URL:** field in report header (newest reports)
 	// 2. **Batch ID:** in report -> batch-input.tsv URL lookup
 	// 3. report_num -> batch-state completed mapping (legacy)
 	// 4. scan-history.tsv (pipeline scan entries matched by company+role)
 	// 5. company name fallback from batch-input.tsv
-	batchURLs := loadBatchInputURLs(careerOpsPath)
-	reportNumURLs := loadJobURLs(careerOpsPath)
+	inputPath := batchFilePath(careerOpsPath, "batch-input.tsv")
+	statePath := batchFilePath(careerOpsPath, "batch-state.tsv")
+	batchURLs := loadBatchInputURLs(inputPath)
+	reportNumURLs := loadJobURLs(inputPath, statePath)
 
 	for i := range apps {
+		if apps[i].JobURL != "" {
+			continue
+		}
 		if apps[i].ReportPath == "" {
 			continue
 		}
 		fullReport := filepath.Join(careerOpsPath, apps[i].ReportPath)
-		reportContent, err := os.ReadFile(fullReport)
+		// Only the header (first 1000 bytes) is scanned, so only that much is
+		// read. This runs on every reload, including after each status change,
+		// and reading whole reports to keep 1000 bytes of each scaled with the
+		// size of every report behind a URL-less row.
+		headerBytes, err := readFileHead(fullReport, reportHeaderBytes)
 		if err != nil {
 			continue
 		}
-		header := string(reportContent)
-		// Only scan the header (first 1000 bytes) for speed
-		if len(header) > 1000 {
-			header = header[:1000]
-		}
+		header := string(headerBytes)
 
 		// Strategy 1: **URL:** in report
 		if m := reReportURL.FindStringSubmatch(header); m != nil {
@@ -157,14 +359,38 @@ func ParseApplications(careerOpsPath string) []model.CareerApplication {
 	enrichFromScanHistory(careerOpsPath, apps)
 
 	// Strategy 5: company name fallback from batch-input.tsv
-	enrichAppURLsByCompany(careerOpsPath, apps)
+	enrichAppURLsByCompany(inputPath, apps)
 
-	return apps
+	return apps, nil
+}
+
+// batchFilePath returns where to read one of batch/batch-runner.sh's files,
+// batch-input.tsv or batch-state.tsv.
+//
+// The runner keeps both beside itself in the checkout, even when
+// CAREER_OPS_ROOT, CAREER_OPS_DATA_DIR or a .career-ops-data marker put the
+// data root somewhere else (#5115, #5116). Reading them only from the data
+// root found nothing under that layout, so rows that rely on the batch tiers
+// lost their job URL. The checkout's copy wins when it exists. Only when it
+// does not exist is the data root's used, which covers files kept there by
+// hand and the case where no checkout can be found. Any other stat error
+// keeps the checkout path, so the read fails instead of picking up an older
+// copy from the data root. In the default layout both are the same file.
+//
+// A FindRepoRoot error is not reported here: main.go already warns about it
+// at startup, and the data root is the path this read used before.
+func batchFilePath(careerOpsPath, name string) string {
+	if root, err := FindRepoRoot(); err == nil && root != "" {
+		checkoutPath := filepath.Join(root, "batch", name)
+		if _, statErr := os.Stat(checkoutPath); !errors.Is(statErr, fs.ErrNotExist) {
+			return checkoutPath
+		}
+	}
+	return filepath.Join(careerOpsPath, "batch", name)
 }
 
 // loadBatchInputURLs reads batch-input.tsv and returns a map of batch ID -> job URL.
-func loadBatchInputURLs(careerOpsPath string) map[string]string {
-	inputPath := filepath.Join(careerOpsPath, "batch", "batch-input.tsv")
+func loadBatchInputURLs(inputPath string) map[string]string {
 	inputData, err := os.ReadFile(inputPath)
 	if err != nil {
 		return nil
@@ -204,9 +430,8 @@ type batchEntry struct {
 // loadJobURLs reads batch TSV files and returns a map of report_num -> job URL.
 // Uses two strategies: (1) report_num mapping for completed jobs, (2) company name
 // matching as fallback for failed/missing jobs.
-func loadJobURLs(careerOpsPath string) map[string]string {
+func loadJobURLs(inputPath, statePath string) map[string]string {
 	// Read batch-input.tsv: id \t url \t source \t notes
-	inputPath := filepath.Join(careerOpsPath, "batch", "batch-input.tsv")
 	inputData, err := os.ReadFile(inputPath)
 	if err != nil {
 		return nil
@@ -250,7 +475,6 @@ func loadJobURLs(careerOpsPath string) map[string]string {
 	}
 
 	// Read batch-state.tsv: id \t url \t status \t ... \t report_num \t ...
-	statePath := filepath.Join(careerOpsPath, "batch", "batch-state.tsv")
 	stateData, err := os.ReadFile(statePath)
 	if err != nil {
 		return nil
@@ -352,8 +576,7 @@ func normalizeCompany(name string) string {
 
 // enrichAppURLsByCompany fills in JobURL for apps that didn't get one via report_num mapping.
 // It matches by company name from batch-input.tsv notes.
-func enrichAppURLsByCompany(careerOpsPath string, apps []model.CareerApplication) {
-	inputPath := filepath.Join(careerOpsPath, "batch", "batch-input.tsv")
+func enrichAppURLsByCompany(inputPath string, apps []model.CareerApplication) {
 	inputData, err := os.ReadFile(inputPath)
 	if err != nil {
 		return
@@ -465,7 +688,10 @@ func ComputeMetrics(apps []model.CareerApplication) model.PipelineMetrics {
 }
 
 // NormalizeStatus normalizes raw status text to a canonical form.
-// Aliases match states.yml -- keep in sync with career-ops/states.yml
+// Aliases match templates/states.yml, which Node and web load directly. Keep
+// them in sync; TestNormalizeStatusCoversStatesYAML fails on a states.yml
+// spelling this function resolves differently, and test-all.mjs guards the
+// other direction (no literal here that states.yml has never heard of).
 func NormalizeStatus(raw string) string {
 	// Strip markdown bold and trailing dates
 	s := strings.ReplaceAll(raw, "**", "")
@@ -476,23 +702,27 @@ func NormalizeStatus(raw string) string {
 	}
 
 	switch {
-	// Most restrictive first — accepts both English and Spanish
-	case strings.Contains(s, "no aplicar") || strings.Contains(s, "no_aplicar") || s == "skip" || strings.Contains(s, "geo blocker"):
+	// Most restrictive first — accepts English, Spanish, and Turkish
+	case s == "hired" || s == "contratado" || s == "contratada" || s == "accepted" || s == "accept" || s == "kabul edildi" || s == "kabul_edildi" || s == "işe alındı" || s == "ise alindi" || s == "işe alindi":
+		return "hired"
+	case strings.Contains(s, "no aplicar") || strings.Contains(s, "no_aplicar") || s == "skip" || s == "monitor" || strings.Contains(s, "geo blocker") || strings.Contains(s, "geo_blocker") || strings.Contains(s, "uygun değil") || strings.Contains(s, "uygun_değil") || strings.Contains(s, "uygun degil") || strings.Contains(s, "uygun_degil"):
 		return "skip"
-	case strings.Contains(s, "interview") || strings.Contains(s, "entrevista"):
+	case strings.Contains(s, "interview") || strings.Contains(s, "entrevista") || strings.Contains(s, "mülakat") || strings.Contains(s, "mulakat"):
 		return "interview"
-	case s == "offer" || strings.Contains(s, "oferta"):
+	case s == "assessment" || s == "screening" || s == "online assessment" || s == "online_assessment" || s == "online screening":
+		return "assessment"
+	case s == "offer" || strings.Contains(s, "oferta") || strings.Contains(s, "teklif"):
 		return "offer"
-	case strings.Contains(s, "responded") || strings.Contains(s, "respondido"):
+	case strings.Contains(s, "responded") || strings.Contains(s, "respondido") || strings.Contains(s, "yanıt verildi") || strings.Contains(s, "yanıt_verildi") || strings.Contains(s, "yanit verildi") || strings.Contains(s, "yanit_verildi"):
 		return "responded"
-	case strings.Contains(s, "applied") || strings.Contains(s, "aplicado") || s == "enviada" || s == "aplicada" || s == "sent":
+	case strings.Contains(s, "applied") || strings.Contains(s, "aplicado") || s == "enviada" || s == "aplicada" || s == "sent" || strings.Contains(s, "başvuruldu") || strings.Contains(s, "basvuruldu"):
 		return "applied"
-	case strings.Contains(s, "rejected") || strings.Contains(s, "rechazado") || s == "rechazada":
+	case strings.Contains(s, "rejected") || strings.Contains(s, "rechazado") || s == "rechazada" || strings.Contains(s, "reddedildi"):
 		return "rejected"
-	case strings.Contains(s, "discarded") || strings.Contains(s, "descartado") || s == "descartada" || s == "cerrada" || s == "cancelada" ||
-		strings.HasPrefix(s, "duplicado") || strings.HasPrefix(s, "dup"):
+	case s == "lapsed" || strings.Contains(s, "discarded") || strings.Contains(s, "descartado") || s == "descartada" || s == "cerrada" || s == "cancelada" ||
+		strings.HasPrefix(s, "duplicado") || strings.HasPrefix(s, "dup") || strings.Contains(s, "iptal edildi") || strings.Contains(s, "iptal_edildi") || strings.Contains(s, "ıptal edildi") || strings.Contains(s, "ıptal_edildi"):
 		return "discarded"
-	case strings.Contains(s, "evaluated") || strings.Contains(s, "evaluada") || s == "condicional" || s == "hold" || s == "monitor" || s == "evaluar" || s == "verificar":
+	case strings.Contains(s, "evaluated") || strings.Contains(s, "evaluada") || s == "condicional" || s == "hold" || s == "evaluar" || s == "verificar" || strings.Contains(s, "değerlendirildi") || strings.Contains(s, "degerlendirildi"):
 		return "evaluated"
 	default:
 		return s
@@ -512,6 +742,8 @@ func LoadReportSummary(careerOpsPath, reportPath string) (archetype, tldr, remot
 		archetype = cleanTableCell(m[1])
 	} else if m := reArchetypeColon.FindStringSubmatch(text); m != nil {
 		archetype = cleanTableCell(m[1])
+	} else if m := reArchetypeYAML.FindStringSubmatch(text); m != nil {
+		archetype = strings.TrimSpace(m[1])
 	}
 
 	// Try table-format TL;DR first (most reports), then colon format
@@ -529,53 +761,415 @@ func LoadReportSummary(careerOpsPath, reportPath string) (archetype, tldr, remot
 		comp = cleanTableCell(m[1])
 	}
 
-	// Truncate long fields
-	if len(tldr) > 120 {
-		tldr = tldr[:117] + "..."
+	archetype = SanitizeTerminalText(archetype)
+	tldr = SanitizeTerminalText(tldr)
+	remote = SanitizeTerminalText(remote)
+	comp = SanitizeTerminalText(comp)
+
+	// Truncate long fields by characters, not bytes: a byte cut splits a
+	// multi-byte character and stops non-Latin text at half the length.
+	if r := []rune(tldr); len(r) > 120 {
+		tldr = string(r[:117]) + "..."
 	}
 
 	return
 }
 
-// UpdateApplicationStatus updates the status of an application in applications.md.
-func UpdateApplicationStatus(careerOpsPath string, app model.CareerApplication, newStatus string) error {
-	filePath := filepath.Join(careerOpsPath, "applications.md")
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		filePath = filepath.Join(careerOpsPath, "data", "applications.md")
-		content, err = os.ReadFile(filePath)
-		if err != nil {
-			return err
+// splitTrackerRow splits a tracker table line into trimmed cell values, using
+// the same delimiter logic as ParseApplications: a mixed "| " + tab-separated
+// body, or a pure pipe-delimited row. Field 0 is the first real column (num), so
+// the returned indices match the legacy layout (Status is field 5).
+//
+// A line is tab-delimited only when it holds a tab and at most two pipes, as in
+// tracker-parse.mjs trackerRowSeparator. In a pipe table a tab is note text that
+// set-status.mjs --note keeps verbatim, not a column delimiter.
+// test-fixtures/tracker-row-split-parity.json pins both readers to one table.
+func splitTrackerRow(line string) []string {
+	line = strings.TrimSpace(line)
+	var fields []string
+	if strings.Contains(line, "\t") && strings.Count(line, "|") <= 2 {
+		// Mixed format: starts with "| " then tab-separated.
+		line = strings.TrimPrefix(line, "|")
+		line = strings.TrimSpace(line)
+		for _, p := range strings.Split(line, "\t") {
+			fields = append(fields, strings.TrimSpace(strings.Trim(p, "|")))
+		}
+	} else {
+		// Pure pipe format. Only the two outer pipes come off: in a row ending in
+		// `||` the first of them closes an empty last cell, which parseTrackerRow
+		// keeps and the width guard counts.
+		line = strings.TrimSuffix(strings.TrimPrefix(line, "|"), "|")
+		for _, p := range strings.Split(line, "|") {
+			fields = append(fields, strings.TrimSpace(p))
 		}
 	}
+	return fields
+}
 
-	lines := strings.Split(string(content), "\n")
-	found := false
+// trackerPostingURL is a row's JobURL from its tracker URL cell: the posting
+// URL the cell names, or "" when it names none — a "—"/"N/A" placeholder (the
+// tracker's empty-cell marker, which a hand-added row carries; "N/A" for a
+// recruiter-sourced role), or a local:jds/ pointer.
+//
+// extractCellURL returns such a cell verbatim, as Node's extractCellUrl does;
+// Node's consumers then key it through normalizeUrl, which yields nothing for
+// a placeholder. Here the consumers only ask whether JobURL is empty: every
+// enrichment tier below runs only for an empty JobURL, so a "—" skipped the
+// report's own **URL:** header and the history tiers, and the pipeline's open
+// action handed "—" to the platform opener. Only an absolute http(s) URL with a
+// host is a posting URL, the same test the viewer's isWebURL applies.
+func trackerPostingURL(cell string) string {
+	value := extractCellURL(cell)
+	parsed, err := url.Parse(value)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return ""
+	}
+	return value
+}
 
-	for i, line := range lines {
-		if !strings.HasPrefix(strings.TrimSpace(line), "|") {
+// extractCellURL returns the posting URL a tracker URL cell points at, in
+// either written form: the href of the first http(s) markdown link, or the cell
+// verbatim when it holds none (a bare URL on an older tracker, or a "—"/"N/A"
+// placeholder, which trackerPostingURL drops before it reaches JobURL).
+//
+// This is a PORT of extractCellUrl / parseMarkdownLinks / markdownLinkDestination
+// in tracker-parse.mjs, not an approximation of it. It used to be two regexes,
+// and they disagreed with Node at the edges: a hand-edited cell holding two
+// adjacent links read as one malformed URL spanning both. The JobURL tier and
+// merge-tracker's dedup key must agree on a row's URL, so the boundary rules —
+// first link wins, balanced parentheses kept, `[`/`]` allowed in the
+// destination, the same escapes undone — are the same code, not a lookalike.
+//
+// This reader is tier 0 of the JobURL enrichment chain since #3452, and a
+// markdown-wrapped cell it could not read would not error — it would look like
+// a row with no URL and silently fall through to the report/scan-history tiers,
+// which resolve a DIFFERENT posting often enough to matter.
+func extractCellURL(cellValue string) string {
+	value := strings.TrimSpace(cellValue)
+	if value == "" {
+		return ""
+	}
+	for _, link := range parseMarkdownLinks(value) {
+		target := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(link.target), "<"), ">")
+		lower := strings.ToLower(target)
+		if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+			return target
+		}
+	}
+	return value
+}
+
+type markdownLink struct {
+	label  string
+	target string
+}
+
+// firstNumberedLink returns the first link in a Report cell whose label is a
+// report number (`[61](../reports/061-….md)`). It walks parseMarkdownLinks so
+// a target with parentheses, such as `001-acme-(berlin)-….md`, survives whole
+// (career-ops-hq/career-ops#5482).
+func firstNumberedLink(cell string) (markdownLink, bool) {
+	for _, link := range parseMarkdownLinks(cell) {
+		if reReportLabel.MatchString(link.label) {
+			return link, true
+		}
+	}
+	return markdownLink{}, false
+}
+
+// parseMarkdownLinks returns every markdown link in value, in order. Mirrors
+// parseMarkdownLinks in tracker-parse.mjs: the label ends at the first
+// unescaped `]`, it must be followed directly by `(`, and the destination runs
+// to the `)` that balances it, so `(remote)` inside a href survives whole.
+// Works on runes; every delimiter involved is ASCII.
+func parseMarkdownLinks(value string) []markdownLink {
+	r := []rune(value)
+	var links []markdownLink
+	cursor := 0
+	for cursor < len(r) {
+		labelStart := -1
+		for i := cursor; i < len(r); i++ {
+			if r[i] == '[' {
+				labelStart = i
+				break
+			}
+		}
+		if labelStart == -1 {
+			break
+		}
+		labelEnd := -1
+		for i := labelStart + 1; i < len(r); i++ {
+			if r[i] == '\\' {
+				i++
+			} else if r[i] == ']' {
+				labelEnd = i
+				break
+			}
+		}
+		if labelEnd == -1 || labelEnd+1 >= len(r) || r[labelEnd+1] != '(' {
+			cursor = labelStart + 1
 			continue
 		}
-		// Match by report number
-		if app.ReportNumber != "" && strings.Contains(line, fmt.Sprintf("[%s]", app.ReportNumber)) {
-			// Replace the status field
-			lines[i] = replaceStatusInLine(line, app.Status, newStatus)
-			found = true
+		depth, linkEnd := 1, -1
+		for i := labelEnd + 2; i < len(r); i++ {
+			if r[i] == '\\' {
+				i++
+			} else if r[i] == '(' {
+				depth++
+			} else if r[i] == ')' {
+				depth--
+				if depth == 0 {
+					linkEnd = i
+					break
+				}
+			}
+		}
+		if linkEnd == -1 {
+			cursor = labelStart + 1
+			continue
+		}
+		if target, ok := markdownLinkDestination(string(r[labelEnd+2 : linkEnd])); ok {
+			links = append(links, markdownLink{label: string(r[labelStart+1 : labelEnd]), target: target})
+		}
+		cursor = linkEnd + 1
+	}
+	return links
+}
+
+// markdownLinkDestination extracts the destination from the text between `](`
+// and its balancing `)`: an angle-bracketed `<...>` form, or the run up to the
+// first whitespace outside parentheses. Mirrors markdownLinkDestination in
+// tracker-parse.mjs, including undoing the same escapes.
+func markdownLinkDestination(raw string) (string, bool) {
+	r := []rune(strings.TrimLeftFunc(raw, unicode.IsSpace))
+	if len(r) > 0 && r[0] == '<' {
+		for i := 1; i < len(r); i++ {
+			if r[i] == '\\' {
+				i++
+			} else if r[i] == '>' {
+				return reMarkdownDestEscape.ReplaceAllString(string(r[1:i]), "$1"), true
+			}
+		}
+		return "", false
+	}
+	depth, end := 0, len(r)
+	for i := 0; i < len(r); i++ {
+		switch {
+		case r[i] == '\\':
+			i++
+		case r[i] == '(':
+			depth++
+		case r[i] == ')' && depth > 0:
+			depth--
+		case unicode.IsSpace(r[i]) && depth == 0:
+			end = i
+		}
+		if end != len(r) {
 			break
 		}
 	}
-
-	if !found {
-		return fmt.Errorf("application not found: report %s", app.ReportNumber)
+	destination := strings.TrimSpace(string(r[:end]))
+	if destination == "" {
+		return "", false
 	}
-
-	return os.WriteFile(filePath, []byte(strings.Join(lines, "\n")), 0644)
+	return reMarkdownDestEscape.ReplaceAllString(destination, "$1"), true
 }
 
-// replaceStatusInLine replaces the old status with new status in a table line.
-func replaceStatusInLine(line, oldStatus, newStatus string) string {
-	// Case-insensitive replacement of the status field
-	return strings.Replace(line, oldStatus, newStatus, 1)
+// trackerHeaderAliases maps a lowercased header cell to a canonical field name.
+// Mirrors tracker-aliases.json, which Node and web load directly. Keep the full
+// table in sync; TestTrackerHeaderAliasesMatchSharedJSON guards exact parity.
+var trackerHeaderAliases = map[string]string{
+	"#": "num", "num": "num",
+	"date": "date", "fecha": "date", "datum": "date", "data": "date",
+	"dato": "date", "tanggal": "date", "tarih": "date",
+	"company": "company", "empresa": "company",
+	"firma": "company", "virksomhed": "company", "virksomhet": "company", "perusahaan": "company",
+	"entreprise": "company", "azienda": "company", "şirket": "company",
+	"via": "via", "role": "role", "puesto": "role",
+	"rolle": "role", "rola": "role", "vaga": "role", "ruolo": "role", "rol": "role",
+	"location": "location", "ort": "location",
+	"score": "score", "punteggio": "score", "puan": "score",
+	"status": "status", "statut": "status", "stato": "status", "durum": "status",
+	"pdf": "pdf", "materials": "pdf", "report": "report", "rapor": "report",
+	"apply link": "applylink", "apply": "applylink",
+	"follow-up": "followup", "follow up": "followup", "followup": "followup",
+	"notes": "notes", "notlar": "notes", "url": "url",
+}
+
+// legacyTrackerColumns is the original fixed layout in splitTrackerRow field
+// space (num=0 … notes=8), used when no recognizable header row is present.
+var legacyTrackerColumns = map[string]int{
+	"num": 0, "date": 1, "company": 2, "role": 3, "score": 4,
+	"status": 5, "pdf": 6, "report": 7, "notes": 8,
+}
+
+// detectTrackerColumns scans for the table header row and maps canonical field
+// names to column indices in splitTrackerRow field space. It returns nil unless
+// the essential columns are all present, so a stray pipe line cannot yield a
+// bogus mapping and the caller falls back to legacyTrackerColumns. Mirrors
+// detectColumns in tracker-parse.mjs (#954).
+func detectTrackerColumns(lines []string) map[string]int {
+	for _, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), "|") {
+			continue
+		}
+		cells := splitTrackerRow(line)
+		m := make(map[string]int)
+		for i, c := range cells {
+			if name, ok := trackerHeaderAliases[strings.ToLower(c)]; ok {
+				// Unconditional assign: with a duplicated header name the LAST
+				// occurrence wins, matching detectColumns in tracker-parse.mjs
+				// (which this function mirrors) — first-wins here made the two
+				// runtimes map the same header row differently.
+				m[name] = i
+			}
+		}
+		complete := true
+		for _, k := range []string{"num", "company", "role", "score", "status"} {
+			if _, ok := m[k]; !ok {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			return m
+		}
+	}
+	return nil
+}
+
+// trackerRowWidth is how many cells a complete row has under cols: one per
+// column up to the highest one mapped. The Go twin of parseTrackerRow's
+// dynamic width guard; splitTrackerRow drops the outer pipes, so no edge cells
+// are counted.
+func trackerRowWidth(cols map[string]int) int {
+	width := 0
+	for _, idx := range cols {
+		if idx+1 > width {
+			width = idx + 1
+		}
+	}
+	return width
+}
+
+// resolveTrackerColumns returns the header-detected column map, falling back to
+// the legacy fixed layout when no header row is found.
+func resolveTrackerColumns(lines []string) map[string]int {
+	if m := detectTrackerColumns(lines); m != nil {
+		return m
+	}
+	return legacyTrackerColumns
+}
+
+func UpdateApplicationStatus(careerOpsPath string, app model.CareerApplication, newStatus string) error {
+	return UpdateApplicationStatusAndNotes(careerOpsPath, app, newStatus, "")
+}
+
+// UpdateApplicationStatusAndNotes delegates to the canonical writer so status,
+// notes, the transition ledger and Applied follow-up seeding share one path.
+// Notes use the CLI's idempotent "; " separator; empty notes are unchanged.
+// Only the child takes the tracker lock: holding it here would deadlock.
+func UpdateApplicationStatusAndNotes(careerOpsPath string, app model.CareerApplication, newStatus, notesAppend string) error {
+	if strings.ContainsAny(notesAppend, "|\r\n\t") {
+		return fmt.Errorf("notes cannot contain table delimiters or line breaks")
+	}
+	if !isCanonicalStatusName(newStatus) {
+		return fmt.Errorf("unrecognized status: %q", newStatus)
+	}
+	if app.ReportNumber == "" {
+		return fmt.Errorf("application has no report identity; use set-status.mjs --row to select a tracker row")
+	}
+	return runStatusWriter(careerOpsPath, app.ReportNumber, newStatus, notesAppend)
+}
+
+// IsCanonicalStatusName reports whether status is one of the states.yml
+// stages, matched case-insensitively. The pipeline screen uses it to decide
+// which rows belong on the OTHER tab.
+func IsCanonicalStatusName(status string) bool {
+	return isCanonicalStatusName(status)
+}
+
+// Reject malformed UI input cheaply; the writer validates against states.yml.
+func isCanonicalStatusName(status string) bool {
+	switch strings.ToLower(status) {
+	case "evaluated", "applied", "responded", "assessment", "interview", "offer", "hired", "rejected", "discarded", "skip":
+		return true
+	}
+	return false
+}
+
+// AppendApplicationNote appends a note fragment to the Notes column of the
+// application row identified by reportNumber. Joined to existing notes with
+// "; " (a non-pipe separator so the table parser still sees a single column).
+// No-op if the application is not found.
+func AppendApplicationNote(careerOpsPath, reportNumber, note string) (err error) {
+	if reportNumber == "" || note == "" {
+		return nil
+	}
+	// Pipes inside a markdown table cell fracture the row when split by '|'.
+	// Replace them with the broken-bar U+00A6 so the cell stays single-column.
+	note = strings.ReplaceAll(note, "|", "¦")
+	// Same tracker the parser and the Node writers use (data/ first, then the
+	// legacy root layout, CAREER_OPS_TRACKER honoured), under the shared
+	// tracker lock so a concurrent set-status/merge-tracker write is not lost.
+	filePath := resolveTrackerPath(careerOpsPath)
+	lock, err := acquireTrackerLock(filePath, defaultTrackerLockOptions())
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if releaseErr := lock.release(); releaseErr != nil && err == nil {
+			err = releaseErr
+		}
+	}()
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(string(content), "\n")
+	marker := fmt.Sprintf("[%s]", reportNumber)
+	for i, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), "|") || !strings.Contains(line, marker) {
+			continue
+		}
+		// Update last column (Notes). Find last pipe before optional trailing pipe.
+		trimmed := strings.TrimRight(line, " \t")
+		trailingPipe := strings.HasSuffix(trimmed, "|")
+		body := trimmed
+		if trailingPipe {
+			body = strings.TrimSuffix(body, "|")
+			body = strings.TrimRight(body, " \t")
+		}
+		lastPipe := strings.LastIndex(body, "|")
+		if lastPipe < 0 {
+			return nil
+		}
+		notesField := strings.TrimSpace(body[lastPipe+1:])
+		var newNotes string
+		if notesField == "" {
+			newNotes = note
+		} else {
+			newNotes = notesField + "; " + note
+		}
+		rebuilt := body[:lastPipe+1] + " " + newNotes
+		if trailingPipe {
+			rebuilt += " |"
+		}
+		lines[i] = rebuilt
+		return writeFileAtomic(filePath, []byte(strings.Join(lines, "\n")))
+	}
+	return nil
+}
+
+// FindApplicationByNumber returns the application matching tracker number, or false.
+func FindApplicationByNumber(apps []model.CareerApplication, number int) (model.CareerApplication, bool) {
+	for _, a := range apps {
+		if a.Number == number {
+			return a, true
+		}
+	}
+	return model.CareerApplication{}, false
 }
 
 // cleanTableCell removes trailing pipes and whitespace from a table cell value.
@@ -588,29 +1182,36 @@ func cleanTableCell(s string) string {
 // StatusPriority returns the sort priority for a status (lower = higher priority).
 func StatusPriority(status string) int {
 	switch NormalizeStatus(status) {
+	// Hired sorts first, as in statusGroupOrder (screens/pipeline.go), the
+	// order the group headers and the metrics strip use. -1 keeps the other
+	// values as they are.
+	case "hired":
+		return -1
 	case "interview":
 		return 0
 	case "offer":
 		return 1
-	case "responded":
+	case "assessment":
 		return 2
-	case "applied":
+	case "responded":
 		return 3
-	case "evaluated":
+	case "applied":
 		return 4
-	case "skip":
+	case "evaluated":
 		return 5
-	case "rejected":
+	case "skip":
 		return 6
-	case "discarded":
+	case "rejected":
 		return 7
-	default:
+	case "discarded":
 		return 8
+	default:
+		return 9
 	}
 }
 
 // ComputeProgressMetrics computes progress-oriented analytics from applications.
-func ComputeProgressMetrics(apps []model.CareerApplication) model.ProgressMetrics {
+func ComputeProgressMetrics(apps []model.CareerApplication, history ...map[int]int) model.ProgressMetrics {
 	pm := model.ProgressMetrics{}
 
 	// Count by normalized status
@@ -630,10 +1231,8 @@ func ComputeProgressMetrics(apps []model.CareerApplication) model.ProgressMetric
 			}
 		}
 
-		if norm == "offer" {
-			pm.TotalOffers++
-		}
-		if norm != "skip" && norm != "rejected" && norm != "discarded" {
+		switch norm {
+		case "applied", "responded", "assessment", "interview", "offer":
 			pm.ActiveApps++
 		}
 	}
@@ -643,22 +1242,79 @@ func ComputeProgressMetrics(apps []model.CareerApplication) model.ProgressMetric
 	}
 
 	// Funnel: each stage counts all apps that reached at least that stage.
-	// An app in "interview" has passed through evaluated -> applied -> responded -> interview.
+	// An app in "interview" has passed through evaluated -> applied -> responded -> assessment -> interview.
+	// "hired" is terminal success and proves every earlier stage (a landed job
+	// proves the offer, the interviews, the response, and the submission), so it
+	// counts into all four existing funnel tiers — matching computeFunnel() in stats.mjs, the
+	// canonical funnel definition, whose docstring already describes this exact
+	// math as mirroring this function.
 	total := len(apps)
-	applied := statusCounts["applied"] + statusCounts["responded"] + statusCounts["interview"] + statusCounts["offer"] + statusCounts["rejected"]
-	responded := statusCounts["responded"] + statusCounts["interview"] + statusCounts["offer"]
-	interview := statusCounts["interview"] + statusCounts["offer"]
-	offer := statusCounts["offer"]
+	applied := statusCounts["applied"] + statusCounts["responded"] + statusCounts["assessment"] + statusCounts["interview"] + statusCounts["offer"] + statusCounts["hired"] + statusCounts["rejected"]
+	responded := statusCounts["responded"] + statusCounts["assessment"] + statusCounts["interview"] + statusCounts["offer"] + statusCounts["hired"] + statusCounts["rejected"]
+	assessment := statusCounts["assessment"] + statusCounts["interview"] + statusCounts["offer"] + statusCounts["hired"]
+	interview := statusCounts["interview"] + statusCounts["offer"] + statusCounts["hired"]
+	offer := statusCounts["offer"] + statusCounts["hired"]
+	if len(history) > 0 {
+		applied, responded, assessment, interview, offer = 0, 0, 0, 0, 0
+		ranks := make(map[int]int)
+		var unnumberedRanks []int
+		for _, app := range apps {
+			if NormalizeStatus(app.Status) == "skip" {
+				continue
+			}
+			rank := funnelRank(app.Status)
+			if app.TrackerNumberMissing {
+				unnumberedRanks = append(unnumberedRanks, rank)
+				continue
+			}
+			if history[0][app.Number] > rank {
+				rank = history[0][app.Number]
+			}
+			if rank > ranks[app.Number] {
+				ranks[app.Number] = rank
+			}
+		}
+		for _, rank := range ranks {
+			unnumberedRanks = append(unnumberedRanks, rank)
+		}
+		for _, rank := range unnumberedRanks {
+			if rank >= 1 {
+				applied++
+			}
+			if rank >= 2 {
+				responded++
+			}
+			if rank >= 3 {
+				assessment++
+			}
+			if rank >= 4 {
+				interview++
+			}
+			if rank >= 5 {
+				offer++
+			}
+		}
+	}
 
+	// The Progress headline and funnel must report the same historical offers.
+	pm.TotalOffers = offer
+
+	// Top stage counts every tracked row, including rows backfilled without a
+	// score (#1799) — hence "Tracked", not "Evaluated", which already means both
+	// a status value and the Stats screen's scored count.
 	pm.FunnelStages = []model.FunnelStage{
-		{Label: "Evaluated", Count: total, Pct: 100.0},
+		{Label: "Tracked", Count: total, Pct: 100.0},
 		{Label: "Applied", Count: applied, Pct: safePct(applied, total)},
 		{Label: "Responded", Count: responded, Pct: safePct(responded, applied)},
+		{Label: "Assessment", Count: assessment, Pct: safePct(assessment, applied)},
 		{Label: "Interview", Count: interview, Pct: safePct(interview, applied)},
 		{Label: "Offer", Count: offer, Pct: safePct(offer, applied)},
 	}
 
-	// Rates (relative to applied)
+	// Rates (relative to applied). The denominator travels with them so the
+	// renderer can tell an absent rate from a measured 0% — see
+	// model.ProgressMetrics.RatesDenominator.
+	pm.RatesDenominator = applied
 	if applied > 0 {
 		pm.ResponseRate = float64(responded) / float64(applied) * 100
 		pm.InterviewRate = float64(interview) / float64(applied) * 100
@@ -733,4 +1389,58 @@ func safePct(part, whole int) float64 {
 		return 0
 	}
 	return float64(part) / float64(whole) * 100
+}
+
+// LoadReportDiscardReasons parses predicted discard reasons from a report file.
+func LoadReportDiscardReasons(careerOpsPath, reportPath string) []string {
+	if reportPath == "" {
+		return nil
+	}
+	p := reportPath
+	if strings.Contains(p, "](") {
+		idx := strings.Index(p, "](")
+		p = p[idx+2:]
+		p = strings.TrimSuffix(p, ")")
+	}
+	fullPath := filepath.Join(careerOpsPath, p)
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		return nil
+	}
+	text := string(content)
+
+	match := reDiscardReasons.FindStringSubmatch(text)
+	if len(match) < 2 {
+		return nil
+	}
+
+	itemsMatch := reDiscardItem.FindAllStringSubmatch(match[1], -1)
+	var reasons []string
+	for _, item := range itemsMatch {
+		reasons = append(reasons, strings.TrimSpace(item[1]))
+	}
+	return reasons
+}
+
+// SaveAnonymousStat records an anonymized win stat to data/reported-hires.tsv.
+func SaveAnonymousStat(careerOpsPath string, role string, weeks int) error {
+	dirPath := filepath.Join(careerOpsPath, "data")
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		return err
+	}
+	filePath := filepath.Join(dirPath, "reported-hires.tsv")
+	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err == nil && fi.Size() == 0 {
+		_, _ = f.WriteString("Date\tRoleType\tWeeksToHire\n")
+	}
+
+	dateStr := time.Now().Format("2006-01-02")
+	_, err = f.WriteString(fmt.Sprintf("%s\t%s\t%d\n", dateStr, role, weeks))
+	return err
 }

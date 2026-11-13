@@ -1,0 +1,376 @@
+#!/usr/bin/env node
+/**
+ * reconcile-pipeline.mjs — Sync pipeline.md "Pendientes" with batch-state.tsv
+ *
+ * THE PROBLEM
+ * batch-runner.sh records every evaluated offer in batch/batch-state.tsv, but
+ * it never writes back to data/pipeline.md. Offers processed via batch mode
+ * therefore stay in the "Pendientes" section forever — the next scan and the
+ * next `/career-ops pipeline` run both re-surface them, and they get evaluated
+ * again (duplicate reports, duplicate tracker rows).
+ *
+ * WHAT THIS DOES
+ * For each `completed` / `skipped` entry in batch-state.tsv whose URL is still
+ * sitting in pipeline.md "Pendientes", move that line to "Procesadas" with its
+ * report link, score and PDF flag.
+ *
+ * Idempotent: an entry already moved (no longer in Pendientes) is a no-op, and
+ * an entry already present in Procesadas is dropped from Pendientes without a
+ * second copy. Safe to run after every batch.
+ *
+ * Run: node reconcile-pipeline.mjs [--dry-run] [--state <path>] [--pipeline <path>]
+ */
+
+import { readFileSync, existsSync, readdirSync, copyFileSync, realpathSync, statSync } from 'fs';
+import { join, dirname, resolve, relative, isAbsolute } from 'path';
+import { fileURLToPath } from 'url';
+import { normalizeReportLink } from './tracker-links.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
+import { flagValue, validateFlags } from './lib/cli-flags.mjs';
+import { withPipelineLock, LockTimeoutError } from './pipeline-lock.mjs';
+import { writeFileAtomic } from './tracker-utils.mjs';
+import { sectionKind, processedHeadingFor } from './lib/pipeline-sections.mjs';
+import { normalizeUrl } from './url-key.mjs';
+
+const CAREER_OPS = getCareerOpsRoot();
+const CODEBASE_ROOT = dirname(fileURLToPath(import.meta.url));
+
+const KNOWN_FLAGS = ['--dry-run', '--pipeline', '--state', '--help', '-h'];
+const VALUE_FLAGS = ['--pipeline', '--state'];
+const USAGE = `Usage: node reconcile-pipeline.mjs [--dry-run] [--state <path>] [--pipeline <path>]
+  Moves batch-processed offers out of pipeline.md "Pendientes" into "Procesadas".`;
+
+// An unrecognized flag (typo'd --dry-run, say) used to be silently ignored
+// and fall through to a LIVE run that writes pipeline.md — the caller
+// believed they were in dry-run mode and were not. Fail fast instead.
+const args = process.argv.slice(2);
+validateFlags(args, KNOWN_FLAGS, USAGE, { valueFlags: VALUE_FLAGS, requireOperand: true });
+
+const DRY_RUN = args.includes('--dry-run');
+
+// Pipeline writes stay inside the data root. Batch state can also live in the
+// code checkout, where batch-runner.sh keeps it under batch/.
+// Symlinks are resolved first (realpathSync) so an in-repo symlink cannot
+// smuggle the real target outside the tree past a purely lexical check.
+function resolveInsideRepo(inputPath, fallbackPath, flag, roots = [CAREER_OPS]) {
+  const abs = resolve(inputPath || fallbackPath);
+  let repoRoots, targetReal;
+  try {
+    repoRoots = roots.map(root => realpathSync(root));
+    // The target may not exist yet (e.g. a fresh --pipeline path); fall back to
+    // its parent directory so the symlink-resolved boundary check still applies.
+    targetReal = existsSync(abs) ? realpathSync(abs) : realpathSync(dirname(abs));
+  } catch {
+    console.error(`Invalid ${flag}: cannot resolve path (${abs})`);
+    process.exit(1);
+  }
+  if (!repoRoots.some(root => {
+    const rel = relative(root, targetReal);
+    return !rel.startsWith('..') && !isAbsolute(rel);
+  })) {
+    console.error(`Invalid ${flag}: path must stay inside the repository (${abs})`);
+    process.exit(1);
+  }
+  // Reject a directory target early — otherwise readFileSync/copyFileSync would
+  // throw an unhandled EISDIR later instead of failing with a clear message.
+  if (existsSync(abs) && statSync(abs).isDirectory()) {
+    console.error(`Invalid ${flag}: expected a file, not a directory (${abs})`);
+    process.exit(1);
+  }
+  return abs;
+}
+
+const defaultPipeline = existsSync(join(CAREER_OPS, 'data/pipeline.md'))
+  ? join(CAREER_OPS, 'data/pipeline.md')
+  : join(CAREER_OPS, 'pipeline.md');
+const PIPELINE_FILE = resolveInsideRepo(flagValue(args, '--pipeline'), defaultPipeline, '--pipeline');
+const STATE_FILE = resolveInsideRepo(flagValue(args, '--state'), join(CODEBASE_ROOT, 'batch/batch-state.tsv'), '--state', [CODEBASE_ROOT, CAREER_OPS]);
+const REPORTS_DIR = join(CAREER_OPS, 'reports');
+
+// ---- guards ----
+if (!existsSync(STATE_FILE)) {
+  console.log('No batch-state.tsv found — nothing to reconcile.');
+  process.exit(0);
+}
+if (!existsSync(PIPELINE_FILE)) {
+  console.log('No pipeline.md found — nothing to reconcile.');
+  process.exit(0);
+}
+
+// ---- parse batch-state.tsv ----
+// columns: id  url  status  started_at  completed_at  report_num  score  error  retries
+const DONE = new Map(); // url key -> { reportNum, score, dealbreaker, closed }
+// sync-batch-input.mjs records new URL(raw).href, which lowercases the host and
+// adds a bare origin's trailing slash, so the state file need not spell a URL the
+// way pipeline.md does. Compare keys, or the offer stays Pending for good. A
+// local:jds/ row has no key, so it compares as written.
+const urlKey = (url) => normalizeUrl(url) || url;
+for (const line of readFileSync(STATE_FILE, 'utf-8').split(/\r?\n/)) {
+  if (!line.trim() || line.startsWith('id\t')) continue;
+  const c = line.split('\t');
+  if (c.length < 7) continue;
+  const [, url, status, , , reportNum, score, error] = c;
+  // "completed" and "skipped" (below --min-score) both produced a report. A
+  // dealbreaker skip (batch-prompt.md Step 1.6) is finished without one: its
+  // SKIP tracker row is the record. "skipped" with a posting-closed error did
+  // not produce one either — it is resolved as expired.
+  if (status !== 'completed' && status !== 'skipped') continue;
+  if (!url || !url.trim()) continue;
+  const dealbreaker = status === 'skipped' && (error || '').startsWith('dealbreaker:');
+  const closed = status === 'skipped' && /^posting-closed/.test((error || '').trim());
+  DONE.set(urlKey(url.trim()), { reportNum: (reportNum || '').trim(), score: (score || '').trim(), dealbreaker, closed });
+}
+
+if (DONE.size === 0) {
+  console.log('No completed batch entries in batch-state.tsv — nothing to reconcile.');
+  process.exit(0);
+}
+
+// ---- report lookup ----
+let reportFiles = [];
+try { reportFiles = readdirSync(REPORTS_DIR).filter(f => f.endsWith('.md')); } catch { /* no reports dir */ }
+
+function findReportFile(reportNum) {
+  if (!reportNum || reportNum === '-') return null;
+  const n = parseInt(reportNum, 10);
+  if (Number.isNaN(n)) return null;
+  return reportFiles.find(f => {
+    const m = f.match(/^(\d+)-/);
+    return m && parseInt(m[1], 10) === n;
+  }) || null;
+}
+
+function readReportField(reportFile, field) {
+  if (!reportFile) return null;
+  try {
+    const txt = readFileSync(join(REPORTS_DIR, reportFile), 'utf-8');
+    // An empty header is unknown; never borrow the following URL/PDF line.
+    const m = txt.match(new RegExp(`^\\*\\*${field}:\\*\\*([^\\r\\n]*)$`, 'm'));
+    return m ? m[1].trim() : null;
+  } catch { return null; }
+}
+
+function formatScore(value) {
+  return /^\d+(?:\.\d+)?$/.test(value) && Number(value) <= 5 ? `${value}/5` : null;
+}
+
+// A valid numeric state score is authoritative; otherwise fall back to the report.
+function resolveScore(stateScore, reportFile) {
+  const state = formatScore(stateScore);
+  if (state) return state;
+  const rep = readReportField(reportFile, 'Score');
+  if (rep) {
+    // Scores may have Markdown decoration or trailing prose. The first
+    // denominator is authoritative even when an annotation precedes it,
+    // matching evaluator score cells: "4.2 (strong fit)/10" is not 4.2/5.
+    const score = rep.match(/^[*_`]*(\d+(?:\.\d+)?)(?=$|[\s*_`/,(—–-])/);
+    if (!score) return 'N/A';
+    const denominator = rep.match(/\/[ \t]*(\d+(?:\.\d+)?)/);
+    if (denominator) {
+      const tail = rep.slice(denominator.index + denominator[0].length);
+      if (Number(denominator[1]) !== 5 || (tail && !/^[\s*_`,;:.()\]—–-]/.test(tail))) return 'N/A';
+    } else if (/^[*_`]*[ \t]*\//.test(rep.slice(score[0].length))) {
+      return 'N/A'; // An explicit but unreadable scale is not a bare score.
+    }
+    return formatScore(score[1]) || 'N/A';
+  }
+  return 'N/A';
+}
+
+// The batch report header names the PDF path when one was generated, and
+// otherwise says "not generated" in the user's output language. Only the path
+// is the same in every language.
+function resolvePdf(reportFile) {
+  const rep = readReportField(reportFile, 'PDF');
+  // A filename ending in .pdf (path or basename), not a bare ".pdf" mention in
+  // a localized "not generated" note.
+  return rep && (/[^\s]+\.pdf\b/i.test(rep) || rep.includes('✅')) ? '✅' : '❌';
+}
+
+// ---- parse pipeline.md ----
+const SECTION_RE = /^##\s+/;
+const PENDING_ITEM_RE = /^- \[ \]\s+/;
+
+function lineUrl(body) {
+  // "{url} | company | role"  ->  "{url}"
+  const i = body.indexOf(' |');
+  return (i >= 0 ? body.slice(0, i) : body).trim();
+}
+
+// The whole read → compute → write runs under the pipeline lock (#4895).
+// scan.mjs and every other pipeline writer append under withPipelineLock; a
+// bare read here followed by a bare write later silently dropped any offers
+// appended in between — and the .pre-reconcile.bak, copied before they
+// landed, did not have them either.
+function reconcile() {
+  const lines = readFileSync(PIPELINE_FILE, 'utf-8').split(/\r?\n/);
+
+  let pendStart = -1, procStart = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const kind = sectionKind(lines[i]);
+    if (pendStart < 0 && kind === 'pending') pendStart = i;
+    else if (procStart < 0 && kind === 'processed') procStart = i;
+  }
+
+  if (pendStart < 0) {
+    console.log('No "Pendientes" section in pipeline.md — nothing to reconcile.');
+    return;
+  }
+
+  function sectionEnd(start) {
+    for (let i = start + 1; i < lines.length; i++) {
+      if (SECTION_RE.test(lines[i])) return i;
+    }
+    return lines.length;
+  }
+  const pendEnd = sectionEnd(pendStart);
+  const procEnd = procStart >= 0 ? sectionEnd(procStart) : -1;
+
+  // URLs already in Procesadas — guards against a double copy on re-runs.
+  const procUrls = new Set();
+  if (procStart >= 0) {
+    for (let i = procStart + 1; i < procEnd; i++) {
+      const m = lines[i].match(/^- \[x\]\s+(.+)$/i);
+      if (!m) continue;
+      // "[num](path) | url | company | role | score | PDF x" — url is field 2
+      const parts = m[1].split('|').map(s => s.trim());
+      if (parts[1]) procUrls.add(urlKey(parts[1]));
+    }
+  }
+
+  // ---- walk Pendientes, decide keep vs. move ----
+  const removeIdx = new Set();
+  const movedProcLines = [];
+  const moved = [];
+  const skippedNoReport = [];
+
+  for (let i = pendStart + 1; i < pendEnd; i++) {
+    if (!PENDING_ITEM_RE.test(lines[i])) continue; // blank lines, "- [!]" errors → keep
+    const body = lines[i].replace(PENDING_ITEM_RE, '');
+    const url = lineUrl(body);
+    const key = urlKey(url);
+    const done = DONE.get(key);
+    if (!done) continue; // not processed → keep in Pendientes
+
+    if (procUrls.has(key)) {
+      // Already recorded in Procesadas — just drop the stale Pendientes copy.
+      removeIdx.add(i);
+      moved.push({ url, role: '(already in Procesadas)', dup: true });
+      continue;
+    }
+
+    if (done.dealbreaker) {
+      const [, company = '', role = ''] = body.split('|').map(s => s.trim());
+      movedProcLines.push(`- [x] SKIP | ${url} | ${company} | ${role} | N/A | PDF ❌`);
+      moved.push({ url, company, role, num: '-', score: 'SKIP, dealbreaker' });
+      procUrls.add(key);
+      removeIdx.add(i);
+      continue;
+    }
+
+    if (done.closed) {
+      // Posting is gone — resolve it as expired, the same line the pipeline
+      // mode's liveness sweep writes, instead of leaving it in Pendientes forever.
+      const [, company = '', role = ''] = body.split('|').map(s => s.trim());
+      movedProcLines.push(`- [x] ~~${url} | ${company} | ${role}~~ — posting expired (batch: 404/410)`);
+      moved.push({ url, company, role, num: '-', score: 'expired' });
+      procUrls.add(key);
+      removeIdx.add(i);
+      continue;
+    }
+
+    const reportFile = findReportFile(done.reportNum);
+    if (!reportFile) {
+      // No report on disk — leave it in Pendientes rather than write a dead link.
+      skippedNoReport.push({ url, reportNum: done.reportNum || '?' });
+      continue;
+    }
+
+    const parts = body.split('|').map(s => s.trim());
+    const company = parts[1] || '';
+    const role = parts[2] || '';
+    const score = resolveScore(done.score, reportFile);
+    const pdf = resolvePdf(reportFile);
+    const num = parseInt(done.reportNum, 10);
+
+    const reportLink = normalizeReportLink(`[${num}](reports/${reportFile})`, dirname(PIPELINE_FILE), CAREER_OPS);
+    movedProcLines.push(`- [x] ${reportLink} | ${url} | ${company} | ${role} | ${score} | PDF ${pdf}`);
+    moved.push({ url, company, role, num, score });
+    procUrls.add(key);
+    removeIdx.add(i);
+  }
+
+  // ---- report & exit early if nothing changed ----
+  console.log('=== Reconcile pipeline.md ===');
+  for (const s of skippedNoReport) {
+    console.warn(`⚠️  ${s.url} — batch reports report #${s.reportNum} but no reports/${s.reportNum}-*.md found; left in Pendientes.`);
+  }
+
+  if (removeIdx.size === 0) {
+    console.log('✅ pipeline.md already in sync — nothing to reconcile.');
+    return;
+  }
+
+  // ---- rebuild the file ----
+  const out = [];
+  let skipBlankAfterProc = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (removeIdx.has(i)) continue;
+    if (skipBlankAfterProc) {
+      skipBlankAfterProc = false;
+      if (lines[i].trim() === '') continue; // drop the original blank after "## Procesadas"
+    }
+    out.push(lines[i]);
+    if (i === procStart && movedProcLines.length > 0) {
+      out.push('', ...movedProcLines);
+      skipBlankAfterProc = true;
+    }
+  }
+  // No Procesadas section yet — create one at the end of the file, matching the
+  // language the pending section header already uses.
+  if (procStart < 0 && movedProcLines.length > 0) {
+    if (out.length && out[out.length - 1].trim() !== '') out.push('');
+    out.push(processedHeadingFor(lines[pendStart]), '', ...movedProcLines);
+  }
+
+  const newContent = out.join('\n');
+
+  const newCount = (() => {
+    let n = 0, inPend = false;
+    for (const l of out) {
+      if (sectionKind(l) === 'pending') { inPend = true; continue; }
+      if (SECTION_RE.test(l)) { inPend = false; continue; }
+      if (inPend && PENDING_ITEM_RE.test(l)) n++;
+    }
+    return n;
+  })();
+
+  const realMoves = moved.filter(m => !m.dup);
+  console.log(`🔄 ${realMoves.length} processed entr${realMoves.length === 1 ? 'y' : 'ies'} moved Pendientes → Procesadas:`);
+  for (const m of realMoves) console.log(`   + #${m.num} ${m.company} — ${m.role} (${m.score})`);
+  const dups = moved.filter(m => m.dup);
+  if (dups.length) console.log(`🧹 ${dups.length} stale Pendientes entr${dups.length === 1 ? 'y' : 'ies'} dropped (already in Procesadas).`);
+  console.log(`📋 Pendientes now: ${newCount} entr${newCount === 1 ? 'y' : 'ies'}`);
+
+  if (DRY_RUN) {
+    console.log('(dry-run — no changes written)');
+    return;
+  }
+
+  copyFileSync(PIPELINE_FILE, `${PIPELINE_FILE}.pre-reconcile.bak`);
+  writeFileAtomic(PIPELINE_FILE, newContent);
+  console.log(`✅ pipeline.md updated (backup: ${PIPELINE_FILE}.pre-reconcile.bak)`);
+}
+
+// A dry run writes nothing, so it neither waits on nor blocks a writer.
+if (DRY_RUN) {
+  reconcile();
+} else {
+  try {
+    await withPipelineLock(PIPELINE_FILE, reconcile);
+  } catch (err) {
+    if (!(err instanceof LockTimeoutError)) throw err;
+    console.error(`❌ ${err.message} — another process is writing pipeline.md; nothing was changed. Re-run once it finishes.`);
+    process.exit(1);
+  }
+}

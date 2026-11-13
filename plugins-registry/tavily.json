@@ -1,0 +1,20 @@
+{
+  "id": "tavily",
+  "name": "career-ops-plugin-tavily",
+  "version": "0.1.2",
+  "license": "MIT",
+  "description": "Tavily web search for job scanning.",
+  "repo": "https://github.com/Schlaflied/career-ops-plugin-tavily",
+  "sha": "bc0df367d4e3972292104eed3dbd234075a6a073",
+  "hooks": [
+    "search"
+  ],
+  "requiredEnv": [
+    "TAVILY_API_KEY"
+  ],
+  "allowedHosts": [
+    "api.tavily.com"
+  ],
+  "registrationIssue": "https://github.com/career-ops-hq/career-ops/issues/1344",
+  "addedAt": "2026-06-29"
+}

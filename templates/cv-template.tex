@@ -5,7 +5,17 @@
 %------------------------
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%  Random Stuff %%%%%%%%%%%%%%%%%%%%%%%%%%%%
-\documentclass[letterpaper,11pt]{article}
+\documentclass[{{PAPER}},11pt]{article}
+% T1 encoding: without it pdflatex's default OT1 has no glyph for "_" and
+% "~", so a CV carrying "snake_case" or "~12" loses those characters in the
+% PDF text layer (ATS parsers read that layer, not the screen).
+% lmodern is not optional here. fontenc alone switches to the EC fonts,
+% whose Type 1 files are not installed everywhere; pdflatex then falls back
+% to Type 3 bitmaps with no ToUnicode map, which breaks text extraction for
+% the whole document. Latin Modern ships matching Type 1 fonts, so every
+% glyph keeps an encoding.
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
 \usepackage{latexsym}
 \usepackage[empty]{fullpage}
 \usepackage{titlesec}
@@ -17,7 +27,7 @@
 \usepackage{fancyhdr}
 \usepackage[english]{babel}
 \usepackage{tabularx}
-\usepackage{fontawesome5}
+\usepackage{fontawesome}
 \usepackage{multicol}
 \setlength{\multicolsep}{-3.0pt}
 \setlength{\columnsep}{-1pt}
@@ -86,7 +96,9 @@
         \\ {{CONTACT_LINE}}\\
         \small
         % EMAIL
-        \href{mailto:{{EMAIL_URL}}}{\raisebox{-0.2\height}\faEnvelope\  \underline{{{EMAIL_DISPLAY}}}} ~
+        % EMAIL_URL already carries its scheme: sanitizeUrl() prefixes bare
+        % addresses with mailto:, so the template must not add a second one.
+        \href{{{EMAIL_URL}}}{\raisebox{-0.2\height}\faEnvelope\  \underline{{{EMAIL_DISPLAY}}}} ~
         % LINKEDIN
         \href{{{LINKEDIN_URL}}}{\raisebox{-0.2\height}\faLinkedin\ \underline{{{LINKEDIN_DISPLAY}}}}  ~
         % GITHUB
@@ -111,6 +123,12 @@
 {{PROJECTS}}
 \resumeSubHeadingListEnd
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%  AWARDS  %%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Awards \& Honors}
+\resumeSubHeadingListStart
+{{AWARDS}}
+\resumeSubHeadingListEnd
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%  Technical Skills  %%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{Technical Skills}
 \vspace{-7pt}
@@ -119,5 +137,7 @@
 {{SKILLS}}
 }}
 \end{itemize}
+
+%%%%  END  %%%%
 
 \end{document}
