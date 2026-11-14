@@ -21,7 +21,9 @@ import { persistEvaluation, evaluateRunOutcome, evaluationOutcomeEvent } from "@
 import { buildPrompt, isShellSafeCompanyName } from "@/lib/run-prompts.mjs";
 import { isTruncatedJd, prefetchJd } from "@/lib/jd-prefetch.mjs";
 import { runCoreCli } from "@/lib/core-cli";
-import { parseCoverRequest } from "@/lib/cover-brief.mjs";
+import { parseCoverRequest, resolveCoverReport } from "@/lib/cover-brief.mjs";
+import { createCoverSuggestFilter, parseCoverSuggestions } from "@/lib/cover-suggest.mjs";
+import { allowedFactText, saveCoverSuggestions } from "@/lib/cover-suggest-server";
 import { capabilitiesFor } from "@/lib/worker-capabilities.mjs";
 import { fencingReport, isCliAllowedForCapabilities } from "@/lib/cli-fencing.mjs";
 import { claudeCliArgs } from "@/lib/claude-invocation.mjs";
@@ -81,7 +83,7 @@ export async function POST(req: Request) {
   // it to modes/oferta.md meant a configured market passed a check on a file the
   // run never opens, and would have missed a market dir with no evaluation mode.
   const lang = readLanguageConfig();
-  const needsScript: Record<string, string> = { evaluate: lang.evalModeFile, "fix-portal": "verify-portals.mjs", pdf: "generate-pdf.mjs", cover: "modes/cover.md" };
+  const needsScript: Record<string, string> = { evaluate: lang.evalModeFile, "fix-portal": "verify-portals.mjs", pdf: "generate-pdf.mjs", cover: "modes/cover.md", "cover-suggest": "modes/cover.md" };
   const required = needsScript[kind];
   // Scripts and system modes live in the code checkout, which on a split-layout
   // install is not the data root (cv.md, reports/ and output stay under that).
@@ -133,7 +135,7 @@ export async function POST(req: Request) {
 
   // An A–F score is meaningless without a CV to score against — the CLI would
   // hallucinate a fit narrative and still emit a VERDICT. Require cv.md first.
-  if ((kind === "evaluate" || kind === "pdf" || kind === "cover" || kind === "research-review") && !fs.existsSync(path.join(careerOpsRoot(), "cv.md"))) {
+  if ((kind === "evaluate" || kind === "pdf" || kind === "cover" || kind === "cover-suggest" || kind === "research-review") &&!fs.existsSync(path.join(careerOpsRoot(), "cv.md"))) {
     return new Response(
       JSON.stringify({ error: "Add your CV first so I can score this against you — drop it on the home page." }),
       { status: 400, headers: { "Content-Type": "application/json" } },
@@ -191,6 +193,12 @@ export async function POST(req: Request) {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
+  }
+  // cover-suggest runs the same mode up to its Step 6 menus, so it needs the
+  // same report but no answers yet (the answers are what it suggests).
+  const suggestReport = kind === "cover-suggest" ? resolveCoverReport({ input, root: careerOpsRoot(), findReportFile }) : undefined;
+  if (suggestReport && !suggestReport.ok) {
+    return Response.json({ error: suggestReport.error }, { status: 400 });
   }
 
   // Resolve the posting date HERE rather than asking the agent for it. The
@@ -260,7 +268,8 @@ export async function POST(req: Request) {
       userTemplatesDir,
       // The worker's cwd is the data root; modes, templates and scripts live in the checkout.
       codeRoot,
-      reportFile: pdfPaths?.reportFile ?? (coverRequest?.ok ? coverRequest.reportFile : reviewReportFile),
+      reportFile: pdfPaths?.reportFile
+        ?? (coverRequest?.ok ? coverRequest.reportFile : suggestReport?.ok ? suggestReport.reportFile : reviewReportFile),
       coverBrief: coverRequest?.ok ? coverRequest.brief : undefined,
       researchReview: reviewCtx?.researchRel ? { researchFile: reviewCtx.researchRel, status: reviewCtx.app?.status ?? "" } : undefined,
       cvRepair,
@@ -452,6 +461,8 @@ export async function POST(req: Request) {
       const reportFilter = kind === "evaluate" ? createReportEnvelopeFilter() : null;
       // research-review's proposals arrive in a <<research-review>> JSON envelope.
       const reviewFilter = kind === "research-review" ? createResearchReviewFilter() : null;
+      // cover-suggest's Step 6 options arrive in a <<cover-suggest>> JSON envelope.
+      const suggestFilter = kind === "cover-suggest" ? createCoverSuggestFilter() : null;
       // Assistant-authored text only, before report-body filtering. Tools/JDs
       // cannot directly declare a gated outcome. Process integrity is checked
       // first at close, before this text can be treated as a terminal stop.
@@ -466,7 +477,7 @@ export async function POST(req: Request) {
       // ignored by the client's switch, so this is safe for older tabs too.
       const sendAgentText = (text: string) => {
         if (kind === "evaluate") evaluationText += text;
-        const filter = cvFilter ?? reportFilter ?? reviewFilter;
+        const filter = cvFilter ?? reportFilter ?? reviewFilter ?? suggestFilter;
         const visible = filter ? filter.push(text) : text;
         if (visible) send({ type: "text", text: visible });
       };
@@ -737,6 +748,30 @@ export async function POST(req: Request) {
             } else {
               sendWarnings(parsed.warnings);
               const saved = saveReview(reviewCtx.researchRel, reviewCtx.reportNum, parsed.review, today);
+              if (!saved.ok) send({ type: "error", msg: saved.error.slice(0, 400) });
+              else send({ type: "done", tokens: lastTokens, costUsd: lastCostUsd });
+            }
+          }
+          return close();
+        }
+
+        if (kind === "cover-suggest") {
+          const tail = suggestFilter?.flush();
+          if (tail) send({ type: "text", text: tail });
+          const baseErr = noOutputMessage();
+          if (baseErr) {
+            send({ type: "error", msg: baseErr });
+          } else if (!cleanExit || sawError) {
+            send({ type: "error", msg: "The suggestions run hit an error before finishing, so nothing was saved — re-run it." });
+          } else if (!suggestFilter) {
+            send({ type: "error", msg: "Internal error: the suggestions run lost its output filter — please report this." });
+          } else {
+            const parsed = parseCoverSuggestions(suggestFilter.text(), { allowedText: allowedFactText() });
+            if (!parsed.ok) {
+              send({ type: "error", msg: parsed.error.slice(0, 400) });
+            } else {
+              sendWarnings(parsed.warnings);
+              const saved = saveCoverSuggestions(input, parsed.suggestions);
               if (!saved.ok) send({ type: "error", msg: saved.error.slice(0, 400) });
               else send({ type: "done", tokens: lastTokens, costUsd: lastCostUsd });
             }

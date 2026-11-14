@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { parseCoverRequest } from "../../src/lib/cover-brief.mjs";
+import { parseCoverRequest, resolveCoverReport } from "../../src/lib/cover-brief.mjs";
 
 const ROOT = path.join(path.sep, "tmp", "career-ops");
 const REPORT = path.join(ROOT, "reports", "041-acme-2026-10-01.md");
@@ -95,4 +95,29 @@ test("parseCoverRequest: a non-string tone is refused as incomplete", () => {
   });
   assert.equal(result.ok, false);
   assert.equal(result.error, "Answer all four cover letter questions first.");
+});
+
+test("parseCoverRequest: optional gap answers, research and answer sources pass through", () => {
+  const result = parseCoverRequest({
+    input: "041",
+    brief: { ...BRIEF, gaps: " Domain? -> Briefly ", research: "Acme rebuilds checkout.", whyFrom: "suggested", problemFrom: "edited", approachFrom: "bogus" },
+    root: ROOT,
+    findReportFile,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.brief.gaps, "Domain? -> Briefly");
+  assert.equal(result.brief.research, "Acme rebuilds checkout.");
+  // An unknown source reads as the candidate's own words.
+  assert.deepEqual(result.brief.sources, { why: "suggested", problem: "edited", approach: "own" });
+});
+
+test("parseCoverRequest: an oversized research summary is refused, not cut", () => {
+  const result = parseCoverRequest({ input: "041", brief: { ...BRIEF, research: "x".repeat(1501) }, root: ROOT, findReportFile });
+  assert.equal(result.ok, false);
+});
+
+test("resolveCoverReport: the suggestions run resolves the same report and refuses the same selectors", () => {
+  assert.deepEqual(resolveCoverReport({ input: "041", root: ROOT, findReportFile }), { ok: true, reportFile: "reports/041-acme-2026-10-01.md" });
+  assert.equal(resolveCoverReport({ input: "../x", root: ROOT, findReportFile }).ok, false);
+  assert.equal(resolveCoverReport({ input: "7", root: ROOT, findReportFile }).ok, false);
 });

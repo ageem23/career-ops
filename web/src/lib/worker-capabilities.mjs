@@ -68,7 +68,7 @@ export const CAPS = Object.freeze({
  * Lives here rather than in claude-invocation.mjs because it is a fact about the
  * run route's workers, not about Claude. Re-exported there for existing importers.
  */
-export const KNOWN_KINDS = Object.freeze(["pdf", "research", "evaluate", "fix-portal", "cover", "research-review"]);
+export const KNOWN_KINDS = Object.freeze(["pdf", "research", "evaluate", "fix-portal", "cover", "cover-suggest", "research-review"]);
 
 /**
  * What each run-route kind needs. Derived from what its prompt actually does
@@ -83,6 +83,9 @@ export const KNOWN_KINDS = Object.freeze(["pdf", "research", "evaluate", "fix-po
  * - fix-portal rewrites one portals.yml entry after finding a working ATS URL.
  * - cover     runs cover.md's web research and re-reads the posting url, then
  *             returns the draft letter in its reply. It writes nothing.
+ * - cover-suggest runs the same mode's Steps 2-6 (posting, web research,
+ *             keywords, gaps) and returns the Step 6 options in an envelope the
+ *             backend caches. Same web needs as cover; it writes nothing.
  * - research-review compares filed deep research with the report and cv.md and
  *             returns proposals in an envelope the backend files. Local reads
  *             only: the research is already on disk, and the candidate approves
@@ -98,6 +101,7 @@ const KIND_CAPABILITIES = Object.freeze({
   evaluate: CAPS.networkReadOnly,
   "fix-portal": CAPS.workspaceWrite,
   cover: CAPS.networkReadOnly,
+  "cover-suggest": CAPS.networkReadOnly,
   "research-review": CAPS.localReadOnly,
 });
 

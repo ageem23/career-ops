@@ -1,45 +1,34 @@
 "use client";
 
-import { useMemo, useState, type FormEvent } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { FileText, Loader2, Mail, RotateCcw, TriangleAlert } from "lucide-react";
 import { useJobs } from "@/components/jobs/job-store";
-import { CostBadge } from "@/components/cost/cost-badge";
+import { CoverBriefForm, type CoverFormState } from "@/components/cover-brief-form";
 import { coverDraftButtonState } from "@/lib/pdf-button-state.mjs";
-import { COVER_TONES } from "@/lib/cover-tones.mjs";
 import { pipelineQuery } from "@/lib/pipeline-navigation.mjs";
 
 // Fires the real career-ops `cover` mode (worker kind "cover") for THIS
 // application. cover.md will not draft until the candidate answers its four
-// Step 6 prompts, so the button opens those questions first. The draft lands in
-// the run log. Rendering it to PDF is still the CLI's Step 9.
-const QUESTIONS = [
-  { name: "why", label: "Why this role or company?", hint: "One or two angles: scale, mission, stage, or what you would learn." },
-  { name: "problem", label: "What problem would you solve for them?", hint: "The research step checks this against what the company says publicly." },
-  { name: "approach", label: "How would you approach it on day one?", hint: "One or two sentences. This is the most specific part of the letter." },
-] as const;
-
-const fieldClass =
-  "mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground focus:border-brand/50 focus:outline-none";
+// Step 6 prompts, so the button opens those questions first, with options from
+// a `cover-suggest` run when one has been made (cover-brief-form.tsx). The draft
+// lands in the run log. Rendering it to PDF is still the CLI's Step 9.
 
 export function CoverDraftButton({ n, company }: { n: string; company: string }) {
   const { jobs, startJob } = useJobs();
   const listQuery = pipelineQuery(useSearchParams().toString());
   const jobQuery = listQuery ? `?${listQuery}` : "";
   const [open, setOpen] = useState(false);
-  const [savedBrief, setSavedBrief] = useState<Record<string, string> | null>(null);
+  const [saved, setSaved] = useState<CoverFormState | null>(null);
   const job = useMemo(
     () => jobs.filter((j) => j.kind === "cover" && j.input === n).sort((a, b) => b.startedAt - a.startedAt)[0],
     [jobs, n],
   );
   const state = coverDraftButtonState(job);
 
-  const submit = (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const data = new FormData(e.currentTarget);
-    const brief = Object.fromEntries(["why", "problem", "approach", "tone"].map((k) => [k, String(data.get(k) ?? "")]));
-    setSavedBrief(brief);
+  const submit = (brief: Record<string, string>, formState: CoverFormState) => {
+    setSaved(formState);
     startJob({ title: `Cover letter · ${company}`, subtitle: "draft for this role", kind: "cover", input: n, page: `/pipeline/${n}`, brief });
     setOpen(false);
   };
@@ -91,34 +80,7 @@ export function CoverDraftButton({ n, company }: { n: string; company: string })
           <span>Cover letter not drafted. {state.failure.reason}</span>
         </Link>
       )}
-      {open && (
-        <form onSubmit={submit} aria-label="Cover letter questions" className="basis-full rounded-2xl border border-border bg-surface/50 p-4">
-          {QUESTIONS.map((q) => (
-            <label key={q.name} className="mb-3 block text-sm font-medium text-foreground">
-              {q.label}
-              <span className="block text-xs font-normal text-muted">{q.hint}</span>
-              <textarea name={q.name} required maxLength={1000} rows={2} defaultValue={savedBrief?.[q.name] ?? ""} className={fieldClass} />
-            </label>
-          ))}
-          <label className="mb-4 block text-sm font-medium text-foreground">
-            Tone
-            <select name="tone" defaultValue={savedBrief?.tone ?? "mirror"} className={fieldClass}>
-              {Object.entries(COVER_TONES).map(([id, label]) => (
-                <option key={id} value={id}>{label}</option>
-              ))}
-            </select>
-          </label>
-          <div className="flex flex-wrap items-center gap-2">
-            <button type="submit" className="inline-flex items-center gap-1.5 rounded-full bg-brand px-3 py-1.5 text-xs font-medium text-brand-foreground shadow-sm transition-colors hover:bg-brand-200 max-sm:min-h-[44px]">
-              <Mail className="size-3.5" /> Draft letter
-            </button>
-            <CostBadge kind="spend" size="xs" />
-            <button type="button" onClick={() => setOpen(false)} className="text-xs text-muted hover:text-brand-text max-sm:min-h-[44px]">
-              Cancel
-            </button>
-          </div>
-        </form>
-      )}
+      {open && <CoverBriefForm n={n} company={company} initial={saved} onSubmit={submit} onCancel={(formState) => { setSaved(formState); setOpen(false); }} />}
     </>
   );
 }
