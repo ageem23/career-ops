@@ -1133,12 +1133,25 @@ rate_limit_delay() {
   echo "$delay"
 }
 
+# The last lines of a worker log, flattened to one 200-char line for the state
+# file's error column. Claude Code prints one "Permission allow rule (...) has a
+# wildcard..." warning per questionable settings rule at startup, on every run;
+# they are not the failure. Left in, they filled the 200 chars and the real
+# error after them (e.g. a Cloudflare 403 on auth) was cut off, so the morning
+# brief blamed the settings file. Drop them, and fall back when nothing is left.
+log_tail_error() {
+  local log_file="$1" fallback="$2" msg
+  msg=$(grep -vE '^Permission (allow|deny|ask) rule \(' "$log_file" 2>/dev/null \
+    | grep -v '^[[:space:]]*$' | tail -5 | tr '\n' ' ' | sed 's/[[:space:]]*$//' | cut -c1-200)
+  printf '%s' "${msg:-$fallback}"
+}
+
 mark_paused_rate_limit() {
   local id="$1" url="$2" started_at="$3" report_num="$4" retries="$5" log_file="$6"
   local completed_at
   completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   local error_msg
-  error_msg=$(tail -5 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c1-200 || echo "session/rate limit reached")
+  error_msg=$(log_tail_error "$log_file" "session/rate limit reached")
   update_state_retrying "$id" "$url" "paused_rate_limit" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries" || true
   printf '%s\t%s\t%s\n' "$id" "$report_num" "$error_msg" > "$PAUSE_FILE"
   BATCH_PAUSED=true
@@ -2384,7 +2397,7 @@ process_offer() {
       retries=$((retries + 1))
     fi
     local error_msg
-    error_msg=$(tail -5 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c1-200 || echo "Unknown error (exit code $exit_code)")
+    error_msg=$(log_tail_error "$log_file" "Unknown error (exit code $exit_code)")
     update_state_retrying "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries" || true
     release_report_num "$reserved_num"
     echo "    ❌ Failed (attempt $retries, exit code $exit_code)"

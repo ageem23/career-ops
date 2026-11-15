@@ -24,6 +24,8 @@ import { companyPresentation } from "@/lib/company-presentation.mjs";
 import { ApplyNext } from "@/components/apply-next";
 import { resolveHeroState, mayClaimAllClear, showsQueue, missingSourceLabel, displayCounts } from "@/lib/home/hero-state.mjs";
 import { homeFollowupRemainder } from "@/lib/home/followups-shown.mjs";
+import { NightlyBriefCard } from "@/components/home/nightly-brief-card";
+import type { LatestBrief } from "@/lib/nightly-brief-server";
 
 // The retention "Today": a dual-loop action queue (the maintainer's
 // "N new matches this week · M follow-ups due"). SUPPLY loop = fresh free-scan
@@ -36,6 +38,7 @@ export function TodayDashboard({
   legitimacy,
   inbox,
   applyFacts = {},
+  nightlyBrief = null,
 }: {
   applications: Application[];
   reasons: Record<string, CardReason>;
@@ -44,6 +47,8 @@ export function TodayDashboard({
   inbox: Pick<InboxJob, "url" | "done">[];
   inBetween: boolean;
   applyFacts?: Record<string, { pdfOnDisk: boolean; postingUrl: string }>;
+  /** The newest morning brief from the nightly job, read by the page; null when none exists. */
+  nightlyBrief?: LatestBrief | null;
 }) {
   const [followups, setFollowups] = useState<FollowUp[]>([]);
   const [overdue, setOverdue] = useState(0);
@@ -243,6 +248,8 @@ export function TodayDashboard({
           <QuickEvaluate />
         </div>
       </section>
+
+      {nightlyBrief && <NightlyBriefCard latest={nightlyBrief} />}
 
       {dataError && !dataLoading && (
         <div role="alert" className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-surface/40 px-5 py-4 text-sm text-muted">

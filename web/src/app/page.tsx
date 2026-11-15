@@ -12,6 +12,7 @@ import { OnboardingBanner } from "@/components/onboarding-banner";
 import { OnboardingProgress } from "@/components/home/onboarding-progress";
 import { FirstRunHome } from "@/components/home/first-run-home";
 import { TodayDashboard } from "@/components/home/today-dashboard";
+import { readLatestBrief } from "@/lib/nightly-brief-server";
 
 export const dynamic = "force-dynamic"; // always read fresh local files at request time (never at build — CI has no user data)
 
@@ -57,7 +58,7 @@ export default async function Home() {
   // Once there is a tracker or an inbox, that work leads. Setup stays on the
   // page, under the queue, until the profile panel is complete.
   const dashboard = (
-    <TodayDashboard applications={applications} reasons={reasons} legitimacy={legitimacy} inbox={inbox} inBetween={phase === "in-between"} applyFacts={applyFacts} />
+    <TodayDashboard applications={applications} reasons={reasons} legitimacy={legitimacy} inbox={inbox} inBetween={phase === "in-between"} applyFacts={applyFacts} nightlyBrief={readLatestBrief()} />
   );
   const lead = homeLead(snapshot.applications.length > 0 || snapshot.inbox.length > 0);
   return (

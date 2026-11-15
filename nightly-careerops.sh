@@ -11,7 +11,8 @@
 #   - "career-ops-nightly-late" → 04:00 daily (--no-scan --late --cap=40: leftovers + eval)
 # Each run logs to its own file — tmp/nightly-{date}.log (scan), -eval.log
 # (22:00), or -late.log (04:00, pass --late) — and writes a morning summary to
-# tmp/nightly-latest-summary.txt. Before #(log-split), the 22:00 and 04:00 runs
+# tmp/nightly-latest-summary.txt. The 04:00 run also writes the morning brief
+# (morning-brief.mjs → data/nightly-briefs/), shown on the web UI's Today page. Before #(log-split), the 22:00 and 04:00 runs
 # both wrote to -late.log (both pass --no-scan with nothing to tell them apart),
 # so a run that slipped past midnight was indistinguishable from one that never
 # ran at all. --late is the only thing that tells the 04:00 job apart from the
@@ -93,6 +94,28 @@ fi
 export RUN_LABEL
 SUMMARY="tmp/nightly-latest-summary.txt"
 exec > >(tee -a "$LOG") 2>&1
+
+# --- Morning brief (04:00 run only) ---
+# The last thing the night does: write data/nightly-briefs/{date}.json + .md —
+# the "check last night's batch run" answer — which the web dashboard's Today
+# page shows. A trap, not a final step, because this script has several early
+# `exit 0` paths (no new offers, recovery pass) and the brief matters most on
+# exactly those nights. Facts are written first; the Claude summary is added
+# after, so a failed summary still leaves a brief. Opt out with
+# NIGHTLY_BRIEF=0, or keep facts only with NIGHTLY_BRIEF_CLAUDE=0.
+if $LATE_RUN && [[ "${NIGHTLY_BRIEF:-1}" != "0" ]]; then
+  write_morning_brief() {
+    local rc=$?
+    sleep 2 # let tee flush the "Run complete" line the brief reads
+    echo ""
+    echo "--- Morning brief ---"
+    local brief_args=()
+    [[ "${NIGHTLY_BRIEF_CLAUDE:-1}" == "0" ]] && brief_args+=(--no-claude)
+    node morning-brief.mjs "${brief_args[@]}" > /dev/null || echo "WARN: morning brief failed (see above)"
+    return $rc
+  }
+  trap write_morning_brief EXIT
+fi
 
 echo "================================================"
 echo "  Nightly career-ops run — $TS"
