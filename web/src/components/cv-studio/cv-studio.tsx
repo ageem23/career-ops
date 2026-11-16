@@ -15,7 +15,7 @@ import { CvPreview } from "./cv-preview";
 import { CoverageMeter } from "./coverage-meter";
 import { AssistPanel } from "./assist-panel";
 
-type Loaded = { ok: true; reportNum: string; company: string; file: string; tree: BlockTree; doc: StudioDoc; edits: StudioEdits; stale: boolean; hasBase: boolean };
+type Loaded = { ok: true; reportNum: string; company: string; file: string; tree: BlockTree; doc: StudioDoc; edits: StudioEdits; stale: boolean; hasBase: boolean; pdfExport?: { ok: false; error: string } | null };
 type LoadState = { kind: "loading" } | { kind: "error"; reason: string } | { kind: "ready"; data: Loaded };
 type SaveState =
   | { kind: "idle" }
@@ -106,7 +106,9 @@ function Studio({ n, data }: { n: string; data: Loaded }) {
     },
     [doc, recordEdit],
   );
-  const [save, setSave] = useState<SaveState>({ kind: "idle" });
+  const rejectedOnLoad = data.pdfExport?.ok === false;
+  const [pdfRejected, setPdfRejected] = useState(rejectedOnLoad);
+  const [save, setSave] = useState<SaveState>(rejectedOnLoad ? { kind: "failed", error: data.pdfExport?.error ?? "Saving failed." } : { kind: "idle" });
   const [autosaveError, setAutosaveError] = useState<string | null>(null);
   const resolved = useMemo(() => resolveStudio(doc, edits), [doc, edits]);
   const html = useMemo(() => renderBlocks(tree, resolved.view, { added: resolved.added }), [tree, resolved]);
@@ -201,7 +203,7 @@ function Studio({ n, data }: { n: string; data: Loaded }) {
   }, [edits, putEdits]);
 
   const editsJson = JSON.stringify(edits);
-  const editStatus = editSaveStatus(savedJsonRef.current, editsJson, savingJsonRef.current, postingJsonRef.current, autosaveUncertainRef.current);
+  const editStatus = editSaveStatus(savedJsonRef.current, editsJson, savingJsonRef.current, postingJsonRef.current, autosaveUncertainRef.current, pdfRejected);
 
   const saveForApply = useCallback(async () => {
     setSave({ kind: "saving" });
@@ -230,10 +232,13 @@ function Studio({ n, data }: { n: string; data: Loaded }) {
         return;
       }
       if (!r.ok || !body.pdf) {
+        setPdfRejected(true);
         setSave({ kind: "failed", error: SAVE_ERRORS[body.error ?? ""] ?? body.error ?? "Saving failed." });
       } else if (latestEdits.current !== sent) {
+        setPdfRejected(false);
         setSave({ kind: "outdated", pdf: body.pdf });
       } else {
+        setPdfRejected(false);
         setSave({ kind: "saved", pdf: body.pdf, indexed: body.indexed === true, warnings: body.warnings ?? [] });
       }
     } catch {

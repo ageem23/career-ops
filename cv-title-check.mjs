@@ -158,20 +158,34 @@ export function parseTailoredExperience(payload) {
   const parsed = [];
   const incomplete = [];
 
-  experience.forEach((e, index) => {
-    const company = String(e?.company ?? '').trim();
-    const title = String(e?.role ?? '').trim();
-    const dates = String(e?.dates ?? '').trim();
+  const check = (label, company, role, dates) => {
     const missingFields = [];
     if (!company) missingFields.push('company');
-    if (!title) missingFields.push('role');
+    if (!role) missingFields.push('role');
     if (!dates) missingFields.push('dates');
+    if (missingFields.length > 0) incomplete.push(`${label} is missing ${missingFields.join(', ')}`);
+    else parsed.push({ company, title: role, dates });
+  };
 
-    if (missingFields.length > 0) {
-      incomplete.push(`experience[${index}] is missing ${missingFields.join(', ')}`);
-    } else {
-      parsed.push({ company, title, dates });
+  experience.forEach((e, index) => {
+    const company = String(e?.company ?? '').trim();
+    // A grouped entry (build-cv-html.mjs isGroupedEntry: one employer, its
+    // titles in `roles`) carries no top-level role. cv.md lists each of those
+    // titles as its own entry under the same company, so each role is compared
+    // on its own, with the employer's company. Every role still needs a title
+    // and dates: a grouped entry is not a way around the completeness rule.
+    if (Array.isArray(e?.roles) && e.roles.length > 0) {
+      e.roles.forEach((r, ri) => {
+        check(
+          `experience[${index}].roles[${ri}]`,
+          company,
+          String(r?.role ?? '').trim(),
+          String(r?.dates ?? r?.period ?? '').trim(),
+        );
+      });
+      return;
     }
+    check(`experience[${index}]`, company, String(e?.role ?? '').trim(), String(e?.dates ?? '').trim());
   });
 
   if (incomplete.length > 0) {
@@ -412,6 +426,21 @@ function runSelfTest() {
       passed++;
     }
   };
+  // A grouped entry (one employer, its titles in `roles`) is compared role by
+  // role against cv.md's separate entries for that company.
+  const grouped = parseTailoredExperience({
+    experience: [{ company: 'Acme Corp', dates: '2018 - 2024', roles: [
+      { role: 'Senior Software Engineer', dates: '2020-2024' },
+      { role: 'Software Engineer', period: '2018-2020' },
+    ] }],
+  });
+  eq('a grouped entry expands to one comparison per role', grouped.length, 2);
+  eq('a grouped role takes its company from the employer', grouped[1].company, 'Acme Corp');
+  eq('a grouped role reads period when dates is absent', grouped[1].dates, '2018-2020');
+  throwsFor('a grouped role missing its title throws', {
+    experience: [{ company: 'Acme Corp', roles: [{ dates: '2020-2024' }] }],
+  });
+
   throwsFor('an entry missing dates throws instead of being dropped', {
     experience: [{ company: 'Acme Corp', role: 'Senior Software Engineer' }],
   });

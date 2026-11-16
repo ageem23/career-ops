@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import * as yaml from "js-yaml";
@@ -32,8 +33,14 @@ import { normalizeMemoryFact } from "@/lib/memory-fact.mjs";
 /**
  * Resolve the career-ops DATA root — the directory holding the user's files
  * (cv.md, data/, reports/). Same precedence as the core: CAREER_OPS_ROOT →
- * CAREER_OPS_DATA_DIR → `.career-ops-data` marker → the checkout itself. For
+ * CAREER_OPS_DATA_DIR → `.career-ops-data` marker → `~/career-ops-data` when the
+ * checkout is a Claude Code plugin install copy → the checkout itself. For
  * scripts, system modes and templates use resolveCodeRoot() (core/code-root.mjs).
+ *
+ * Throws UnsafeDataRootError (core/data-root.mjs) when an environment variable or
+ * the marker names a folder inside a plugin install copy, as the core does: that
+ * folder is deleted on the next plugin update. The error message is one line that
+ * names the setting to change; callers that report a bad data root surface it.
  */
 export function careerOpsRoot(): string {
   // `process.cwd()` is `<core>/web` for `next dev`/`next start`, so its parent is
@@ -60,6 +67,7 @@ export function careerOpsRoot(): string {
     process.env,
     path.resolve,
     path.join,
+    { homedir: os.homedir, realpath: fs.realpathSync, platform: process.platform },
   );
 }
 
@@ -232,7 +240,7 @@ export type Application = {
 export function readApplications(): Application[] {
   const root = careerOpsRoot();
   const file = resolveTrackerPath(root);
-  const codeRoot = path.resolve(process.cwd(), "..");
+  const codeRoot = resolveCodeRoot(process.cwd(), process.env);
   // Parsed rows follow tracker-aliases.json as well as the tracker. A header
   // rename in that file must not keep serving the old columns.
   const aliasFiles = [...new Set([
@@ -256,7 +264,7 @@ export type TrackerShape = "missing" | "empty" | "malformed" | "rows";
  *  so the pipeline does not tell every zero-row case to clear the search. */
 export function readTrackerShape(): TrackerShape {
   const md = readTrackerFile(careerOpsRoot());
-  return classifyTracker(md, careerOpsRoot(), path.resolve(process.cwd(), ".."));
+  return classifyTracker(md, careerOpsRoot(), resolveCodeRoot(process.cwd(), process.env));
 }
 
 export type StatusLogRow = {
@@ -300,7 +308,7 @@ export type PdfPathForReportResult =
   | { status: "found"; path: string; html: string | null }
   | { status: "not-found" }
   | { status: "invalid" }
-  | { status: "rejected" };
+  | { status: "rejected"; html: string | null };
 
 /** The exact PDF path indexed for this report number, or null if none exists
  *  (malformed id, no index row, the indexed file is missing on disk, or the
@@ -321,12 +329,13 @@ export async function pdfPathStatusForReport(n: string, kind: "cv" | "cover" = "
   if (!entries) return { status: "not-found" };
   const entry = entries.get(target);
   if (!entry) return { status: "not-found" };
-  if (!entry.path) return { status: "rejected" };
   const root = careerOpsRoot();
   const outputDir = path.resolve(root, "output");
-  const abs = containedOutputFile(root, outputDir, entry.path);
-  if (!abs) return { status: "rejected" };
+  // Studio can still open the recorded HTML when the PDF is unavailable.
   const html = entry.html ? containedOutputFile(root, outputDir, entry.html) : null;
+  if (!entry.path) return { status: "rejected", html };
+  const abs = containedOutputFile(root, outputDir, entry.path);
+  if (!abs) return { status: "rejected", html };
   return { status: "found", path: abs, html };
 }
 

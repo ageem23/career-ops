@@ -48,6 +48,7 @@ import { fetchJdViaKnownApi } from './browser-extract.mjs';
 import { HYDRATING_CODES, extractApplyControls, postingIdentity } from './liveness-browser.mjs';
 import { installPiiInterceptor } from './lib/pii-interceptor.mjs';
 import { assertLlmRequestAllowed } from './lib/llm-outbound.mjs';
+import { APPLY_MIN } from './lib/score-action.mjs';
 import { browserLaunchOptions } from './lib/browser-launch.mjs';
 
 // Ambient privacy guard over global fetch. Installed explicitly here (rather
@@ -395,6 +396,19 @@ export function buildCachedSystemMessage(systemPrompt) {
   };
 }
 
+// A reply that stopped for any reason other than "stop" is incomplete, the rule
+// openai-eval follows since #3949: cut off at max_tokens ("length"), filtered
+// ("content_filter"), or ended by a provider error ("error"). Its text can
+// still carry every block heading and the score line validateEvaluationResponse
+// checks, so it would be saved as the report. A reply with no finish_reason is
+// accepted: some servers omit the field, and nothing then says it stopped early.
+function assertReplyFinished(data) {
+  const reason = data.choices?.[0]?.finish_reason;
+  if (reason == null || reason === 'stop') return;
+  const hint = reason === 'length' ? ` (cut off at max_tokens ${MAX_TOKENS})` : '';
+  throw new Error(`Incomplete reply: finish_reason "${String(reason).slice(0, 40)}"${hint}`);
+}
+
 // ---------------------------------------------------------------------------
 // OpenRouter API call — automatic model rotation with fallback
 // ---------------------------------------------------------------------------
@@ -449,6 +463,7 @@ async function callOpenRouter(systemPrompt, userMessage) {
       if (data.error) throw new Error(data.error.message);
       const content = data.choices?.[0]?.message?.content ?? '';
       if (!content) throw new Error('Empty response');
+      assertReplyFinished(data);
       console.log('OK');
       const usage = normalizeOpenAIUsage(data.usage);
       return { content, usage };
@@ -523,6 +538,7 @@ async function callOpenRouter(systemPrompt, userMessage) {
 
       const content = data.choices?.[0]?.message?.content ?? '';
       if (!content) throw new Error('Empty response');
+      assertReplyFinished(data);
 
       const usage = normalizeOpenAIUsage(data.usage);
 
@@ -1267,8 +1283,8 @@ async function cmdApply(ref, ctx) {
   // Score-gate: warn and confirm before applying to low-fit roles (AGENTS.md Ethical Use)
   const scoreMatch = reportContent.match(/^\s*\*?\*?\s*(?:score|puntuaci[oó]n)\s*:\s*\*?\*?\s*(\d+(?:\.\d+)?)\s*\/\s*5/im);
   const scoreValue = scoreMatch ? parseFloat(scoreMatch[1]) : NaN;
-  if (isFinite(scoreValue) && scoreValue < 4.0) {
-    console.log(`\n⚠️  This report scored ${scoreValue.toFixed(1)}/5 — below the 4.0/5 threshold.`);
+  if (isFinite(scoreValue) && scoreValue < APPLY_MIN) {
+    console.log(`\n⚠️  This report scored ${scoreValue.toFixed(1)}/5 — below the ${APPLY_MIN.toFixed(1)}/5 threshold.`);
     console.log('Strongly discourage low-fit applications. Your time and the recruiter\'s time are both valuable.');
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     const answer = await new Promise(resolve => {

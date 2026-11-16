@@ -9,12 +9,13 @@ import {
   slugify, decodeHtml,
   createLocalGate, writeRunLog,
 } from '../scan-local-lib.mjs';
-import { companyRoleDedupKey } from '../scan.mjs';
+import { companyRoleDedupKey, buildLocationFilter } from '../scan.mjs';
 import { normalizeCompanyName } from '../invite-match.mjs';
 import {
   buildSeekUrl, parseSeekPage, extractReduxJson,
   scanSeekSearch, loadSearches as seekSearches,
 } from '../scan-seek.mjs';
+import { PORTAL_TOP_LEVEL_KEYS, portalTopLevelTypos } from '../validate-portals.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
@@ -283,6 +284,44 @@ test('seek page parsing reads SEEK_REDUX_DATA, dedups ids, decodes text', () => 
   assert.strictEqual(offers[1].postedAt, '');
 });
 
+const SEEK_HTML_LOCATIONS = `<html><script>window.SEEK_REDUX_DATA = ${JSON.stringify({
+  results: { results: { jobs: [
+    { id: '82000001', title: 'Senior .NET Developer', advertiser: { description: 'Harbour Tech' },
+      locations: [{ countryCode: 'NZ', label: 'Auckland CBD, Auckland' }],
+      workArrangements: { data: [{ id: '3', label: { text: 'Remote' } }], displayText: 'Remote' } },
+    { id: '82000002', title: 'Senior C# Engineer', advertiser: { description: 'Harbour Tech' },
+      locations: [{ countryCode: 'NZ', label: 'Wellington Central, Wellington' }],
+      workArrangements: { data: [{ id: '2', label: { text: 'Hybrid' } }], displayText: 'Hybrid' } },
+    { id: '82000003', title: 'Software Engineer', advertiser: { description: 'Harbour Tech' },
+      locations: [{ countryCode: 'NZ', label: 'Masterton, Wairarapa' }],
+      workArrangements: { data: [{ id: '1', label: { text: 'On-site' } }] } },
+    { id: '82000004', title: 'Developer', advertiser: { description: 'Harbour Tech' } },
+  ] } },
+})};</script></html>`;
+
+test('seek page parsing reads the locations array and work arrangement', () => {
+  const offers = parseSeekPage(SEEK_HTML_LOCATIONS);
+  assert.deepStrictEqual(offers.map((o) => [o.location, o.workArrangement]), [
+    ['Auckland CBD, Auckland, New Zealand', 'Remote'],
+    ['Wellington Central, Wellington, New Zealand', 'Hybrid'],
+    ['Masterton, Wairarapa, New Zealand', 'On-site'],
+    ['', undefined],
+  ]);
+  assert.ok(!('workArrangement' in offers[3]));
+});
+
+test('seek work arrangement reaches the workplace_policy: remote NZ admitted, hybrid elsewhere dropped', () => {
+  const filter = buildLocationFilter({
+    always_allow: ['New Zealand'],
+    allow: ['New Zealand'],
+    workplace_policy: { onsite_locations: ['Masterton'], remote_countries: ['New Zealand'] },
+  });
+  const [remote, hybrid, onsite] = parseSeekPage(SEEK_HTML_LOCATIONS);
+  assert.strictEqual(filter(remote.location, remote.url, remote.title, remote), true);
+  assert.strictEqual(filter(hybrid.location, hybrid.url, hybrid.title, hybrid), false);
+  assert.strictEqual(filter(onsite.location, onsite.url, onsite.title, onsite), true);
+});
+
 test('seek page parsing throws descriptively for blocked/malformed pages', () => {
   assert.throws(
     () => parseSeekPage('<html>blocked</html>'),
@@ -313,6 +352,17 @@ test('seek searches config: minimal { keyword, location? } schema plus optional 
     ],
   );
   assert.deepStrictEqual(seekSearches({}), []);
+});
+
+test('seek_searches is a registered portals.yml key, so a typo is reported', () => {
+  // Same class of bug as `tracked_companys` and the TopDev key: a valid list
+  // plus a `seek_searche` miss beside it used to validate clean, and the
+  // scanner would read the real list and silently ignore the extra search.
+  assert.ok(PORTAL_TOP_LEVEL_KEYS.includes('seek_searches'));
+  assert.deepStrictEqual(
+    portalTopLevelTypos({ seek_searches: [{ keyword: 'devops' }], seek_searche: [{ keyword: 'qa' }] }),
+    [{ key: 'seek_searche', suggestion: 'seek_searches' }],
+  );
 });
 
 // ── CLI ──────────────────────────────────────────────────────────────
