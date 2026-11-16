@@ -19,10 +19,14 @@ import { WorkerPills } from "@/components/jobs/worker-pills";
 import { UsageMeter } from "@/components/usage-meter";
 import { instrumentSerif } from "@/lib/fonts";
 import { visibleNavItems, isActivePath } from "@/lib/nav-items";
+import { claudeCodeLinks } from "@/lib/claude-code-handoff.mjs";
+import { ClaudeCwdProvider } from "@/components/claude-cwd";
+import { SquareTerminal } from "lucide-react";
 
-export function AppShell({ children, followupsEnabled }: { children: React.ReactNode; followupsEnabled: boolean }) {
+export function AppShell({ children, followupsEnabled, claudeCwd = "" }: { children: React.ReactNode; followupsEnabled: boolean; claudeCwd?: string }) {
   const pathname = usePathname();
   return (
+    <ClaudeCwdProvider cwd={claudeCwd}>
     <JobsProvider>
       <PipelineProvider>
       <ApplyProvider>
@@ -72,13 +76,22 @@ export function AppShell({ children, followupsEnabled }: { children: React.React
           <WorkerPills />
 
           <div className="mt-auto space-y-3 pb-16 pt-4 md-tall:pb-40">
+            {claudeCwd && (
+              <a
+                href={claudeCodeLinks({ cwd: claudeCwd }).terminal}
+                title="Open an interactive Claude Code session in the career-ops folder"
+                className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm text-muted transition-colors hover:bg-surface-hover hover:text-foreground"
+              >
+                <SquareTerminal className="size-4" /> Ask Claude Code
+              </a>
+            )}
             <UsageMeter />
             <ThemeToggle showLabel />
           </div>
         </aside>
         <main id="main-content" tabIndex={-1} className="flex-1 overflow-x-hidden focus:outline-none">{children}</main>
         <div className="print:hidden">
-          <AssistantConsole />
+          <AssistantConsole claudeCwd={claudeCwd} />
           <BackToTop />
           <FirstScoreView />
           <BetaBanner />
@@ -88,5 +101,6 @@ export function AppShell({ children, followupsEnabled }: { children: React.React
       </ApplyProvider>
       </PipelineProvider>
     </JobsProvider>
+    </ClaudeCwdProvider>
   );
 }

@@ -91,3 +91,12 @@ test("deepResearchUrlFromProfile accepts only http(s) and claude:// links", () =
   assert.equal(deepResearchUrlFromProfile({}), "");
   assert.equal(deepResearchUrlFromProfile(null), "");
 });
+
+test("the desktop default prefills the prompt in a claude:// link", async () => {
+  const { CLAUDE_DESKTOP_URL, claudeResearchLink } = await import("../../src/lib/deep-prompt.mjs");
+  assert.equal(CLAUDE_DESKTOP_URL, "claude://claude.ai/new?q={prompt}");
+  const { url, prefilled } = claudeResearchLink("Research Acme & co", CLAUDE_DESKTOP_URL);
+  assert.equal(url, `claude://claude.ai/new?q=${encodeURIComponent("Research Acme & co")}`);
+  assert.equal(prefilled, true);
+});
+

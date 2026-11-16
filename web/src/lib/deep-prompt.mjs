@@ -65,6 +65,9 @@ function stripCodeFence(s) {
   return s;
 }
 
+/** Opens the Claude desktop app on a new chat with the prompt prefilled. */
+export const CLAUDE_DESKTOP_URL = "claude://claude.ai/new?q={prompt}";
+
 /**
  * `deep_research.claude_url` in config/profile.yml, or "" when unset or not an
  * http(s)/claude:// link.

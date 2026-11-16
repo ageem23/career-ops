@@ -1,4 +1,5 @@
 import { ChevronDown, FlaskConical } from "lucide-react";
+import { DeepPromptActions } from "@/components/deep-prompt-actions";
 import { ReportMarkdown } from "@/components/report-markdown";
 import { ResearchPaste, ResearchProposals, ResearchReviewStatus, type ProposalView } from "@/components/research-controls";
 import type { Proposal, ReviewSidecar } from "@/lib/research-server";
@@ -25,6 +26,8 @@ export function ResearchPanel({
   researchRel,
   research,
   review,
+  prompt = "",
+  claudeUrl = "",
 }: {
   n: string;
   company: string;
@@ -32,16 +35,22 @@ export function ResearchPanel({
   researchRel: string | null;
   research: string | null;
   review: ReviewSidecar | null;
+  /** The report's Deep Research Prompt; "" hides the Research in Claude button. */
+  prompt?: string;
+  /** Where that button opens the prompt (deep-prompt.mjs claudeResearchLink). */
+  claudeUrl?: string;
 }) {
   return (
     <section className="mt-6 rounded-2xl border border-border bg-surface/40 px-5 py-4 print:hidden" aria-labelledby="deep-research-heading">
       <div className="flex flex-wrap items-center gap-2">
         <FlaskConical className="size-4 text-brand-text" />
-        <h2 id="deep-research-heading" className="text-sm font-medium text-foreground">Deep research</h2>
+        <h2 id="deep-research-heading" className="text-sm font-medium text-foreground">Deep Research</h2>
         {researchRel && <span className="truncate font-mono text-xs text-faint">{researchRel}</span>}
-        {research != null && (
-          <span className="ml-auto">
-            <ResearchReviewStatus n={n} company={company} hasReview={review != null} />
+        {(prompt || research != null) && (
+          <span className="ml-auto inline-flex flex-wrap items-center gap-2">
+            {/* Run the research here, then paste it into the box below: one place for the feature. */}
+            {prompt && <DeepPromptActions prompt={prompt} claudeUrl={claudeUrl} showCopy={false} />}
+            {research != null && <ResearchReviewStatus n={n} company={company} hasReview={review != null} />}
           </span>
         )}
       </div>
@@ -52,7 +61,11 @@ export function ResearchPanel({
         <>
           {review ? (
             <>
-              {review.bottomLine && <p className="mt-3 text-[15px] leading-relaxed text-foreground">{review.bottomLine}</p>}
+              {/* The updates to approve come first: they are what the user acts on.
+                  The comparison and flags below are the evidence behind them. */}
+              <h3 className="mt-3 text-xs font-medium uppercase tracking-[0.14em] text-faint">Proposed updates · reviewed {review.reviewedAt}</h3>
+              <ResearchProposals n={n} proposals={review.proposals.map((p) => proposalView(p, currentScore))} />
+              {review.bottomLine && <p className="mt-4 text-[15px] leading-relaxed text-foreground">{review.bottomLine}</p>}
               <div className="report-prose mt-3">
                 <ReportMarkdown>{review.changesMarkdown}</ReportMarkdown>
               </div>
@@ -68,8 +81,6 @@ export function ResearchPanel({
                   </ul>
                 </div>
               )}
-              <h3 className="mt-4 text-xs font-medium uppercase tracking-[0.14em] text-faint">Proposed updates · reviewed {review.reviewedAt}</h3>
-              <ResearchProposals n={n} proposals={review.proposals.map((p) => proposalView(p, currentScore))} />
             </>
           ) : (
             <p className="mt-3 text-sm text-muted">

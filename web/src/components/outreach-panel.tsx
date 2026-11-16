@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ChevronDown, ListPlus, Loader2, TriangleAlert, Users } from "lucide-react";
 import { DeepPromptActions, type PromptActionLabels } from "@/components/deep-prompt-actions";
+import { CLAUDE_DESKTOP_URL } from "@/lib/deep-prompt.mjs";
 import { TaskList } from "@/components/tasks/task-list";
 import { parseAddTaskCommands } from "@/lib/contacto-prompt.mjs";
 import { compareTasks, type Task } from "@/lib/tasks.mjs";
@@ -17,8 +18,6 @@ const CONTACTO_LABELS: PromptActionLabels = {
   fallback: "“Show the prompt” in the Outreach card",
 };
 
-/** Opens the Claude desktop app on a new chat with the prompt prefilled. */
-const CLAUDE_DESKTOP_URL = "claude://claude.ai/new?q={prompt}";
 
 /**
  * Paste Claude's contacto reply (or only its `node add-task.mjs` block). The

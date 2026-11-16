@@ -34,12 +34,14 @@ import { cvDiskState } from "@/lib/cv-disk-state.mjs";
 import { reportSpendActions } from "@/lib/report-spend-actions.mjs";
 import { applyPostingUrl } from "@/lib/posting-url.mjs";
 import { PageFrame } from "@/components/page-frame";
-import { DeepPromptActions } from "@/components/deep-prompt-actions";
+import { CLAUDE_DESKTOP_URL } from "@/lib/deep-prompt.mjs";
 import { ResearchPanel } from "@/components/research-panel";
 import type { ReviewSidecar } from "@/lib/research-server";
 import { extractDeepPrompt } from "@/lib/deep-prompt.mjs";
 import { CvGateCard } from "@/components/cv-gate-card";
 import { OutreachPanel } from "@/components/outreach-panel";
+import { ClaudeCodeMenu, type ClaudeCodeItem } from "@/components/claude-code-menu";
+import { askPrompt, salaryPrompt, sourceEditPrompt } from "@/lib/claude-code-handoff.mjs";
 import type { Task } from "@/lib/tasks.mjs";
 import type { CvGateState } from "@/lib/cv-gate-server";
 
@@ -57,6 +59,7 @@ export function ReportView({
   id,
   app,
   report,
+  file = null,
   canDelete = false,
   pdfFileReady = false,
   trackerMarkedPdf = false,
@@ -70,6 +73,7 @@ export function ReportView({
   contactoPrompt = "",
   tasks = [],
   today = "",
+  claudeCwd = "",
 }: {
   id: string;
   app: Application | null;
@@ -97,6 +101,8 @@ export function ReportView({
   cvGate?: CvGateState | null;
   /** The contacto research prompt, once the application has gone out (contacto-prompt-server.ts). */
   contactoPrompt?: string;
+  /** Project folder an interactive Claude Code session opens in (claude-code-handoff.mjs). */
+  claudeCwd?: string;
   /** This application's rows in data/tasks.md. */
   tasks?: Task[];
   /** Local YYYY-MM-DD, for due-date badges. */
@@ -118,6 +124,21 @@ export function ReportView({
   const company = app ? companyPresentation(app) : null;
   const companyName = company?.label ?? app?.company ?? meta?.title ?? id;
   const deepPrompt = extractDeepPrompt(report);
+  // Jobs the web workers cannot write for: a tracker note, cv.md / article-digest.md.
+  const handoffApp = {
+    n: id,
+    company: companyName,
+    role: app?.role ?? "",
+    reportFile: file ? `reports/${file}` : null,
+    trackerRow: app?.n ?? null,
+  };
+  const claudeItems: ClaudeCodeItem[] = [
+    ...(app
+      ? [{ label: "Salary expectations", hint: "Recommend an answer, then record it in the tracker notes", prompt: salaryPrompt({ ...handoffApp, trackerRow: app.n }) }]
+      : []),
+    { label: "Change CV or article content", hint: "Edit cv.md or article-digest.md for every future CV", prompt: sourceEditPrompt(handoffApp) },
+    { label: "Ask about this application", hint: "Open-ended question with the report and tracker row loaded", prompt: askPrompt(handoffApp) },
+  ];
   const outreachPanel = app && (contactoPrompt || tasks.length > 0) && (
     <OutreachPanel n={id} prompt={contactoPrompt} tasks={tasks} today={today} />
   );
@@ -214,7 +235,7 @@ export function ReportView({
                 )}
                 <MarkPdfReadyButton reportNum={reportNum} ready={disk.exists} trackerMarked={trackerMarkedPdf} />
                 <ApplyButton n={id} url={applyUrl} company={companyName} pdfReady={disk.exists} quiet={quietApply} />
-                {deepPrompt && <DeepPromptActions prompt={deepPrompt} claudeUrl={deepResearchUrl} />}
+                <ClaudeCodeMenu cwd={claudeCwd} items={claudeItems} />
                 {coverReady && (
                   <a
                     href={`/api/cover-pdf?application=${encodeURIComponent(id)}`}
@@ -241,6 +262,9 @@ export function ReportView({
                 researchRel={research?.rel ?? null}
                 research={research?.text ?? null}
                 review={research?.review ?? null}
+                prompt={deepPrompt}
+                // Desktop app by default, like Outreach; deep_research.claude_url in profile.yml overrides it.
+                claudeUrl={deepResearchUrl || CLAUDE_DESKTOP_URL}
               />
             );
             if (sections.length === 0) {
@@ -249,7 +273,6 @@ export function ReportView({
                   {callout}
                   {actions}
                   {gateCard}
-                  {researchPanel}
                   {outreachPanel}
                   {app && canDelete && (
                     <div className="mt-8 border-t border-border pt-4 print:hidden">
@@ -257,6 +280,7 @@ export function ReportView({
                     </div>
                   )}
                   <ScoreLevers report={report} />
+                  {researchPanel}
                   <article className="report-prose mt-6">
                     <ReportMarkdown>{meta?.body ?? report}</ReportMarkdown>
                   </article>
@@ -268,7 +292,6 @@ export function ReportView({
                 {callout}
                 {actions}
                 {gateCard}
-                {researchPanel}
                 {outreachPanel}
                 {app && canDelete && (
                   <div className="mt-8 border-t border-border pt-4 print:hidden">
@@ -276,6 +299,7 @@ export function ReportView({
                   </div>
                 )}
                 <ScoreLevers report={report} />
+                {researchPanel}
 
                 {mainSections.map((s, i) => {
                   const expanded = isLeadSection(s);

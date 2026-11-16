@@ -15,6 +15,7 @@ import { tasksForApp } from "@/lib/tasks-server";
 import { localISODate } from "@/lib/followups";
 import { applyPostingUrl } from "@/lib/posting-url.mjs";
 import { applicationMetadata } from "@/lib/tab-title-server";
+import { resolveCodeRoot } from "@/lib/core/code-root.mjs";
 
 export const dynamic = "force-dynamic";
 
@@ -65,6 +66,7 @@ export default async function ReportPage({ params, searchParams }: {
       contactoPrompt={contactoPromptFor(app, postingUrl)}
       tasks={app ? tasksForApp(app.n) : []}
       today={localISODate()}
+      claudeCwd={resolveCodeRoot(process.cwd(), process.env)}
     />
   );
 }

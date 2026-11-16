@@ -6,6 +6,7 @@ import { RouteProgressHost } from "@/components/route-progress-host";
 import { ThemeProvider } from "@/components/theme-provider";
 import { readFollowupsEnabled } from "@/lib/followups-server";
 import { ROOT_TITLE } from "@/lib/tab-title.mjs";
+import { resolveCodeRoot } from "@/lib/core/code-root.mjs";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -45,7 +46,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
         <script dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} />
         <RouteProgressHost />
         <ThemeProvider>
-          <AppShell followupsEnabled={followupsEnabled}>{children}</AppShell>
+          <AppShell followupsEnabled={followupsEnabled} claudeCwd={resolveCodeRoot(process.cwd(), process.env)}>{children}</AppShell>
         </ThemeProvider>
       </body>
     </html>

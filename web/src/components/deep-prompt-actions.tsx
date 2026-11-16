@@ -57,10 +57,13 @@ export function DeepPromptActions({
   prompt,
   claudeUrl = "",
   labels = RESEARCH_LABELS,
+  showCopy = true,
 }: {
   prompt: string;
   claudeUrl?: string;
   labels?: PromptActionLabels;
+  /** false drops the separate copy button; "open" still copies first. */
+  showCopy?: boolean;
 }) {
   const [note, setNote] = useState("");
   const [copied, setCopied] = useState(false);
@@ -79,7 +82,10 @@ export function DeepPromptActions({
     // refuses writes from an unfocused document.
     const ok = await copyText(prompt);
     const { url, prefilled } = claudeResearchLink(prompt, claudeUrl);
-    window.open(url, "_blank", "noopener,noreferrer");
+    // An app link (claude://) opens the desktop app; window.open would leave
+    // an empty browser tab behind it.
+    if (/^https?:/i.test(url)) window.open(url, "_blank", "noopener,noreferrer");
+    else window.location.href = url;
     setNote(
       prefilled
         ? "Opened Claude with the prompt filled in. Turn on Research, then send."
@@ -92,19 +98,21 @@ export function DeepPromptActions({
   return (
     <span className="inline-flex flex-col items-start gap-1">
       <span className="inline-flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          onClick={copy}
-          title={labels.copyTitle}
-          className={`${PILL} border-border text-muted hover:border-brand/40 hover:text-brand-text`}
-        >
-          {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-          {copied ? "Copied" : labels.copy}
-        </button>
+        {showCopy && (
+          <button
+            type="button"
+            onClick={copy}
+            title={labels.copyTitle}
+            className={`${PILL} border-border text-muted hover:border-brand/40 hover:text-brand-text`}
+          >
+            {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+            {copied ? "Copied" : labels.copy}
+          </button>
+        )}
         <button
           type="button"
           onClick={open}
-          title="Copy the prompt and open Claude in a new tab"
+          title={/^https?:/i.test(claudeUrl || "https:") ? "Copy the prompt and open Claude in a new tab" : "Copy the prompt and open it in the Claude desktop app"}
           className={`${PILL} border-brand/30 text-brand-text hover:bg-brand-soft/50`}
         >
           <ExternalLink className="size-3.5" /> {labels.open}

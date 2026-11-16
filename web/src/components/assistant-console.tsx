@@ -3,7 +3,8 @@
 import { lazy, Suspense, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import Link from "next/link";
-import { Send, X, Loader2, Settings, RotateCcw, ArrowUpRight, Sparkles, Maximize2, Minimize2 } from "lucide-react";
+import { Send, X, Loader2, Settings, RotateCcw, ArrowUpRight, Sparkles, Maximize2, Minimize2, SquareTerminal } from "lucide-react";
+import { claudeCodeLinks, consolePrompt } from "@/lib/claude-code-handoff.mjs";
 import { CoMark } from "@/components/co-mark";
 import { useJobs } from "@/components/jobs/job-store";
 import { usePipeline } from "@/components/pipeline/pipeline-provider";
@@ -140,7 +141,7 @@ function msgText(m: Msg): string {
   return m.parts.filter((p): p is Extract<Part, { type: "text" }> => p.type === "text").map((p) => p.text).join(" ").trim();
 }
 
-export function AssistantConsole() {
+export function AssistantConsole({ claudeCwd = "" }: { claudeCwd?: string }) {
   const [open, setOpen] = useState(false);
   const [cliId, setCliId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Msg[]>([]);
@@ -415,6 +416,19 @@ export function AssistantConsole() {
     } catch (e) { setSaveError(e instanceof Error ? e.message : "Could not switch conversations"); }
     finally { setChatPending(false); }
   }
+  // Hand the conversation to an interactive Claude Code session: the page,
+  // the recent messages (minus the canned greeting) and the unsent draft.
+  function continueInClaudeCode() {
+    const prompt = consolePrompt({
+      page: describePage(pathname),
+      messages: messagesRef.current
+        .map((m) => ({ role: m.role, text: msgText(m) }))
+        .filter((m) => !(m.role === "assistant" && m.text === GREETING.trim())),
+      draft: input,
+    });
+    window.location.href = claudeCodeLinks({ cwd: claudeCwd, prompt }).terminal;
+  }
+
   function exportChat() {
     // Export the live draft even if it exceeds the storage limits.
     const blob = new Blob([JSON.stringify({ ...activeChat.current, messages: messagesRef.current, draft: input }, null, 2)], { type: "application/json" });
@@ -855,6 +869,11 @@ export function AssistantConsole() {
               <div id={panelTitleId} className="text-sm font-semibold tracking-tight">Assistant</div>
               <div className="text-xs text-faint">{cliId ? `via ${cliId}` : "no CLI configured"}</div>
             </div>
+            {claudeCwd && (
+              <Button variant="ghost" size="icon" onClick={continueInClaudeCode} className="text-muted" aria-label="Continue in Claude Code" title="Continue this conversation in a Claude Code terminal (full write access). Nothing runs until you press Enter there.">
+                <SquareTerminal className="size-4" />
+              </Button>
+            )}
             <Button variant="ghost" size="icon" onClick={cycleSize} className="text-muted" aria-label={SIZE_LABEL[size]} title={SIZE_LABEL[size]}>
               {size === "full" ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
             </Button>

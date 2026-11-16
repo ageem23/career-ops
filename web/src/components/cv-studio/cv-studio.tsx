@@ -14,6 +14,8 @@ import { SectionCard } from "./section-card";
 import { CvPreview } from "./cv-preview";
 import { CoverageMeter } from "./coverage-meter";
 import { AssistPanel } from "./assist-panel";
+import { ClaudeCodeMenu } from "@/components/claude-code-menu";
+import { sourceEditPrompt } from "@/lib/claude-code-handoff.mjs";
 
 type Loaded = { ok: true; reportNum: string; company: string; file: string; tree: BlockTree; doc: StudioDoc; edits: StudioEdits; stale: boolean; hasBase: boolean; pdfExport?: { ok: false; error: string } | null };
 type LoadState = { kind: "loading" } | { kind: "error"; reason: string } | { kind: "ready"; data: Loaded };
@@ -34,7 +36,7 @@ const STALE = "This CV was regenerated in another tab. Reload the Studio.";
 const KEEPALIVE_BYTES = 60_000;
 const SAVE_ERRORS: Record<string, string> = { stale: STALE, busy: "This CV is already being saved. Wait for that save to finish." };
 
-export function CvStudio({ n }: { n: string }) {
+export function CvStudio({ n, claudeCwd = "" }: { n: string; claudeCwd?: string }) {
   const listQuery = pipelineQuery(useSearchParams().toString());
   const reportHref = `/pipeline/${encodeURIComponent(n)}${listQuery ? `?${listQuery}` : ""}`;
   const [load, setLoad] = useState<LoadState>({ kind: "loading" });
@@ -61,12 +63,12 @@ export function CvStudio({ n }: { n: string }) {
           <p className="mt-2 text-sm text-muted">{REASONS[load.reason]?.body ?? "Reload the page to try again."}</p>
         </div>
       )}
-      {load.kind === "ready" && <Studio n={n} data={load.data} />}
+      {load.kind === "ready" && <Studio n={n} data={load.data} claudeCwd={claudeCwd} />}
     </div>
   );
 }
 
-function Studio({ n, data }: { n: string; data: Loaded }) {
+function Studio({ n, data, claudeCwd }: { n: string; data: Loaded; claudeCwd: string }) {
   const { doc, tree } = data;
   const [edits, dispatchEdit] = useReducer((e: StudioEdits, a: StudioAction) => studioReducer(e, a, doc), data.edits);
   const history = useRef<StudioEdits[]>([]);
@@ -285,6 +287,10 @@ function Studio({ n, data }: { n: string; data: Loaded }) {
           <button onClick={() => recordEdit({ type: "reset" })} className="inline-flex items-center gap-1.5 rounded-full border border-border px-3 py-1.5 text-xs text-muted transition-colors hover:border-brand/40 hover:text-brand-text">
             <RotateCcw className="size-3.5" /> Reset
           </button>
+          <ClaudeCodeMenu
+            cwd={claudeCwd}
+            items={[{ label: "Change CV or article content", hint: "Edit cv.md or article-digest.md for every future CV", prompt: sourceEditPrompt({ n, company: data.company }) }]}
+          />
           <p role="status" className="text-xs text-muted">{editStatus}</p>
           <button
             onClick={saveForApply}
