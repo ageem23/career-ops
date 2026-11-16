@@ -1,4 +1,5 @@
 import { evaluationGateForJob, jobStateLabel } from "./job-gate.mjs";
+import { repairState } from "./job-repair.mjs";
 
 /** @typedef {{ id: string, title: string, subtitle?: string, status: string }} Worker */
 
@@ -23,7 +24,8 @@ export function workerBatchSummary(jobs, total = jobs.length) {
     ["running", jobs.filter((j) => j.status === "running").length],
     ["completed", jobs.filter((j) => j.status === "done").length],
     ["needs review", jobs.filter((j) => j.status === "gated" || evaluationGateForJob(j)).length],
-    ["failed", jobs.filter((j) => j.status === "error" && !evaluationGateForJob(j)).length],
+    // A refused run its repair fixed is not a failure: the repair counts as completed.
+    ["failed", jobs.filter((j) => j.status === "error" && !evaluationGateForJob(j) && repairState(j) !== "repaired").length],
     ["unavailable", Math.max(0, total - jobs.length)],
   ];
   return counts.filter(([, count]) => count).map(([state, count]) => `${count} ${state}`).join(", ");

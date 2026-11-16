@@ -7,6 +7,7 @@ import { createWorkerFeedback } from "@/lib/worker-feedback.mjs";
 import { readJobStream } from "@/lib/job-stream.mjs";
 import { createJobsPersister, restoreStoredJobs, saveJobsAfterOpen } from "@/lib/jobs-persist.mjs";
 import type { EVALUATION_GATE_REASONS } from "@/lib/evaluation-gate.mjs";
+import { withRepairFinished, withRepairStarted, type JobRepair } from "@/lib/job-repair.mjs";
 
 export type JobStep = { kind: "tool" | "status"; label: string; ts: number };
 export type JobGate = { reason: (typeof EVALUATION_GATE_REASONS)[number]; message: string; confirmationRequired: boolean };
@@ -30,9 +31,11 @@ export type Job = {
   reportN?: number | null;
   startedAt: number;
   endedAt?: number;
+  repair?: JobRepair; // on a run the CV fact gate refused: the automatic repair run started for it
+  repairOf?: string; // on that repair run: the refused run's id
 };
 
-type StartOpts = { title: string; subtitle?: string; kind: string; input: string; page?: string; batchId?: string; brief?: Record<string, string>; evaluationSections?: string[] };
+type StartOpts = { title: string; subtitle?: string; kind: string; input: string; page?: string; batchId?: string; brief?: Record<string, string>; evaluationSections?: string[]; repairOf?: string };
 
 type Ctx = {
   jobs: Job[];
@@ -138,6 +141,7 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
         kind: opts.kind,
         evaluationSections: opts.evaluationSections ? [...opts.evaluationSections] : undefined,
         batchId: opts.batchId,
+        repairOf: opts.repairOf,
         status: "running",
         steps: [{ kind: "status", label: "Starting…", ts: Date.now() }],
         text: "",
@@ -163,6 +167,10 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
           steps.push(step);
           patch(id, (j) => ({ ...j, steps: [...j.steps, step] }));
         });
+        // A repair run reports how it ended on the refused run it repairs.
+        const settleRepairOf = (status: "done" | "error" | "gated") => {
+          if (opts.repairOf) patch(opts.repairOf, (j) => withRepairFinished(j, id, status, Date.now()));
+        };
         if (!cliId) {
           feedback.current?.push({ ...job, status: "error" });
           patch(id, (j) => ({
@@ -171,6 +179,7 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
             endedAt: Date.now(),
             steps: [...j.steps, { kind: "status", label: "No CLI configured — open Config and click Save config", ts: Date.now() }],
           }));
+          settleRepairOf("error");
           return;
         }
         let text = "";
@@ -195,6 +204,7 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
             endedAt: Date.now(),
             steps: lastLabel ? [...j.steps, { kind: "status", label: lastLabel, ts: Date.now() }] : j.steps,
           }));
+          settleRepairOf(status);
           // persist a readable log file so the CLI/assistant can read past runs
           if (status === "done" || status === "gated") {
             fetch("/api/runs/save", {
@@ -243,11 +253,13 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
             const repair = completion.retry === "fact-check" && opts.kind === "pdf" && opts.brief?.repair !== "fact-check";
             finish("error", repair ? `The CV checks refused some lines; started one automatic repair run. ${completion.message}` : completion.message);
             if (repair) {
-              startRef.current?.({
+              const repairId = startRef.current?.({
                 ...opts,
                 subtitle: "repair: rewording the lines the CV checks flagged",
                 brief: { ...(opts.brief ?? {}), repair: "fact-check" },
+                repairOf: id,
               });
+              if (repairId) patch(id, (j) => withRepairStarted(j, repairId));
             }
             return;
           }

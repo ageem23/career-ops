@@ -1,4 +1,5 @@
 import { classifyEvaluationGate, EVALUATION_GATE_REASONS, stripEvaluationGate } from "./evaluation-gate.mjs";
+import { repairState } from "./job-repair.mjs";
 
 /** @typedef {{ reason: (typeof EVALUATION_GATE_REASONS)[number], message: string, confirmationRequired: boolean, legacy?: boolean }} JobGate */
 
@@ -37,6 +38,9 @@ export function evaluationGateForJob(job) {
 /** The presentation label never asserts that an unscored gate saved a report. */
 export function jobStateLabel(job) {
   if (job?.status === "gated" || evaluationGateForJob(job)) return "Needs review";
+  const repair = repairState(job);
+  if (repair === "repaired") return "Fixed by repair run";
+  if (repair === "running") return "Failed, repair running";
   return job?.status === "done" ? "Completed" : job?.status === "error" ? "Failed" : "Running";
 }
 

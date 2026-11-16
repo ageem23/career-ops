@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { Check, AlertTriangle, Loader2, Trash2, CirclePause } from "lucide-react";
+import { Check, AlertTriangle, Loader2, Trash2, CirclePause, Wrench } from "lucide-react";
 import { useJobs } from "@/components/jobs/job-store";
 import { evaluationGateForJob, jobStateLabel } from "@/lib/job-gate.mjs";
+import { repairState } from "@/lib/job-repair.mjs";
 import { pillTone } from "@/components/jobs/worker-pills";
 import { cn } from "@/lib/cn";
 
@@ -59,6 +60,8 @@ export default function JobsHistory() {
                     <Loader2 className="size-4 shrink-0 animate-spin text-brand-text" />
                   ) : gate || j.status === "gated" ? (
                     <CirclePause className="size-4 shrink-0 text-amber-500" />
+                  ) : repairState(j) === "repaired" || repairState(j) === "running" ? (
+                    <Wrench className="size-4 shrink-0 text-zinc-400" />
                   ) : j.status === "error" ? (
                     <AlertTriangle className="size-4 shrink-0 text-red-400" />
                   ) : (

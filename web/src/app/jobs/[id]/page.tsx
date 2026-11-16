@@ -5,8 +5,11 @@ import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { noMarkdownImages } from "@/lib/markdown-options.mjs";
-import { ArrowLeft, ArrowRight, Loader2, Wrench, CircleDot, Check, X, CirclePause } from "lucide-react";
+import { ArrowLeft, ArrowRight, Loader2, Wrench, CircleDot, Check, X, CirclePause, SquareTerminal } from "lucide-react";
+import { useClaudeCwd } from "@/components/claude-cwd";
+import { claudeCodeLinks, jobErrorPrompt } from "@/lib/claude-code-handoff.mjs";
 import { evaluationGateForJob, isLegacyMissingReportMessage, jobOutputForDisplay } from "@/lib/job-gate.mjs";
+import { repairState } from "@/lib/job-repair.mjs";
 import { notFound, useSearchParams } from "next/navigation";
 import { useJobs } from "@/components/jobs/job-store";
 import { missingWorker } from "@/lib/job-route.mjs";
@@ -20,6 +23,7 @@ import { Badge } from "@/components/ui/badge";
 export default function JobPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const { jobs, ready } = useJobs();
+  const claudeCwd = useClaudeCwd();
   const job = jobs.find((j) => j.id === id);
   const query = pipelineQuery(useSearchParams().toString());
   const pipelineHref = `/pipeline${query ? `?${query}` : ""}`;
@@ -53,6 +57,7 @@ export default function JobPage({ params }: { params: Promise<{ id: string }> })
   if (!job) notFound();
 
   const gate = evaluationGateForJob(job);
+  const repair = repairState(job);
   const displayOutput = jobOutputForDisplay(job);
   return (
     <div className="mx-auto max-w-3xl px-6 py-8">
@@ -70,17 +75,65 @@ export default function JobPage({ params }: { params: Promise<{ id: string }> })
               <><CirclePause className="size-3 text-amber-500" /> needs review</>
             ) : job.status === "done" ? (
               <><Check className="size-3 text-emerald-500" /> done</>
+            ) : repair === "repaired" ? (
+              <><Wrench className="size-3 text-zinc-400" /> fixed by repair run</>
+            ) : repair === "running" ? (
+              <><Wrench className="size-3 text-zinc-400" /> failed, repair running</>
             ) : (
               <><X className="size-3 text-red-400" /> error</>
             )}
           </p>
           <h1 className="mt-2 font-display text-2xl tracking-tight text-landing">{job.title}</h1>
           {job.subtitle && <p className="mt-1 text-sm text-muted">{job.subtitle}</p>}
+          {repair && job.repair && (
+            <p className="mt-3 text-sm text-muted">
+              {repair === "repaired"
+                ? "The CV checks refused some lines of this run, so an automatic repair run reworded them and generated the PDF. Nothing more to do here."
+                : repair === "running"
+                  ? "The CV checks refused some lines of this run. An automatic repair run is rewording them now."
+                  : "The CV checks refused some lines of this run, and the automatic repair run did not finish either."}{" "}
+              <Link href={`/jobs/${job.repair.id}${query ? `?${query}` : ""}`} className="text-foreground underline-offset-2 hover:underline">
+                Open the repair run
+              </Link>
+            </p>
+          )}
+          {job.repairOf && (
+            <p className="mt-3 text-sm text-muted">
+              Automatic repair of a run the CV checks refused.{" "}
+              <Link href={`/jobs/${job.repairOf}${query ? `?${query}` : ""}`} className="text-foreground underline-offset-2 hover:underline">
+                Open the refused run
+              </Link>
+            </p>
+          )}
           {job.status === "done" && job.result?.score != null && (
             <div className="mt-3 flex flex-wrap items-center gap-2.5">
               <Badge tone={job.result.tone}>{job.result.score}/5</Badge>
               {job.result.summary && <span className="text-sm text-muted">{job.result.summary}</span>}
             </div>
+          )}
+          {job.status === "error" && repair !== "repaired" && repair !== "running" && claudeCwd && (
+            <a
+              href={claudeCodeLinks({
+                cwd: claudeCwd,
+                prompt: jobErrorPrompt({
+                  id: job.id,
+                  kind: job.kind,
+                  title: job.title,
+                  subtitle: job.subtitle,
+                  input: job.input,
+                  page: job.page,
+                  error: job.steps.at(-1)?.label,
+                  steps: job.steps.slice(0, -1).map((s) => (s.kind === "tool" ? `Using ${s.label}` : s.label)),
+                  output: job.text,
+                  startedAt: job.startedAt,
+                  endedAt: job.endedAt,
+                }),
+              }).terminal}
+              title="Open a Claude Code terminal with this run's error, steps and output typed in. Nothing runs until you press Enter."
+              className="mr-2 mt-4 inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-4 py-2 text-sm font-medium text-foreground transition-colors hover:border-brand/40 hover:text-brand-text max-sm:min-h-[44px]"
+            >
+              <SquareTerminal className="size-4" /> Debug in Claude Code
+            </a>
           )}
           {appHref && job.status !== "running" && (
             <Link

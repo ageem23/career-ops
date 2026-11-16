@@ -8,6 +8,8 @@
 // reload must not lose (a job just finished or was removed), and `flush()`
 // covers a page that goes away mid-stream.
 
+import { settleInterruptedRepair } from "./job-repair.mjs";
+
 /**
  * @template T
  * @param {object} options
@@ -49,7 +51,10 @@ export function createJobsPersister({ write, isActive, delayMs = 1000, setTimer 
 
 export function restoreStoredJobs(stored, now) {
   if (!Array.isArray(stored)) return [];
-  return stored.map((job) => {
+  return stored.map((stale) => {
+    // A repair cut off by the reload is restored as interrupted below, so the
+    // refused run it was repairing stops saying "repair running".
+    const job = settleInterruptedRepair(stale);
     if (job?.status !== "running") return job;
     const steps = Array.isArray(job.steps) ? job.steps : [];
     return {

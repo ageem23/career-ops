@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Check, X, Loader2, AlertTriangle, CirclePause } from "lucide-react";
+import { Check, X, Loader2, AlertTriangle, CirclePause, Wrench } from "lucide-react";
 import type { Job } from "@/components/jobs/job-store";
 import { workerIdentity } from "@/lib/worker-feedback.mjs";
 import { evaluationGateForJob, jobStateLabel } from "@/lib/job-gate.mjs";
 import { jobErrorHint } from "@/lib/job-error-hint.mjs";
+import { repairState } from "@/lib/job-repair.mjs";
 import { cn } from "@/lib/cn";
 import { isFencingNotice } from "@/lib/cli-fencing.mjs";
 
@@ -73,6 +74,9 @@ export const TONE = {
 
 export function pillTone(j: Job): keyof typeof TONE {
   if (j.status === "gated" || evaluationGateForJob(j)) return "warn";
+  // A refused run whose repair fixed it (or is still trying) is not shown red.
+  const repair = repairState(j);
+  if (repair === "repaired" || repair === "running") return "muted";
   if (j.status === "error") return "bad";
   if (j.status === "done") return j.result?.tone ?? "muted";
   return "muted";
@@ -97,6 +101,8 @@ export function WorkerCard({
   const inline = variant === "inline";
   const hasScore = job.status === "done" && job.result?.score != null;
   const errorHint = jobErrorHint(job);
+  const repair = repairState(job);
+  const repaired = repair === "repaired" || repair === "running";
   const fencing = fencingNotice(job);
   const tokens = job.status === "done" || job.status === "gated" ? job.cost?.tokens ?? 0 : 0;
 
@@ -107,6 +113,8 @@ export function WorkerCard({
           <Loader2 className="size-3 shrink-0 animate-spin text-brand-text" />
         ) : gate || job.status === "gated" ? (
           <CirclePause className="size-3 shrink-0 text-amber-500" />
+        ) : repaired ? (
+          <Wrench className={cn("size-3 shrink-0", tone.icon)} />
         ) : job.status === "error" ? (
           <AlertTriangle className={cn("size-3 shrink-0", tone.icon)} />
         ) : (
