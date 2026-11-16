@@ -33,7 +33,7 @@ import {
   untrackedSignature,
   walkSignature,
 } from "../src/lib/web-service-prepare.mjs";
-import { crashRestartDelayMs, parseRunArgs } from "../src/lib/web-service.mjs";
+import { crashRestartDelayMs, isRunnerCommandLine, parseRunArgs, runnerPidPath } from "../src/lib/web-service.mjs";
 
 const webDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(webDir, "..");
@@ -100,6 +100,23 @@ async function runService(argv) {
     if (fd === null) process.stderr.write(text);
     else fs.writeSync(fd, text);
   };
+
+  // Windows: record this runner so restart/uninstall can stop it (runnerPidPath).
+  // An earlier runner still recorded here outlived its task, through the Task
+  // Scheduler UI or an older restart; stop it so this one can take the port.
+  if (process.platform === "win32" && logPath) {
+    const pidFile = runnerPidPath(logPath);
+    let previous = NaN;
+    try { previous = Number(fs.readFileSync(pidFile, "utf8").trim()); } catch { /* none recorded */ }
+    if (Number.isInteger(previous) && previous > 0 && previous !== process.pid) {
+      const query = run("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${previous}").CommandLine`]);
+      if (query.status === 0 && isRunnerCommandLine(query.stdout)) {
+        run("taskkill", ["/T", "/F", "/PID", String(previous)]);
+        log(`stopped an earlier runner (pid ${previous}) that was still running`);
+      }
+    }
+    fs.writeFileSync(pidFile, String(process.pid));
+  }
 
   const git = (args) => {
     const result = spawnSync("git", ["-C", repoRoot, ...args], {

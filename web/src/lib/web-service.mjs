@@ -226,13 +226,17 @@ const winArg = (s) =>
  * `%` is refused: Task Scheduler expands %VARIABLE% in an action's arguments, and a
  * path containing one would be silently rewritten.
  */
-export function renderTaskXml({ node, args, workDir, user }) {
-  for (const value of [node, workDir, user, ...args]) {
+export function renderTaskXml({ node, args, workDir, user, consoleHost = null }) {
+  for (const value of [node, workDir, user, consoleHost ?? "", ...args]) {
     if (String(value).includes("%")) {
       throw new Error(`a path containing "%" cannot be used in a scheduled task: ${value}`);
     }
   }
-  const argLine = args.map(winArg).join(" ");
+  // An InteractiveToken task that runs node.exe directly gets a console window
+  // in the user's session, and closing that window kills the dashboard. Through
+  // `conhost.exe --headless` the same process runs with no window.
+  const command = consoleHost ?? node;
+  const argLine = [...(consoleHost ? ["--headless", node] : []), ...args].map(winArg).join(" ");
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -276,13 +280,29 @@ export function renderTaskXml({ node, args, workDir, user }) {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>${xmlEscape(node)}</Command>
+      <Command>${xmlEscape(command)}</Command>
       <Arguments>${xmlEscape(argLine)}</Arguments>
       <WorkingDirectory>${xmlEscape(workDir)}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>
 `;
+}
+
+/**
+ * Where the Windows runner records its process id: beside the log. Through
+ * `conhost.exe --headless` (renderTaskXml) the runner is not the task's own
+ * process, so `schtasks /End` stops the console host and leaves the runner
+ * and its server holding the port. restart, install and uninstall stop the
+ * recorded runner's process tree instead.
+ */
+export function runnerPidPath(logPath) {
+  return logPath.replace(/\.log$/i, "") + ".pid";
+}
+
+/** True when a Windows process command line is this service's runner. */
+export function isRunnerCommandLine(commandLine) {
+  return /web-service\.mjs["']?\s+run(\s|$)/i.test(String(commandLine ?? ""));
 }
 
 /** Where each platform keeps the definition the installer writes. */

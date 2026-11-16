@@ -162,6 +162,7 @@ test("Windows install registers the task from a UTF-16 definition, then starts i
 
   assert.deepEqual(sb.calls.map((c) => c.split(" ").slice(0, 3).join(" ")), [
     "schtasks /Create /TN",
+    "schtasks /End /TN",
     "schtasks /Run /TN",
   ]);
   assert.match(sb.calls[0], /\/TN career-ops web \/XML .*career-ops-web-task\.xml \/F$/);
@@ -376,4 +377,53 @@ test("Windows uninstall and status tell a missing task from a failed query", asy
       assert.equal(serviceStatus(sb.ctx), false);
     });
   }
+});
+
+// Through conhost --headless, schtasks /End stops only the console host: the
+// runner and its server keep the port. The recorded runner is stopped too.
+function recordRunner(sb, pid) {
+  fs.mkdirSync(path.dirname(sb.ctx.logPath), { recursive: true });
+  fs.writeFileSync(path.join(path.dirname(sb.ctx.logPath), "web-service.pid"), String(pid));
+}
+const runnerLine = { status: 0, stdout: '"C:\Program Files\nodejs\node.exe" C:\co\web\scripts\web-service.mjs run --log C:\co\data\web-service.log\r\n', stderr: "" };
+
+test("Windows restart stops the recorded runner's process tree before starting the task", () => withSandbox(
+  "win32",
+  { results: { powershell: [runnerLine] } },
+  async (sb) => {
+    recordRunner(sb, 4242);
+    restartService(sb.ctx);
+    assert.deepEqual(sb.calls.map((c) => c.split(" ").slice(0, 2).join(" ")), [
+      "schtasks /End",
+      "powershell -NoProfile",
+      "taskkill /T",
+      "schtasks /Run",
+    ]);
+    assert.ok(sb.calls.includes("taskkill /T /F /PID 4242"));
+    assert.ok(!fs.existsSync(path.join(path.dirname(sb.ctx.logPath), "web-service.pid")), "the pid file is cleared");
+  },
+));
+
+test("Windows restart never stops a recorded PID that is no longer the runner", () => withSandbox(
+  "win32",
+  { results: { powershell: [{ status: 0, stdout: '"C:\Program Files\nodejs\node.exe" some-other-app.js\r\n', stderr: "" }] } },
+  async (sb) => {
+    recordRunner(sb, 4242);
+    restartService(sb.ctx);
+    assert.ok(!sb.calls.some((c) => c.startsWith("taskkill")), sb.calls.join("\n"));
+  },
+));
+
+test("Windows uninstall and install also stop the recorded runner", async () => {
+  await withSandbox("win32", { results: { powershell: [runnerLine] } }, async (sb) => {
+    recordRunner(sb, 7);
+    uninstallService(sb.ctx);
+    assert.ok(sb.calls.includes("taskkill /T /F /PID 7"), sb.calls.join("\n"));
+  });
+  await withSandbox("win32", { results: { powershell: [runnerLine] } }, async (sb) => {
+    recordRunner(sb, 8);
+    await installService(sb.ctx);
+    const order = sb.calls.map((c) => c.split(" ")[0] + " " + c.split(" ")[1]);
+    assert.ok(order.indexOf("taskkill /T") < order.indexOf("schtasks /Run"), order.join("\n"));
+  });
 });

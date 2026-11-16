@@ -168,6 +168,25 @@ test("the Task Scheduler definition runs at logon as the user, unelevated, and r
   assert.match(xml, /<WorkingDirectory>C:\\career ops\\web<\/WorkingDirectory>/);
 });
 
+test("the Task Scheduler definition runs node through a headless console host when given one", () => {
+  const xml = renderTaskXml({
+    node: "C:\\Program Files\\nodejs\\node.exe",
+    args: ["C:\\co\\web\\scripts\\web-service.mjs", "run"],
+    workDir: "C:\\co\\web",
+    user: "PC\\me",
+    consoleHost: "C:\\Windows\\System32\\conhost.exe",
+  });
+  assert.ok(xml.includes("<Command>C:\\Windows\\System32\\conhost.exe</Command>"), xml);
+  assert.ok(
+    xml.includes("<Arguments>--headless &quot;C:\\Program Files\\nodejs\\node.exe&quot; C:\\co\\web\\scripts\\web-service.mjs run</Arguments>"),
+    xml,
+  );
+  assert.throws(
+    () => renderTaskXml({ node: "n", args: [], workDir: "w", user: "u", consoleHost: "C:\\50%\\conhost.exe" }),
+    /cannot be used in a scheduled task/,
+  );
+});
+
 test("the Task Scheduler definition escapes XML and refuses a percent sign", () => {
   const xml = renderTaskXml({ node: "n", args: ["a&b"], workDir: "w", user: "u" });
   assert.ok(xml.includes("<Arguments>a&amp;b</Arguments>"));
@@ -214,4 +233,14 @@ test("Windows crash restarts are throttled to RESTART_SECONDS by the runner", ()
   // launchd and systemd throttle in their own definitions
   assert.equal(crashRestartDelayMs({ platform: "linux", ...crash }), null);
   assert.equal(crashRestartDelayMs({ platform: "darwin", ...crash }), null);
+});
+
+test("the runner pid file sits beside the log, and only the runner's command line matches", async () => {
+  const { runnerPidPath, isRunnerCommandLine } = await import("../../src/lib/web-service.mjs");
+  assert.equal(runnerPidPath("C:\co\data\web-service.log"), "C:\co\data\web-service.pid");
+  assert.ok(isRunnerCommandLine('"C:\node.exe" C:\co\web\scripts\web-service.mjs run --log x'));
+  assert.ok(isRunnerCommandLine("node web-service.mjs run"));
+  assert.ok(!isRunnerCommandLine('"C:\node.exe" C:\co\web\scripts\web-service.mjs restart'));
+  assert.ok(!isRunnerCommandLine("node server.mjs start"));
+  assert.ok(!isRunnerCommandLine(""));
 });

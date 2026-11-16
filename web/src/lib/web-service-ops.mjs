@@ -19,7 +19,9 @@ import {
   renderLaunchdPlist,
   renderSystemdUnit,
   renderTaskXml,
+  isRunnerCommandLine,
   runArgs,
+  runnerPidPath,
   stableNodePath,
 } from "./web-service.mjs";
 
@@ -62,7 +64,13 @@ function plan(ctx) {
     text = renderSystemdUnit({ node, args, workDir: webDir });
   } else {
     if (!ctx.user) throw new Error("cannot tell which Windows user to run the task as (USERNAME is not set)");
-    text = renderTaskXml({ node, args, workDir: webDir, user: ctx.user });
+    // Hide the dashboard's console window (see renderTaskXml). Only when the
+    // Windows console host is where it should be; otherwise the task keeps the
+    // visible window rather than failing to start.
+    const systemRoot = env?.SystemRoot || env?.SYSTEMROOT || env?.windir;
+    const conhost = systemRoot ? path.win32.join(systemRoot, "System32", "conhost.exe") : null;
+    const consoleHost = conhost && fs.existsSync(conhost) ? conhost : null;
+    text = renderTaskXml({ node, args, workDir: webDir, user: ctx.user, consoleHost });
   }
   return { node, args, file, text };
 }
@@ -152,10 +160,42 @@ function installTask(ctx, text) {
   } finally {
     fs.rmSync(file, { force: true });
   }
+  // A reinstall over a running task: MultipleInstancesPolicy IgnoreNew would
+  // drop this /Run and leave the old definition's process serving. /End fails
+  // harmlessly when nothing is running.
+  run("schtasks", ["/End", "/TN", name]);
+  stopRecordedRunner(ctx);
   const started = run("schtasks", ["/Run", "/TN", name]);
   out(`Installed task "${name}" (Task Scheduler). It starts at logon and restarts if it exits.`);
   if (started.status !== 0) out(`It could not be started now (${describe(started)}); it will start at your next logon.`);
   out(`Logs: ${ctx.logPath}`);
+}
+
+/**
+ * Stop the runner recorded in the pid file, with its server (Windows). Only a
+ * process whose command line is this service's runner is stopped: once the
+ * runner is gone its PID can belong to anything.
+ */
+function stopRecordedRunner(ctx) {
+  const { fs, run } = ctx;
+  if (!ctx.logPath) return;
+  const file = runnerPidPath(ctx.logPath);
+  let pid;
+  try {
+    pid = Number(String(fs.readFileSync(file, "utf8")).trim());
+  } catch {
+    return;
+  }
+  if (Number.isInteger(pid) && pid > 0) {
+    const query = run("powershell", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`,
+    ]);
+    if (query.status === 0 && isRunnerCommandLine(query.stdout)) run("taskkill", ["/T", "/F", "/PID", String(pid)]);
+  }
+  fs.rmSync(file, { force: true });
 }
 
 // A stop command may fail because there was nothing to stop; any other failure means the
@@ -202,6 +242,7 @@ export function uninstallService(ctx) {
       return;
     }
     run("schtasks", ["/End", "/TN", name]);
+    stopRecordedRunner(ctx);
     const deleted = run("schtasks", ["/Delete", "/TN", name, "/F"]);
     if (deleted.status !== 0) throw new Error(`schtasks /Delete failed: ${describe(deleted)}`);
     out(`Removed task "${name}".`);
@@ -223,6 +264,7 @@ export function restartService(ctx) {
     result = run("systemctl", ["--user", "restart", SERVICE.systemdUnit]);
   } else {
     run("schtasks", ["/End", "/TN", SERVICE.taskName]);
+    stopRecordedRunner(ctx);
     result = run("schtasks", ["/Run", "/TN", SERVICE.taskName]);
   }
   if (result.status !== 0) throw new Error(`restart failed (is the service installed?): ${describe(result)}`);
