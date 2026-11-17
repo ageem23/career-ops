@@ -1,0 +1,263 @@
+#!/usr/bin/env node
+
+/**
+ * find.mjs — resolve a company/role/number query to its full pipeline identity (#1431).
+ *
+ * "Apply to #13" is ambiguous: report numbers and tracker row numbers diverge,
+ * and mapping company ↔ report# ↔ tracker# ↔ PDF used to require opening three
+ * files (applications.md, reports/, data/pdf-index.tsv). This read-only tool
+ * answers it in one lookup.
+ *
+ * Usage:
+ *   node find.mjs <query> [--json]
+ *
+ * <query> is a report number, tracker number, or company/role fragment.
+ * A numeric query matches BOTH the tracker # column and the report number in
+ * the Report link ("012" and "12" are the same number), so a collision between
+ * the two numbering schemes surfaces as multiple rows instead of a silent wrong
+ * pick. A text query matches company/role by case-insensitive substring, with
+ * the shared fuzzy matcher (role-matcher.mjs) as fallback for multi-word
+ * phrases.
+ *
+ * Zero dependencies and strictly read-only: parses data/applications.md via
+ * the shared header-aware column mapping (tracker-parse.mjs) and the PDF
+ * manifest data/pdf-index.tsv (written by generate-pdf.mjs).
+ */
+
+import { readFileSync, existsSync, statSync } from 'fs';
+import { dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
+import { resolveColumns, parseTrackerRow, parseMarkdownLinks } from './tracker-parse.mjs';
+import { resolvePdfIndexPath, resolveWorkspaceRootFor, pathIsInside, pathIsInsideCanonical } from './tracker-utils.mjs';
+import { roleFuzzyMatch } from './role-matcher.mjs';
+import { getCareerOpsRoot, resolveTrackerPath } from './path-resolver.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+
+const ROOT = dirname(fileURLToPath(import.meta.url));
+const DATA_ROOT = getCareerOpsRoot();
+
+// "008" and "8" are the same report — zero-padded report-link form vs unpadded
+// tracker-# form (same normalization as the manifest writer in generate-pdf.mjs).
+export const normNum = (s) => String(s ?? '').trim().replace(/^0+(?=\d)/, '');
+
+// Same status hygiene as tracker.mjs: strip markdown bold and stray dates so a
+// messy cell still prints as its canonical label.
+const cleanStatus = (s) =>
+  String(s ?? '').replace(/\*\*/g, '').replace(/\(?\d{4}-\d{2}-\d{2}\)?/g, '').trim();
+
+/**
+ * Parse the tracker markdown into lookup rows.
+ *
+ * The report number and path come from the Report cell's markdown link. The
+ * path is normalized to be root-relative: trackers at `data/applications.md`
+ * carry `../reports/...` links (relative to the tracker file, see #760), which
+ * would be misleading when printed from the career-ops root.
+ *
+ * @param {string} text - Full contents of applications.md.
+ * @returns {Array<{trackerNum:number,date:string,company:string,role:string,score:string,status:string,reportNum:string|null,reportPath:string|null}>}
+ */
+export function parseTrackerRows(text) {
+  const lines = String(text ?? '').split('\n');
+  const colmap = resolveColumns(lines);
+  const rows = [];
+  for (const line of lines) {
+    const row = parseTrackerRow(line, colmap);
+    if (!row) continue;
+    const link = parseMarkdownLinks(row.report).find(l => /^\d+$/.test(l.label));
+    rows.push({
+      trackerNum: row.num,
+      date: row.date,
+      company: row.company,
+      role: row.role,
+      score: row.score,
+      status: cleanStatus(row.status),
+      reportNum: link ? normNum(link.label) : null,
+      reportPath: link ? link.target.replace(/^(\.\.\/)+/, '') : null,
+    });
+  }
+  return rows;
+}
+
+/**
+ * Parse data/pdf-index.tsv (report \t pdf \t html \t format \t date \t kind)
+ * into a normalized-report# → CV-path map. Comment lines and rows generated
+ * without a report number are skipped.
+ *
+ * Cover-letter rows are skipped too: a report carries one row per artifact
+ * kind, and this map holds one path per report, so a cover written after its
+ * CV would otherwise win and be handed back as the report's CV. A row with no
+ * kind column predates --kind and is a CV.
+ *
+ * @param {string} text - Full contents of pdf-index.tsv.
+ * @returns {Map<string,string>}
+ */
+export function parsePdfIndex(text) {
+  const map = new Map();
+  for (const line of String(text ?? '').split('\n')) {
+    if (!line.trim() || line.startsWith('#')) continue;
+    const fields = line.split('\t');
+    if (!fields[0]?.trim() || !fields[1]) continue;
+    if ((fields[5] ?? '').trim() === 'cover') continue;
+    map.set(normNum(fields[0]), fields[1]);
+  }
+  return map;
+}
+
+/**
+ * Keep only the manifest rows whose PDF is still on disk.
+ *
+ * A row in data/pdf-index.tsv records that a PDF was generated, not that it
+ * still exists: generate-pdf.mjs evicts a row only when it regenerates, so
+ * deleting output/*.pdf leaves every row standing (#4777). Whatever sets a
+ * tracker's PDF cell from the manifest decides presence here, so
+ * merge-tracker.mjs and sync-pdf-flags.mjs cannot disagree about it.
+ *
+ * Paths resolve against the workspace root generate-pdf.mjs wrote them for and
+ * must stay inside it. A path that spells its way out is rejected before it is
+ * touched; one that only leads out through a symlink is rejected once its
+ * target is resolved. A missing file is absent. Any other stat failure (EACCES,
+ * ELOOP, EIO) means presence is unknown: the row is left out, so no flag is set
+ * from it, and `warn` hears about it. Nothing throws, so one unreadable path
+ * cannot fail a batch.
+ *
+ * @param {Map<string,string>} pdfIndex - parsePdfIndex() output.
+ * @param {string} dataRoot - The career-ops data root, getCareerOpsRoot().
+ * @param {(message: string) => void} [warn]
+ * @returns {Map<string,string>} The rows whose file exists.
+ */
+export function livePdfIndex(pdfIndex, dataRoot, warn = () => {}) {
+  const workspaceRoot = resolveWorkspaceRootFor(dataRoot);
+  const live = new Map();
+  for (const [report, pdf] of pdfIndex) {
+    const relPath = pdf.trim();
+    const absPath = resolve(workspaceRoot, relPath);
+    const leftWorkspace = () => warn(`report ${report}: ${relPath} is outside the workspace; its PDF flag is left as it is`);
+    if (!pathIsInside(absPath, workspaceRoot)) {
+      leftWorkspace();
+      continue;
+    }
+    try {
+      if (!statSync(absPath).isFile()) continue;
+    } catch (err) {
+      if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') {
+        warn(`report ${report}: cannot tell whether ${relPath} exists (${err?.code ?? err}); its PDF flag is left as it is`);
+      }
+      continue;
+    }
+    if (pathIsInsideCanonical(absPath, workspaceRoot)) live.set(report, pdf);
+    else leftWorkspace();
+  }
+  return live;
+}
+
+/**
+ * Resolve a query against parsed tracker rows.
+ *
+ * @param {ReturnType<typeof parseTrackerRows>} rows
+ * @param {string} query - Report#, tracker#, or company/role fragment.
+ * @param {Map<string,string>} [pdfIndex] - From parsePdfIndex().
+ * @returns {Array<object>} Matching rows, each augmented with `pdfPath` (null when no PDF is indexed for its report).
+ */
+export function findMatches(rows, query, pdfIndex = new Map()) {
+  const q = String(query ?? '').trim();
+  if (!q) return [];
+
+  let hits;
+  if (/^\d+$/.test(q)) {
+    const nq = normNum(q);
+    hits = rows.filter(r => String(r.trackerNum) === nq || r.reportNum === nq);
+  } else {
+    const ql = q.toLowerCase();
+    hits = rows.filter(r =>
+      r.company.toLowerCase().includes(ql) ||
+      r.role.toLowerCase().includes(ql) ||
+      roleFuzzyMatch(r.company, q) ||
+      roleFuzzyMatch(r.role, q));
+  }
+  return hits.map(r => ({
+    ...r,
+    pdfPath: (r.reportNum !== null && pdfIndex.get(r.reportNum)) || null,
+  }));
+}
+
+// ── CLI ─────────────────────────────────────────────────────────────
+
+const KNOWN_FLAGS = ['--json', '--help', '-h'];
+
+const USAGE = `Usage:
+  node find.mjs <report# | tracker# | company/role fragment> [--json]
+  node find.mjs --help                            # print this usage block and exit`;
+
+function parseArgs(argv) {
+  const args = argv.slice(2);
+
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+
+  const unknownFlags = args.filter(a => a.startsWith('-') && !KNOWN_FLAGS.includes(a));
+  if (unknownFlags.length) {
+    console.error(`Error: unrecognized flag(s): ${unknownFlags.join(', ')}. Valid flags: ${KNOWN_FLAGS.join(', ')}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+
+  const json = args.includes('--json');
+  const query = args.filter(a => a !== '--json').join(' ').trim();
+  return { json, query };
+}
+
+function main() {
+  const { json, query } = parseArgs(process.argv);
+  if (!query) {
+    // The same USAGE the flag paths print. A second hand-written copy is a
+    // second thing to keep in step, which is the class of bug #2773 was about.
+    console.log(USAGE);
+    process.exitCode = 1;
+    return;
+  }
+
+  const trackerPath = resolveTrackerPath(DATA_ROOT);
+  if (!existsSync(trackerPath)) {
+    console.error(`Error: ${trackerPath} not found — nothing to search.`);
+    process.exitCode = 1;
+    return;
+  }
+  const rows = parseTrackerRows(readFileSync(trackerPath, 'utf-8'));
+
+  // Derived from the tracker resolved just above, not from ROOT: a redirected
+  // CAREER_OPS_TRACKER must not be searched against this install's manifest (#2471).
+  const manifestPath = resolvePdfIndexPath(trackerPath);
+  const pdfIndex = existsSync(manifestPath)
+    ? parsePdfIndex(readFileSync(manifestPath, 'utf-8'))
+    : new Map();
+
+  const matches = findMatches(rows, query, pdfIndex);
+  if (json) {
+    console.log(JSON.stringify(matches, null, 2));
+    if (matches.length === 0) process.exitCode = 1;
+    return;
+  }
+  if (matches.length === 0) {
+    console.log(`No application matches "${query}" — try a report #, tracker #, or company fragment.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const headers = ['Tracker#', 'Report#', 'Company', 'Role', 'Status', 'PDF', 'Report'];
+  const table = matches.map(m => [
+    String(m.trackerNum), m.reportNum ?? '—', m.company, m.role,
+    m.status || '—', m.pdfPath ?? '—', m.reportPath ?? '—',
+  ]);
+  const widths = headers.map((h, i) => Math.max(h.length, ...table.map(r => r[i].length)));
+  const fmt = (cells) => cells.map((c, i) => c.padEnd(widths[i])).join('  ').trimEnd();
+  console.log(fmt(headers));
+  console.log(fmt(widths.map(w => '-'.repeat(w))));
+  for (const r of table) console.log(fmt(r));
+  console.error(`\n${matches.length} match(es)`); // stderr so stdout stays pipeable
+}
+
+if (isMainModule(import.meta.url)) {
+  main();
+}

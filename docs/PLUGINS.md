@@ -1,0 +1,170 @@
+# Plugins
+
+Plugins extend career-ops with integrations that need an API key or talk to an
+external service — things the zero-keys, local-first core doesn't carry. They are
+**opt-in**, sandboxed-by-convention, and additive: with no plugins enabled, the
+core runs exactly as it always has.
+
+> This is **not** the Claude Code plugin (`.claude-plugin/`, see
+> [CLAUDE_PLUGIN.md](CLAUDE_PLUGIN.md)). These plugins extend career-ops itself.
+
+## Using plugins
+
+```bash
+node plugins.mjs list          # what's installed + its trust badge
+node plugins.mjs available     # bundled + community plugins we've approved
+node plugins.mjs add <name>    # install an approved community plugin (`install` does the same)
+node plugins.mjs enable <id>   # show the capability card (then add --confirm)
+node plugins.mjs skill <id>    # print a plugin's how-to (if it ships one)
+```
+
+Two gates must both be satisfied for a plugin to run: it must be **enabled**
+(`node plugins.mjs enable <id> --confirm`, which records your consent) **and** its
+keys must be in your `.env`. `node doctor.mjs` shows what's missing.
+
+LinkedIn job alerts do not need a plugin. Paste the email on the dashboard, or
+run `node linkedin-import.mjs`. See [Add LinkedIn jobs](LINKEDIN_JOBS.md).
+
+### Trust badges
+
+| Badge | Meaning |
+|-------|---------|
+| `📦 bundled` | Shipped in `plugins/`, reviewed in-tree, auto-updated with the core. |
+| `✓ approved` | A community plugin we reviewed at an exact pinned commit (in the registry). |
+| `❓ community-unverified` | You installed it from a repo we haven't reviewed — you're trusting the author. |
+| `⚠️ off-registry` | Installed commit differs from the approved one. |
+
+If a plugin's files change without a version bump, career-ops **blocks it** and
+asks you to review + `node plugins.mjs trust <id>` to re-pin (tamper detection).
+The warning counts the modified, removed and added files. It names changed files
+at the plugin root and groups the rest by top-level directory, naming the file
+when a directory has only one. You can tell an edit to your code from new files
+beside it.
+
+The files under a plugin's directory count toward its hash, except inside
+directories named `node_modules` or `.git`, which are skipped. That includes git
+worktrees and tool logs kept there. If you link a plugin checkout into
+`plugins.local/`, keep worktrees and logs outside the plugin's own directory, for
+example `git worktree add ../my-plugin-worktrees/fix-1`.
+
+## Writing a plugin
+
+```bash
+node plugins.mjs new my-plugin     # scaffolds plugins.local/my-plugin/
+```
+
+A plugin is a directory with a `manifest.json` (validated before any code is
+imported), an `index.mjs` (default-exports your hooks), and optionally a
+`skill.md` + `_helpers`. Hooks: **provider / ingest / search / notify / export**
+— there is no auto-submit hook. Producers **return** `Job[]`; the engine writes
+them. Before it does, an `ingest` or `search` result already in the tracker,
+the pipeline or `data/scan-history.tsv` (compared by normalized URL) is dropped.
+A plugin whose manifest sets `"jobPostings": true` also gets the scanner's
+discovery filters: `data/blacklist.md` and `portals.yml`'s `title_filter` /
+`location_filter`, and what it admits is recorded in `data/scan-history.tsv`.
+Leave the flag out when your results are not job postings (interview events, for
+example). Reach the network **only** through `ctx.fetch` (your manifest
+`allowedHosts` is enforced, with SSRF protection). Keys arrive via `ctx.env`,
+non-secret settings via `ctx.settings`. To deduplicate the postings you return —
+or to compare a posting against one you have already seen — use
+`ctx.normalizePostingUrl(url)`, which is the same key the tracker and scanner
+build. It returns `''` when there is nothing to key on, and `''` means *no key*:
+never match one `''` against another. For a posting on a multi-employer
+aggregator (LinkedIn, Indeed), `ctx.aggregatorPostingId(url)` returns
+`{ domain, id }` — the requisition id that a tracking link and the canonical view
+share — or `null` when it does not know. Compare two ids only when their
+`domain` matches, and never read `null` as a match. If your plugin keeps a file
+of its own (a cursor, a saved posting), build its path from `ctx.dataRoot`, the
+absolute path of the user's data root; a bare relative path lands in whichever
+directory the command was run from.
+
+See `plugins/README.md` for the full contract + the honest trust model (plain
+ESM has no hard sandbox — bundled plugins are code-reviewed; your own are your
+trust).
+
+For human-confirmed tracker transitions, #3333 proposes a separate local
+drop-file bridge read by `reply-watch.mjs`: see the draft
+[reply proposal contract](REPLY_PROPOSALS.md). It adds no hook kind and grants
+no tracker-write permission to plugins. The directory and row format are
+accepted as a v1 draft: they may change until a real producer writes to the
+directory.
+
+## Publishing + getting approved
+
+1. Develop locally, then publish your plugin as its **own public GitHub repo**
+   named exactly `career-ops-plugin-<name>` (the template repo gives you the
+   right shape + a release workflow). Minimum files: `manifest.json`,
+   `index.mjs`, `README.md`, `LICENSE`, plus `skill.md` + `test/smoke.mjs` to be
+   listable.
+2. File a **Plugin registration** issue (becomes your plugin's home/changelog).
+3. Open a **registry PR** (the `?template=plugin-registry.md` template — the
+   template repo's release workflow can open it for you on a release tag) that
+   adds your `plugins-registry/<id>.json` file, pinned to an exact commit. CI
+   (`plugin-registry-validate`) checks the naming, manifest, min-files, license,
+   egress, and a static audit before a maintainer reviews. Once merged, users can
+   `node plugins.mjs add <name>` and your plugin ships to them via the normal
+   update.
+4. **Updates** = one more registry PR bumping your entry's `sha` + `version`
+   (your release workflow opens it from your own fork). Users only ever get the
+   commit we approved.
+
+Broadly-useful, low/zero-key plugins may be shipped **bundled** in `plugins/`
+(e.g. `apify`, `gmail`, `notion`; the Notion setup is in [NOTION_SETUP.md](NOTION_SETUP.md)). Bundled plugins are **reference seeds**:
+reviewed in-tree, always present, and a working example to copy — kept minimal
+and stable on purpose, **not** a home for ongoing feature work.
+
+### Improving a bundled plugin → publish a maintained successor
+
+We **don't take feature PRs against bundled plugins.** If you want to extend one
+(more options, a richer mapping, new behavior), own it properly:
+
+1. Publish `career-ops-plugin-<id>` with the **same `id`** as the bundled plugin
+   (start from the bundled plugin's code — it's MIT and credits its origins).
+2. In your registry PR, set **`"supersedesBundled": true`** on your entry.
+3. Once approved + pinned, anyone who runs `node plugins.mjs add career-ops-plugin-<id>`
+   installs your version, and the engine gives **your maintained successor
+   precedence over the bundled reference** of the same id. `node plugins.mjs available`
+   surfaces the link: *"gmail — 🔁 maintained version: career-ops-plugin-gmail"*.
+
+This keeps the core lean and **puts the integration in your hands, with your name
+on it** — while the bundled seed stays as the always-present fallback, so the
+feature never breaks even if a successor goes quiet. Precedence is granted ONLY
+to a registry-approved successor installed at its exact pinned commit — so an
+unprompted, unreviewed community plugin can never shadow a bundled one.
+
+**Trust boundary (plainly).** The thing this protects is the *supply chain*: the
+registry is a reviewed system file and installs pin an exact commit, so no
+upstream author can push code over a bundled plugin without a maintainer merging
+their entry. It does **not** try to stop *you* from running your own modified
+code on your own machine — career-ops is local-first and the source is yours; if
+you edit `plugins.local/` or your `plugins.lock`, you're choosing to run your own
+version, exactly as you always could. Removing a successor restores the bundled
+reference.
+
+## Community plugins
+
+Every community plugin in the registry is reviewed and pinned to an exact commit (see [Trust badges](#trust-badges) and [Publishing + getting approved](#publishing--getting-approved)).
+
+| Plugin | What it does | Hooks | Keys needed | Author |
+| --- | --- | --- | --- | --- |
+| [career-ops-plugin-tavily](https://github.com/Schlaflied/career-ops-plugin-tavily) | Tavily web search for job scanning. | search | `TAVILY_API_KEY` | @Schlaflied |
+| [career-ops-plugin-google-calendar](https://github.com/Schlaflied/career-ops-plugin-google-calendar) | Google Calendar ingest — detect upcoming interview events and surface them in the career-ops pipeline. | ingest | `GOOGLE_CALENDAR_CLIENT_ID`, `GOOGLE_CALENDAR_CLIENT_SECRET`, `GOOGLE_CALENDAR_REFRESH_TOKEN` | @Schlaflied |
+| [career-ops-plugin-linkedin-alerts](https://github.com/Schlaflied/career-ops-plugin-linkedin-alerts) | LinkedIn job alert ingest — parse LinkedIn alert emails from your Gmail inbox, normalize tracking links to canonical job URLs, and surface them in the career-ops pipeline. | ingest | `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN` | @Schlaflied |
+| [career-ops-plugin-outlook-interviews](https://github.com/Schlaflied/career-ops-plugin-outlook-interviews) | Outlook interview ingest — detect interview invitation emails via Microsoft Graph, extract company / role / meeting link, and surface them in the career-ops pipeline. | ingest | `MSGRAPH_CLIENT_ID`, `MSGRAPH_REFRESH_TOKEN` (optional: `MSGRAPH_CLIENT_SECRET`) | @Schlaflied |
+| [career-ops-plugin-obsidian](https://github.com/Schlaflied/career-ops-plugin-obsidian) | Obsidian export — mirror the tracker into your vault as frontmatter notes queryable by Dataview/Bases; frontmatter belongs to the machine, the note body belongs to you. | export | None | @Schlaflied |
+| [career-ops-plugin-startup-boards](https://github.com/giacomoguidotto/career-ops-plugin-startup-boards) | Opt-in scanner provider for YC, Getro, and Consider startup job boards. | provider | None | @giacomoguidotto |
+| [career-ops-plugin-docx](https://github.com/rubicon/career-ops-plugin-docx) | Export your cv.md to a clean, ATS-friendly Word .docx, honoring #### nested sub-roles for fractional, interim, and umbrella engagements. | export | None | @rubicon |
+| [career-ops-plugin-markdown](https://github.com/rubicon/career-ops-plugin-markdown) | Export your cv.md to a clean, markdownlint-compliant Markdown resume, honoring #### nested sub-roles for fractional, interim, and umbrella engagements. | export | None | @rubicon |
+| [career-ops-plugin-serper](https://github.com/d-ulker/career-ops-plugin-serper) | Google Search provider via Serper.dev — drop-in replacement for the discontinued serpapi provider, with isFallback detect so free ATS providers are never shadowed. | provider | `SERPER_API_KEY` | @d-ulker |
+| [career-ops-plugin-commute](https://github.com/bullitt186/career-ops-plugin-commute) | Drive time from home to each posting's workplace for evaluation and triage; home stays coordinates, routing runs on your own OSRM/Valhalla | ingest, search | None | @bullitt186 |
+| [career-ops-plugin-workspace-mcp](https://github.com/theridgerugby/career-ops-plugin-workspace-mcp) | Read-only MCP access to application rows with scores and the absolute paths and byte sizes of reports, CVs and cover letters. | export | None | @theridgerugby |
+
+To add your own plugin to the registry, follow the [Publishing + getting approved](#publishing--getting-approved) flow above.
+
+## Not a plugin
+
+- **Centralized infrastructure** the project would run (hosted aggregation,
+  shared services, proxies) → a separate, opt-in service, see
+  [Discussion #904](https://github.com/career-ops-hq/career-ops/discussions/904).
+- **Auto-submitting / blind-applying** → out of the core everywhere. career-ops
+  drafts for you to review and submit; it is a decision-support tool, not a bot.

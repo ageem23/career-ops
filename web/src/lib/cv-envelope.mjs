@@ -1,0 +1,292 @@
+/**
+ * cv-envelope.mjs — the pdf-mode agent's output channel (#2185).
+ *
+ * pdf mode used to hand the agent `Write`/`Edit` so it could save the tailored
+ * CV itself. Tool grants are tool-name-only, not path-scoped, so a prompt
+ * injection in a job posting or an evaluation report — both of which enter that
+ * agent's context — could redirect a write to cv.md, data/applications.md or
+ * .env. Rather than fence those writes, pdf mode no longer grants them: the
+ * agent emits the tailored HTML inline in a `<<cv-html …>>` envelope and the
+ * BACKEND persists it. That completes the arc #2182 started, which moved
+ * rendering out of the agent for the same reason.
+ *
+ * Plain .mjs (same pattern as pdf-paths.mjs / pdf-render.mjs) so this can be
+ * unit-tested with `node --test`, no TypeScript build step.
+ *
+ * The envelope's rules are all fail-closed, because the alternative to a clean
+ * failure is the backend building from attacker-influenced input and reporting
+ * success: markers only count on a line of their own, the FIRST closer wins (an
+ * injected closer truncates instead of escaping), and more than one envelope is
+ * refused outright rather than guessed at.
+ */
+import { PAGE_FORMATS } from "./page-formats.mjs";
+
+// Markers must own their line — otherwise an agent merely *mentioning* the
+// syntax in its prose (or a CLI echoing the prompt, as `codex exec` does) would
+// open or close an envelope.
+// The marker spellings are exported so the PROMPT that asks for them, the parser
+// that reads them, and any guard that checks them all derive from one string.
+// Restating them by hand in the prompt is how you get a rename that breaks every
+// pdf run at runtime with the whole suite still green.
+export const OPEN_MARK = "<<cv-html";
+export const CLOSE_MARK = "<</cv-html>>";
+export const JSON_OPEN_MARK = "<<cv-json";
+export const JSON_CLOSE_MARK = "<</cv-json>>";
+
+// One pattern source per marker. The closer needs two compiled flavours because
+// `exec` on a global regex advances `lastIndex` between calls, so the single-shot
+// lookup and the scanning one must not share an object; the opener is only ever
+// scanned with `matchAll`, which clones and needs just the one.
+const OPENER_SRC = String.raw`^<<cv-(html|json)(?:[ \t]+format="([^"\n]*)")?(?:[ \t]+country="([^"\n]*)")?>>[ \t]*$`;
+const CLOSER_SRC = String.raw`^<<\/cv-(html|json)>>[ \t]*$`;
+const OPENER = new RegExp(OPENER_SRC, "gm");
+const CLOSER = new RegExp(CLOSER_SRC, "m");
+const CLOSER_ALL = new RegExp(CLOSER_SRC, "gm");
+
+/**
+ * The envelope contract, as the agent is told it. Lives here beside the parser so
+ * the two cannot drift; run-prompts.mjs interpolates it into the pdf prompt.
+ *
+ * The markers are deliberately described MID-LINE (inside backticks) rather than
+ * shown on their own lines: `codex exec` echoes its prompt to stdout, and a
+ * line-start marker in that echo parses as a second envelope, failing the run.
+ *
+ * The page-format sentence depends on the user's `page_format`, read before the
+ * run by core/page-format.mjs (readPageFormatSetting). The agent fills the
+ * template's `{{PAGE_WIDTH}}`, so the prompt names the width that matches the
+ * sheet the backend will print, from the same stance:
+ * - `a4` / `letter`: that format, no choice left to the agent.
+ * - `auto`: the agent names the hiring entity's country and the backend maps it,
+ *   as modes/pdf.md step 6 does on the CLI. The Letter countries come from the
+ *   core, so this prompt carries no copy of the list.
+ * - nothing stated: the agent picks, as before.
+ * The fallback for an agent that declares nothing is a different question,
+ * answered in core/page-format.mjs; tying the two together once produced
+ * "choose letter … otherwise letter".
+ *
+ * It says "do not save" rather than "you have no write tools": that claim is only
+ * true on Claude Code. The six CLIs invoked via clis.ts's bare args keep their own
+ * default tool access, and telling an agent something false about its own
+ * capabilities invites it to test the claim.
+ *
+ * @param {{setting?: "a4"|"letter"|"auto"|null, letterCountries?: string[]}} [pageFormat]
+ *   readPageFormatSetting()'s result; omitted means nothing stated.
+ * @returns {string}
+ */
+export function cvEnvelopeInstruction({ setting = null, letterCountries = [] } = {}) {
+  return `Do NOT save or edit any file. The platform persists your output for you. Instead OUTPUT one JSON object, the modes/pdf.md JSON Input Schema, between two marker lines. ${pageFormatSentences(setting, letterCountries)} Then the JSON object alone, with no markdown fence and no HTML, then a final line containing only \`${JSON_CLOSE_MARK}\`. Each marker appears exactly once. The platform builds the HTML from this JSON and runs the same checks as the CLI. Keep experience roles newest-first. Reorder bullets inside a role, never the roles themselves.`;
+}
+
+function pageFormatSentences(setting, letterCountries) {
+  if (setting === "a4" || setting === "letter") {
+    return `The first line contains only the opening marker \`${JSON_OPEN_MARK} format="${setting}">>\`, and nothing else on that line. The user's profile sets page_format to ${setting}, so do not choose a page size yourself.`;
+  }
+  if (setting === "auto" && letterCountries.length > 0) {
+    return `The user's profile sets page_format to auto: the page size follows the hiring entity's country, and the platform picks it from the code you give. Read that country from the evaluation report's market signals (jurisdiction, currency, benefits and legal vocabulary; for a remote role, the entity that receives the CV). The first line contains only the opening marker carrying its ISO 3166-1 alpha-2 code, for example \`${JSON_OPEN_MARK} country="DE">>\`, and nothing else on that line. If you cannot tell the country, use \`${JSON_OPEN_MARK}>>\` instead.`;
+  }
+  return `The first line contains only the opening marker carrying your chosen page format, \`${JSON_OPEN_MARK} format="a4">>\` or \`${JSON_OPEN_MARK} format="letter">>\`, and nothing else on that line. Choose letter for a US/Canada company, otherwise a4.`;
+}
+
+/**
+ * @typedef {Object} CvEnvelope
+ * @property {true} ok
+ * @property {"html"|"json"} kind
+ * @property {string} [html] - Legacy tailored CV HTML, byte-exact as emitted.
+ * @property {object} [payload] - CLI JSON payload. Present only for a cv-json envelope.
+ * @property {"a4"|"letter"|null} format - The page format the agent declared, or
+ *   null when it declared none it may use. Not yet the sheet: the profile can
+ *   outrank it (core/page-format.mjs resolveRenderPageFormat).
+ * @property {string|null} country - The country code the agent declared under
+ *   `page_format: auto`, as written; core/page-format.mjs validates it.
+ * @property {string[]} warnings - Non-fatal issues to surface in the run log.
+ */
+
+/**
+ * Extract the tailored CV and page format from an agent's full output.
+ *
+ * Returns a result rather than throwing so the caller (the /api/run close
+ * handler) can route the failure through the same honesty gate as every other
+ * "this run produced nothing usable" case.
+ *
+ * @param {string} text - Everything the agent emitted, concatenated.
+ * @returns {CvEnvelope | {ok: false, error: string}}
+ */
+export function parseCvEnvelope(text) {
+  if (typeof text !== "string") {
+    return { ok: false, error: "No agent output to read a CV envelope from." };
+  }
+  // Normalize CRLF once so the line-anchored markers match on a Windows stream
+  // and no stray \r rides into the HTML handed to the renderer.
+  const normalized = text.replace(/\r\n/g, "\n");
+
+  const openers = [...normalized.matchAll(OPENER)];
+  if (openers.length === 0) {
+    return { ok: false, error: "The agent emitted no CV envelope, so there is no CV to render." };
+  }
+  if (openers.length > 1) {
+    const label = openers.every((opener) => opener[1] === "html") ? "<<cv-html>>" : "CV";
+    return { ok: false, error: `Found ${openers.length} ${label} envelopes; refusing to guess which is the real CV.` };
+  }
+
+  const opener = openers[0];
+  const kind = opener[1] === "json" ? "json" : "html";
+  const afterOpener = normalized.slice(opener.index + opener[0].length);
+  const closer = CLOSER.exec(afterOpener);
+  if (!closer) {
+    return { ok: false, error: `The <<cv-${kind}>> envelope was never closed. The CV output is incomplete.` };
+  }
+  if (closer[1] !== kind) {
+    return { ok: false, error: `The <<cv-${kind}>> envelope was closed by <</cv-${closer[1]}>>.` };
+  }
+
+  // The opener match stops before its newline and the closer starts on its own
+  // line, so exactly one delimiting newline sits on each side of the body.
+  const body = afterOpener.slice(0, closer.index).replace(/^\n/, "").replace(/\n$/, "");
+  if (!body.trim()) {
+    return { ok: false, error: `The <<cv-${kind}>> envelope was empty. No CV was tailored.` };
+  }
+
+  // What to do about a missing format, or a country, depends on the profile,
+  // which this pure parser does not read: it reports what was declared and
+  // resolveRenderPageFormat ranks it.
+  const warnings = [];
+  const declared = opener[2];
+  let format = null;
+  if (declared !== undefined) {
+    const lower = declared.trim().toLowerCase();
+    if (PAGE_FORMATS.has(lower)) format = lower;
+    else warnings.push(`Unrecognized page format "${declared}"; ignoring it.`);
+  }
+  const country = opener[3] === undefined ? null : opener[3].trim() || null;
+
+  if (kind === "html") {
+    if (!/<\/html\s*>/i.test(body)) {
+      return { ok: false, error: "The CV was cut off before its closing </html> tag. The output is incomplete." };
+    }
+    return { ok: true, kind, html: body, format, country, warnings };
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return { ok: false, error: "The <<cv-json>> envelope was not valid JSON, so there is no CV to render." };
+  }
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "The <<cv-json>> envelope must hold one JSON object, so there is no CV to render." };
+  }
+  return { ok: true, kind, payload, format, country, warnings };
+}
+
+/**
+ * Could `line` still become a marker once more characters arrive?
+ *
+ * True both while the text is a prefix of a marker (`<`, `<<c`) and once it has
+ * passed one (`<<cv-html format="a4"` is still growing towards `>>`).
+ *
+ * @param {string} line - The unterminated final line.
+ * @returns {boolean}
+ */
+function couldBecomeMarker(line) {
+  const marks = [OPEN_MARK, CLOSE_MARK, JSON_OPEN_MARK, JSON_CLOSE_MARK];
+  return marks.some((mark) => mark.startsWith(line) || line.startsWith(mark));
+}
+
+/**
+ * First match of `re` in `s` whose line is terminated by a newline.
+ *
+ * An unterminated match is deliberately ignored: more characters could still
+ * arrive on that line, and acting early is how a half-written marker leaks into
+ * the rendered log (the flicker act-envelope.mjs documents).
+ *
+ * @param {RegExp} re - Line-anchored marker pattern; must carry the `g` flag.
+ * @param {string} s
+ * @returns {{start: number, end: number} | null} `end` consumes the newline.
+ */
+function completeMarker(re, s) {
+  for (const m of s.matchAll(re)) {
+    const after = m.index + m[0].length;
+    if (s[after] === "\n") return { start: m.index, end: after + 1 };
+  }
+  return null;
+}
+
+/**
+ * Streaming companion to parseCvEnvelope: accumulates the agent's full output
+ * for parsing while keeping the envelope body out of the user's run log.
+ *
+ * Both halves are needed at once. The route must see every byte to reconstruct
+ * the CV, but streaming 15-25 KB of raw HTML into the log would bury the agent's
+ * actual narration. Chunk boundaries fall wherever the transport likes, so the
+ * markers are matched across pushes rather than per chunk.
+ *
+ * @returns {{push: (chunk: string) => string, flush: () => string, result: () => (CvEnvelope | {ok: false, error: string})}}
+ *   `push` returns the text safe to display, `flush` releases anything still
+ *   held at end of stream, `result` parses everything pushed so far.
+ */
+export function createCvEnvelopeFilter() {
+  let raw = "";       // everything pushed, verbatim — what result() parses
+  let pending = "";   // display work buffer (CRLF-normalized so lines match)
+  let carry = "";     // a trailing "\r" whose "\n" may be in the next chunk
+  let inBody = false;
+
+  return {
+    push(chunk) {
+      const text = String(chunk ?? "");
+      raw += text;
+      // Normalizing per chunk is not enough: a CRLF split across two pushes would
+      // leave a lone \r that `[ \t]*$` can never match, so no marker is ever
+      // recognized and the ENTIRE body streams into the run log with ok:true and
+      // no signal. Hold back a trailing \r until its partner arrives.
+      const withCarry = carry + text;
+      carry = withCarry.endsWith("\r") ? "\r" : "";
+      pending += (carry ? withCarry.slice(0, -1) : withCarry).replace(/\r\n/g, "\n");
+      let display = "";
+      for (;;) {
+        if (!inBody) {
+          const opener = completeMarker(OPENER, pending);
+          if (opener) {
+            display += pending.slice(0, opener.start);
+            pending = pending.slice(opener.end);
+            inBody = true;
+            continue;
+          }
+          // Everything up to the unterminated final line is settled: a marker in
+          // it would already have matched. Hold that line only if it might grow
+          // into a marker.
+          const tailStart = pending.lastIndexOf("\n") + 1;
+          const cut = couldBecomeMarker(pending.slice(tailStart)) ? tailStart : pending.length;
+          display += pending.slice(0, cut);
+          pending = pending.slice(cut);
+          return display;
+        }
+        const closer = completeMarker(CLOSER_ALL, pending);
+        if (closer) {
+          // The body itself is never displayed — only skipped past.
+          pending = pending.slice(closer.end);
+          inBody = false;
+          continue;
+        }
+        // Settled body lines are never displayed, so drop them; keep only the
+        // unterminated final line, which may be a closer still being written.
+        // (`raw` retains every byte for parsing — this buffer is display-only.)
+        const tailStart = pending.lastIndexOf("\n") + 1;
+        pending = pending.slice(tailStart);
+        return display;
+      }
+    },
+
+    flush() {
+      // Held text that never became a marker is prose, and dropping it would
+      // silently lose the tail of the log. Body leftovers are already discarded.
+      const held = inBody ? "" : pending + carry;
+      pending = "";
+      carry = "";
+      return held;
+    },
+
+    result() {
+      return parseCvEnvelope(raw);
+    },
+  };
+}

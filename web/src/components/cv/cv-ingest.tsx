@@ -1,0 +1,474 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { noMarkdownImages } from "@/lib/markdown-options.mjs";
+import { Upload, FileText, Loader2, Check, AlertTriangle, Lock, ArrowRight, RotateCcw } from "lucide-react";
+import { cn } from "@/lib/cn";
+import { instrumentSerif } from "@/lib/fonts";
+import { cvStreamErrorMessage, parseCvStream, type CvSeed } from "@/lib/cv/quality";
+import { cvReadiness } from "@/lib/cv/readiness.mjs";
+import { ingestErrorMessage } from "@/lib/cv/ingest-error.mjs";
+import { cvIngestSaveBody } from "@/lib/cv-write.mjs";
+import { canReviewIngest, planIngestSave } from "@/lib/cv-ingest-base.mjs";
+import { DEFAULT_FILTERS, filtersToParams } from "@/lib/explore";
+import { CV_UPLOAD_ACCEPT, cvUploadError } from "@/lib/cv/upload.mjs";
+
+type Phase = "input" | "parsing" | "review" | "saving" | "error";
+
+function cliId(): string | null {
+  try {
+    return JSON.parse(localStorage.getItem("career-ops:config") || "{}").cliId || null;
+  } catch {
+    return null;
+  }
+}
+
+const STYLE = `
+.co-cvdrop{position:relative;border:1.5px dashed color-mix(in srgb, var(--fg) 22%, transparent);border-radius:1rem;transition:border-color .2s,background .2s}
+.co-cvdrop[data-over="true"]{border-color:hsl(26 73% 51%);background:hsl(26 73% 51% /.05)}
+.co-cvtrace{animation:co-rise .4s ease both}
+`;
+
+export function CvIngest({ onSaved, onSavingChange, variant = "onboarding" }: { onSaved?: (content: string) => void; onSavingChange?: (saving: boolean) => void; variant?: "onboarding" | "editor" }) {
+  const router = useRouter();
+  const [phase, setPhase] = useState<Phase>("input");
+  const [paste, setPaste] = useState("");
+  const [over, setOver] = useState(false);
+  const [trace, setTrace] = useState("");
+  const [md, setMd] = useState("");
+  const [seed, setSeed] = useState<CvSeed | null>(null);
+  const [err, setErr] = useState("");
+  const [saveErr, setSaveErr] = useState("");
+  const fileRef = useRef<HTMLInputElement>(null);
+  const baseRef = useRef<{ content: string; exists: boolean } | null>(null);
+  const baseLoad = useRef<Promise<{ content: string; exists: boolean }> | null>(null);
+  const [baseReady, setBaseReady] = useState(false);
+  const [baseFailed, setBaseFailed] = useState(false);
+  const [conflict, setConflict] = useState(false);
+  const [waitingForBase, setWaitingForBase] = useState(false);
+  const loadBase = useCallback((force = false) => {
+    if (!force && baseRef.current) return Promise.resolve(baseRef.current);
+    if (!force && baseLoad.current) return baseLoad.current;
+    const run = fetch("/api/cv")
+      .then(async (r) => {
+        if (!r.ok) throw new Error("load failed");
+        const data = (await r.json()) as { content?: unknown; exists?: unknown };
+        const base = {
+          content: typeof data.content === "string" ? data.content : "",
+          exists: data.exists === true,
+        };
+        if (baseLoad.current !== run) return base;
+        baseRef.current = base;
+        setBaseReady(true);
+        setBaseFailed(false);
+        setConflict(false);
+        return base;
+      })
+      .catch((err) => {
+        if (baseLoad.current === run) {
+          baseLoad.current = null;
+          baseRef.current = null;
+          setBaseReady(false);
+          setBaseFailed(true);
+        }
+        throw err;
+      });
+    baseLoad.current = run;
+    return run;
+  }, []);
+  const enterReview = useCallback(() => {
+    if (canReviewIngest(baseRef.current)) {
+      setWaitingForBase(false);
+      setPhase("review");
+      return;
+    }
+    setWaitingForBase(true);
+    setTrace("Reading the CV already on this machine…");
+    setPhase("parsing");
+  }, []);
+  useEffect(() => {
+    void loadBase(false).catch(() => {});
+  }, [loadBase]);
+  useEffect(() => {
+    if (waitingForBase && baseReady && canReviewIngest(baseRef.current)) {
+      setWaitingForBase(false);
+      setPhase("review");
+    }
+  }, [waitingForBase, baseReady]);
+  const requestRef = useRef<AbortController | null>(null);
+  useEffect(() => () => requestRef.current?.abort(), []);
+  useEffect(() => { onSavingChange?.(phase === "saving"); }, [phase, onSavingChange]);
+
+  const readiness = md ? cvReadiness(md) : null;
+
+  // Stream the ingest, parsing markers live.
+  const runStream = useCallback(async (init: RequestInit) => {
+    setPhase("parsing");
+    setTrace("Reading your CV…");
+    setErr("");
+    setMd("");
+    setSeed(null);
+    setSaveErr("");
+    const abort = new AbortController();
+    requestRef.current?.abort();
+    requestRef.current = abort;
+    try {
+      const r = await fetch("/api/cv/ingest", { ...init, signal: abort.signal });
+      const failure = await ingestErrorMessage(r);
+      if (failure) {
+        setErr(r.status === 404 ? "needs-cli" : failure);
+        setPhase("error");
+        return;
+      }
+      if (!r.body) {
+        setErr("No response.");
+        setPhase("error");
+        return;
+      }
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const parsed = parseCvStream(buf);
+        if (parsed.error) {
+          setErr(cvStreamErrorMessage(parsed.error));
+          setPhase("error");
+          await reader.cancel();
+          return;
+        }
+        if (parsed.trace) setTrace(parsed.trace.split("\n").filter(Boolean).slice(-1)[0] || "Reading your CV…");
+        if (parsed.markdown) setMd(parsed.markdown);
+        if (parsed.seed) setSeed(parsed.seed);
+      }
+      buf += dec.decode();
+      const final = parseCvStream(buf);
+      if (final.error || !buf.includes("<<cv:end>>") || !final.markdown.trim()) {
+        setErr("Couldn't finish reading the CV. Try again or paste the text instead.");
+        setPhase("error");
+        return;
+      }
+      setMd(final.markdown);
+      setSeed(final.seed);
+      enterReview();
+    } catch (e) {
+      if (abort.signal.aborted) return;
+      setErr(e instanceof Error ? e.message : "stream error");
+      setPhase("error");
+    }
+  }, [enterReview]);
+
+  const ingestText = (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      setErr("That looks empty — paste your CV instead.");
+      setPhase("error");
+      return;
+    }
+    // Pasted text is already readable. Same path as a .md/.txt drop — no CLI.
+    // (PDF/DOCX still need a CLI below.)
+    const id = cliId();
+    if (!id) {
+      setSeed(null);
+      setMd(trimmed);
+      enterReview();
+      return;
+    }
+    void runStream({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: trimmed, cliId: id }) });
+  };
+
+  const ingestFile = (file: File) => {
+    const error = cvUploadError(file);
+    if (error) {
+      setErr(error);
+      setPhase("error");
+      return;
+    }
+    // .md/.txt/.markdown fast path — plain text, NO CLI needed, instant.
+    if (/\.(md|markdown|txt)$/i.test(file.name)) {
+      file
+        .text()
+        .then((t) => {
+          if (!t.trim()) {
+            setErr("That file looks empty — paste your CV instead.");
+            setPhase("error");
+            return;
+          }
+          setSeed(null);
+          setMd(t.trim());
+          enterReview();
+        })
+        .catch(() => {
+          setErr("Couldn't read that file — paste your CV instead.");
+          setPhase("error");
+        });
+      return;
+    }
+    // PDF/TeX/Word → the user's CLI converts it. The server can also resolve
+    // the sole installed CLI when no preference has been saved yet.
+    const id = cliId();
+    const form = new FormData();
+    form.append("file", file);
+    form.append("cliId", id || "");
+    void runStream({ method: "POST", body: form });
+  };
+
+  const save = async () => {
+    if (!md.trim()) {
+      setSaveErr("Your CV looks empty — paste it again.");
+      return;
+    }
+    setSaveErr("");
+    const plan = planIngestSave(baseRef.current, { conflict });
+    if (!plan.post) {
+      setSaveErr(
+        plan.reason === "conflict"
+          ? "cv.md changed somewhere else. Load the current file, then save again if you still want to replace it."
+          : "The current CV was not read. Load it before saving.",
+      );
+      setPhase("review");
+      return;
+    }
+    setPhase("saving");
+    try {
+      const r = await fetch("/api/cv", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cvIngestSaveBody(md, plan.base)),
+      });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        if (r.status === 409) setConflict(true);
+        setSaveErr(d.error || "Couldn't save your CV — try again.");
+        setPhase("review"); // keep the parsed CV so they don't lose it
+        return;
+      }
+    } catch {
+      setSaveErr("Couldn't save your CV — check your connection and try again.");
+      setPhase("review");
+      return;
+    }
+    window.dispatchEvent(new CustomEvent("co-cv-saved"));
+    onSaved?.(md);
+    if (variant === "editor") return;
+    // WOW #1 — land in the Explorer with the CV-derived filters in the URL + run=1,
+    // so the Explorer auto-fires the FREE scan itself (robust, no push/replaceState race).
+    // GENEROUS first scan so it never comes back empty (that would kill the wow): roles
+    // only + a wide 30-day window; location stays a refinement for the deepen step, NOT a
+    // hard exclude (allow=[] passes everything). Recall over precision for the first reveal.
+    const roles = seed?.roles?.length ? seed.roles : seed?.title ? [seed.title] : [];
+    const f = { ...DEFAULT_FILTERS, ats: [...DEFAULT_FILTERS.ats], positive: roles, sinceDays: 30 };
+    const qs = filtersToParams(f);
+    router.push(`/explore?${qs}${qs ? "&" : ""}run=1`);
+  };
+
+  // ── INPUT ──
+  if (phase === "input" || phase === "error") {
+    return (
+      <div className="space-y-3">
+        <style>{STYLE}</style>
+        <div
+          className="co-cvdrop p-6"
+          data-over={over}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setOver(true);
+          }}
+          onDragLeave={() => setOver(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setOver(false);
+            const f = e.dataTransfer.files?.[0];
+            if (f) ingestFile(f);
+          }}
+        >
+          <textarea
+            value={paste}
+            onChange={(e) => setPaste(e.target.value)}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && paste.trim()) ingestText(paste.trim());
+            }}
+            placeholder="Paste your CV here — or drop a PDF, TeX or Markdown file below. We'll convert it to cv.md."
+            className="h-32 w-full resize-none bg-transparent text-[14px] leading-relaxed outline-none placeholder:text-faint"
+          />
+          <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-border pt-3">
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface/50 px-3 py-1.5 text-xs font-medium text-foreground transition hover:border-brand/40 hover:text-brand-text max-sm:min-h-[44px] max-sm:px-4"
+            >
+              <Upload className="size-3.5" /> Choose file
+            </button>
+            <input ref={fileRef} aria-label="Upload CV file" type="file" accept={CV_UPLOAD_ACCEPT} hidden onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = "";
+              if (file) ingestFile(file);
+            }} />
+            <span className="inline-flex items-center gap-1 text-[11px] text-faint">
+              <Lock className="size-3" /> Converted with your configured AI CLI.
+            </span>
+            <button
+              type="button"
+              disabled={!paste.trim()}
+              onClick={() => ingestText(paste.trim())}
+              className="ml-auto inline-flex items-center gap-1.5 rounded-lg bg-brand px-4 py-2 text-sm font-semibold text-brand-foreground shadow-sm transition hover:brightness-110 disabled:opacity-50 max-sm:min-h-[44px]"
+            >
+              Read my CV <ArrowRight className="size-4" />
+            </button>
+          </div>
+        </div>
+        {phase === "error" &&
+          (err === "needs-cli" ? (
+            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-[13px] text-amber-800 dark:text-amber-300">
+              <AlertTriangle className="size-3.5 shrink-0" />
+              <span>To convert a PDF, TeX or Word file, connect an AI CLI in Config. Paste or drop .md / .txt to start without one.</span>
+              <Link href="/config" className="ml-auto inline-flex items-center gap-1 rounded-md bg-amber-500/20 px-2.5 py-1 font-medium text-amber-800 transition hover:bg-amber-500/30 dark:text-amber-200">
+                Connect your AI CLI <ArrowRight className="size-3.5" />
+              </Link>
+            </div>
+          ) : (
+            <p role="alert" className="flex items-center gap-1.5 text-[13px] text-amber-800 dark:text-amber-400">
+              <AlertTriangle className="size-3.5 shrink-0" /> {err}
+            </p>
+          ))}
+      </div>
+    );
+  }
+
+  const acceptCurrentFile = async () => {
+    setSaveErr("");
+    setErr("");
+    try {
+      await loadBase(true);
+    } catch {
+      const message = "The current CV could not be read. Load it again before saving.";
+      if (waitingForBase) setErr(message);
+      else setSaveErr(message);
+    }
+  };
+
+  const startOver = () => {
+    baseRef.current = null;
+    baseLoad.current = null;
+    setBaseReady(false);
+    setBaseFailed(false);
+    setConflict(false);
+    setWaitingForBase(false);
+    setMd("");
+    setSeed(null);
+    setSaveErr("");
+    setPhase("input");
+    void loadBase(true).catch(() => {});
+  };
+
+  // ── PARSING (the 10s bridge) ──
+  if (phase === "parsing") {
+    return (
+      <div className="rounded-2xl border border-border bg-surface/60 p-6 backdrop-blur-sm">
+        <style>{STYLE}</style>
+        {waitingForBase && baseFailed ? (
+          <div className="space-y-3">
+            <p className="flex items-center gap-1.5 text-[13px] text-amber-800 dark:text-amber-400">
+              <AlertTriangle className="size-3.5 shrink-0" /> The current CV could not be read. Load it again before review.
+            </p>
+            <button
+              type="button"
+              onClick={() => void acceptCurrentFile()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface/50 px-3 py-1.5 text-xs font-medium text-foreground transition hover:border-brand/40"
+            >
+              Load the current CV
+            </button>
+          </div>
+        ) : (
+          <>
+            <div className="flex items-center gap-2.5">
+              <Loader2 className="size-4 animate-spin text-brand-text" />
+              <span className={`${instrumentSerif.className} text-lg text-foreground`}>{trace || "Reading your CV…"}</span>
+            </div>
+            <p className="mt-3 text-xs text-muted">Converting to Markdown with your configured AI CLI…</p>
+            {md && <div className="co-cvtrace mt-4 max-h-40 overflow-hidden rounded-lg border border-border bg-surface/40 p-3 text-[11px] text-faint">{md.slice(0, 400)}…</div>}
+          </>
+        )}
+      </div>
+    );
+  }
+
+  // ── REVIEW (propose → confirm) ──
+  return (
+    <div className="rounded-2xl border border-border bg-surface/60 p-4 backdrop-blur-sm md:p-5">
+      <style>{STYLE}</style>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <FileText className="size-4 text-brand-text" />
+        <h3 className={`${instrumentSerif.className} text-lg text-foreground`}>Here&apos;s your CV — review and save</h3>
+        {readiness && (
+          <span
+            className={cn(
+              "ml-auto inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium",
+              readiness.scoreable ? "bg-emerald-500/10 text-emerald-800 dark:text-emerald-400" : "bg-amber-500/10 text-amber-800 dark:text-amber-400",
+            )}
+          >
+            {readiness.scoreable ? <Check className="size-3" /> : <AlertTriangle className="size-3" />}
+            {readiness.scoreable ? "Ready to match" : "A bit thin"}
+          </span>
+        )}
+      </div>
+      {readiness?.hint && <p className="mb-2 text-[12px] text-amber-800 dark:text-amber-400">{readiness.hint}</p>}
+      {saveErr && (
+        <div className="mb-2 space-y-2">
+          <p role="alert" className="flex items-center gap-1.5 text-[12px] text-red-500">
+            <AlertTriangle className="size-3.5 shrink-0" /> {saveErr}
+          </p>
+          {(conflict || !baseReady) && (
+            <button
+              type="button"
+              onClick={() => void acceptCurrentFile()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface/50 px-3 py-1.5 text-xs font-medium text-foreground transition hover:border-brand/40"
+            >
+              Use the CV file as it is now
+            </button>
+          )}
+        </div>
+      )}
+      <div className="grid gap-3 md:grid-cols-2">
+        <textarea
+          aria-label="Imported CV Markdown"
+          value={md}
+          disabled={phase === "saving"}
+          onChange={(e) => setMd(e.target.value)}
+          className="h-72 w-full resize-none rounded-lg border border-border bg-surface/40 p-3 font-mono text-[12px] leading-relaxed outline-none focus:border-brand/40"
+        />
+        <div className="prose prose-sm dark:prose-invert h-72 max-w-none [&_p]:whitespace-pre-line overflow-y-auto rounded-lg border border-border bg-surface/40 p-3 text-[13px]">
+          <ReactMarkdown remarkPlugins={[remarkGfm]} {...noMarkdownImages}>{md}</ReactMarkdown>
+        </div>
+      </div>
+      <div className="mt-4 flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          onClick={save}
+          disabled={phase === "saving"}
+          className="inline-flex items-center gap-2 rounded-xl bg-brand px-5 py-2.5 text-sm font-semibold text-brand-foreground shadow-sm transition hover:brightness-110 disabled:opacity-60"
+        >
+          {phase === "saving" ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
+          {phase === "saving" ? "Saving…" : variant === "editor" ? "Update cv.md" : "Save & find my matches"}
+        </button>
+        <button
+          type="button"
+          disabled={phase === "saving"}
+          onClick={startOver}
+          className="inline-flex items-center gap-1.5 text-[13px] text-muted transition hover:text-foreground"
+        >
+          <RotateCcw className="size-3.5" /> Start over
+        </button>
+        <span className="ml-auto inline-flex items-center gap-1 text-[11px] text-faint">
+          <Lock className="size-3" /> {variant === "editor" ? "Save updates cv.md and backs up the previous version" : "Nothing is saved until you click Save."}
+        </span>
+      </div>
+    </div>
+  );
+}

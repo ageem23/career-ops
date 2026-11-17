@@ -1,0 +1,106 @@
+#!/usr/bin/env node
+
+/**
+ * patch-latex-content.mjs — Apply prose patches to a user-owned LaTeX CV in place.
+ *
+ * Usage:
+ *   node patch-latex-content.mjs <source.tex> <patches.json> <output.tex>
+ *
+ * patches.json:
+ *   { "patches": [ { "id": "bullet-0", "text": "Tailored bullet text" } ] }
+ *
+ * Optional manifest fields in patches.json (from extract-latex-content.mjs):
+ *   { "slots": [...], "patches": [...] }
+ */
+
+import { readFile, mkdir } from 'fs/promises';
+import { existsSync } from 'fs';
+import { resolve, dirname } from 'path';
+import { applyPatches, buildManifest } from './lib/latex-content.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { replaceUserFile } from './tracker-utils.mjs';
+
+async function main() {
+  const args = process.argv.slice(2).filter(a => a !== '--help');
+  const [sourcePath, patchesPath, outputPath] = args;
+
+  if (!sourcePath || !patchesPath || !outputPath) {
+    console.error('Usage: node patch-latex-content.mjs <source.tex> <patches.json> <output.tex>');
+    process.exit(1);
+  }
+
+  const absSource = resolve(sourcePath);
+  const absPatches = resolve(patchesPath);
+  const absOutput = resolve(outputPath);
+
+  if (!existsSync(absSource)) {
+    console.error(`Source not found: ${absSource}`);
+    process.exit(1);
+  }
+  if (!existsSync(absPatches)) {
+    console.error(`Patches file not found: ${absPatches}`);
+    process.exit(1);
+  }
+
+  let tex;
+  let payload;
+  try {
+    tex = await readFile(absSource, 'utf-8');
+    payload = JSON.parse(await readFile(absPatches, 'utf-8'));
+  } catch (err) {
+    console.error(`Failed to read input: ${err.message}`);
+    process.exit(1);
+  }
+
+  const patches = Array.isArray(payload.patches) ? payload.patches : [];
+  const slots = Array.isArray(payload.slots) ? payload.slots : [];
+
+  if (slots.length === 0) {
+    console.error('patches.json must include a slots array from extract-latex-content.mjs');
+    process.exit(1);
+  }
+
+  if (new Set(slots.map(s => s.id)).size !== slots.length) {
+    console.error('Duplicate slot ids in patches.json; rerun extract-latex-content.mjs.');
+    process.exit(1);
+  }
+
+  const missing = patches.filter(p => !slots.some(s => s.id === p.id));
+  if (missing.length > 0) {
+    console.error(`Unknown patch ids: ${missing.map(p => p.id).join(', ')}`);
+    process.exit(1);
+  }
+
+  // Re-extract before comparing: unbraced items normalize trailing whitespace.
+  // An edit before or inside a slot must not splice into current LaTeX.
+  const currentSlots = buildManifest(absSource, tex).slots;
+  const stale = patches.filter(p => {
+    const slot = slots.find(s => s.id === p.id);
+    const current = currentSlots.find(s => s.id === p.id);
+    return !current || current.text !== slot.text || current.kind !== slot.kind
+      || current.span.start !== slot.span.start || current.span.end !== slot.span.end;
+  });
+  if (stale.length > 0) {
+    console.error(`Stale patch slots: ${stale.map(p => p.id).join(', ')}. Source changed; rerun extract-latex-content.mjs.`);
+    process.exit(1);
+  }
+
+  const patched = applyPatches(tex, patches, slots);
+  const outDir = dirname(absOutput);
+  if (!existsSync(outDir)) {
+    await mkdir(outDir, { recursive: true });
+  }
+  replaceUserFile(absOutput, patched);
+
+  const report = {
+    source: absSource,
+    output: absOutput,
+    patched: patches.length,
+    valid: true,
+  };
+  console.log(JSON.stringify(report, null, 2));
+}
+
+if (isMainModule(import.meta.url)) {
+  main();
+}

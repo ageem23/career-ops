@@ -1,0 +1,853 @@
+// tests/providers/greenhouse.test.mjs — direct provider-contract tests (#1499).
+// Covers the id/detect/fetch contract scan.mjs calls: api: precedence with the
+// host allowlist, careers_url auto-detection, normalization from the
+// boards-api JSON shape, and the guard chain running before any request.
+// (Indirect coverage elsewhere: liveness tests exercise Greenhouse URL
+// resolution; this file tests the provider module itself.)
+import { pass, fail, ROOT } from '../helpers.mjs';
+import { join } from 'path';
+import { pathToFileURL } from 'url';
+
+console.log('\nProvider — greenhouse');
+
+try {
+  const greenhouseModule = await import(pathToFileURL(join(ROOT, 'providers/greenhouse.mjs')).href);
+  const greenhouse = greenhouseModule.default;
+  const { isWorkModelOnly, officesUrlFor, buildOfficeMap, extractSortedOfficeNames, contentToText } = greenhouseModule;
+
+  if (greenhouse.id === 'greenhouse') pass('greenhouse.id is "greenhouse"');
+  else fail(`greenhouse.id is ${JSON.stringify(greenhouse.id)}`);
+
+  // detect() — careers_url auto-detection (job-boards host → boards-api endpoint)
+  const hit = greenhouse.detect({ name: 'Acme', careers_url: 'https://job-boards.greenhouse.io/acme' });
+  if (hit && hit.url === 'https://boards-api.greenhouse.io/v1/boards/acme/jobs') {
+    pass('greenhouse.detect() resolves job-boards.greenhouse.io/<slug> → boards-api jobs endpoint');
+  } else {
+    fail(`greenhouse.detect() returned ${JSON.stringify(hit)}`);
+  }
+
+  const hitEu = greenhouse.detect({ name: 'EuCo', careers_url: 'https://job-boards.eu.greenhouse.io/euco' });
+  if (hitEu && hitEu.url === 'https://boards-api.greenhouse.io/v1/boards/euco/jobs') {
+    pass('greenhouse.detect() extracts the slug from a job-boards.eu.greenhouse.io careers_url');
+  } else {
+    fail(`greenhouse.detect(eu) returned ${JSON.stringify(hitEu)}`);
+  }
+
+  // detect() — embed boards carry the token in ?for= (the path is "embed")
+  const hitEmbed = greenhouse.detect({
+    name: 'Stripe',
+    careers_url: 'https://job-boards.greenhouse.io/embed/job_board?for=stripe',
+  });
+  if (hitEmbed && hitEmbed.url === 'https://boards-api.greenhouse.io/v1/boards/stripe/jobs') {
+    pass('greenhouse.detect() reads the slug from ?for= on an embed board URL');
+  } else {
+    fail(`greenhouse.detect(embed) returned ${JSON.stringify(hitEmbed)}`);
+  }
+
+  const hitEmbedFiltered = greenhouse.detect({
+    name: 'Databricks',
+    careers_url: 'https://job-boards.greenhouse.io/embed/job_board?for=databricks&offices%5B%5D=4002841002',
+  });
+  if (hitEmbedFiltered && hitEmbedFiltered.url === 'https://boards-api.greenhouse.io/v1/boards/databricks/jobs') {
+    pass('greenhouse.detect() ignores extra query params on an embed board URL');
+  } else {
+    fail(`greenhouse.detect(embed+filter) returned ${JSON.stringify(hitEmbedFiltered)}`);
+  }
+
+  const hitEmbedClassic = greenhouse.detect({ name: 'Stripe', careers_url: 'https://boards.greenhouse.io/embed/job_board?for=stripe' });
+  if (hitEmbedClassic && hitEmbedClassic.url === 'https://boards-api.greenhouse.io/v1/boards/stripe/jobs') {
+    pass('greenhouse.detect() reads ?for= on the boards.greenhouse.io embed host too');
+  } else {
+    fail(`greenhouse.detect(boards embed) returned ${JSON.stringify(hitEmbedClassic)}`);
+  }
+
+  // ?for= names a board only on a Greenhouse host: elsewhere it is an unrelated
+  // param and must not select another company's board.
+  if (greenhouse.detect({ name: 'X', careers_url: 'https://example.com/jobs?for=stripe' }) === null
+      && greenhouse.detect({ name: 'X', careers_url: 'https://example.com/job-boards.greenhouse.io/embed/job_board?for=stripe' }) === null) {
+    pass('greenhouse.detect() ignores ?for= on a non-Greenhouse host');
+  } else {
+    fail('greenhouse.detect() must not read ?for= from a non-Greenhouse URL');
+  }
+
+  // The same for a path slug. The job-boards slug was a regex over the raw
+  // string, so a careers_url that only MENTIONED a board (a redirect wrapper,
+  // a path segment on another site) scanned othercorp's board under this
+  // entry's name. The legacy host was fixed the same way before.
+  const mentions = [
+    'https://careers.acme.com/apply/job-boards.greenhouse.io/othercorp',
+    'https://example.com/?next=https://job-boards.greenhouse.io/othercorp',
+    'https://careers.acme.com/apply/job-boards.eu.greenhouse.io/othercorp',
+  ].filter((careers_url) => greenhouse.detect({ name: 'Acme', careers_url }) !== null);
+  if (mentions.length === 0) {
+    pass('greenhouse.detect() ignores a job-boards.greenhouse.io/<slug> that only appears inside another site\'s URL');
+  } else {
+    fail(`greenhouse.detect() resolved a board from another site's URL: ${JSON.stringify(mentions)}`);
+  }
+
+  // detect() — legacy boards[.eu].greenhouse.io host. It still 301s to
+  // job-boards[.eu] with the same slug, so an entry written in that form must
+  // resolve instead of being silently skipped as "no provider matched".
+  const legacyCases = [
+    ['https://boards.greenhouse.io/acme', 'acme'],
+    ['https://boards.greenhouse.io/exampleco/', 'exampleco'],
+    ['https://boards.greenhouse.io/bigco/jobs/4012345', 'bigco'],
+    ['https://boards.eu.greenhouse.io/euco?gh_src=x', 'euco'],
+    ['https://boards.greenhouse.io/embedded', 'embedded'],
+  ];
+  const legacyMisses = legacyCases.filter(([careers_url, slug]) =>
+    greenhouse.detect({ name: 'Legacy', careers_url })?.url !== `https://boards-api.greenhouse.io/v1/boards/${slug}/jobs`);
+  if (legacyMisses.length === 0) {
+    pass('greenhouse.detect() resolves legacy boards[.eu].greenhouse.io/<slug> careers_urls → boards-api jobs endpoint');
+  } else {
+    fail(`greenhouse.detect() missed legacy careers_urls: ${JSON.stringify(legacyMisses)}`);
+  }
+
+  // detect() — the legacy host must not claim a non-slug path: the iframe
+  // embed URL with no ?for=, a boards-api URL given as careers_url (api: is
+  // where that goes), the same URL with a legacy host sitting in its path, or
+  // a legacy URL over plain http.
+  const notSlugs = [
+    'https://boards.greenhouse.io/embed/job_app?token=4012345',
+    'https://boards-api.greenhouse.io/v1/boards/acme/jobs',
+    'https://boards-api.greenhouse.io/v1/boards/boards.greenhouse.io/acme',
+    'https://example.com/redirect/boards.greenhouse.io/acme',
+    'http://boards.greenhouse.io/acme',
+  ];
+  const wrongClaims = notSlugs
+    .map((careers_url) => [careers_url, greenhouse.detect({ name: 'X', careers_url })])
+    .filter(([, hit]) => hit !== null);
+  if (wrongClaims.length === 0) {
+    pass('greenhouse.detect() does not read a legacy slug from embed, boards-api, embedded-host or http careers_urls');
+  } else {
+    fail(`greenhouse.detect() claimed non-slug careers_urls: ${JSON.stringify(wrongClaims)}`);
+  }
+
+  // detect() — api: takes precedence over careers_url and is used verbatim
+  // when its host is on the allowlist.
+  const hitApi = greenhouse.detect({
+    name: 'Pinned',
+    careers_url: 'https://www.pinned.example/careers',
+    api: 'https://boards-api.greenhouse.io/v1/boards/pinned/jobs',
+  });
+  if (hitApi && hitApi.url === 'https://boards-api.greenhouse.io/v1/boards/pinned/jobs') {
+    pass('greenhouse.detect() honors an allowlisted api: over a branded careers_url');
+  } else {
+    fail(`greenhouse.detect(api-pinned) returned ${JSON.stringify(hitApi)}`);
+  }
+
+  // detect() — api: with an untrusted host must NOT be claimed (SSRF guard).
+  if (greenhouse.detect({ name: 'Evil', api: 'https://evil.example/v1/boards/acme/jobs' }) === null) {
+    pass('greenhouse.detect() returns null for an api: on an untrusted host');
+  } else {
+    fail('greenhouse.detect() must reject an untrusted api: host');
+  }
+
+  // detect() — api: must be HTTPS.
+  if (greenhouse.detect({ name: 'Insecure', api: 'http://boards-api.greenhouse.io/v1/boards/acme/jobs' }) === null) {
+    pass('greenhouse.detect() returns null for a non-HTTPS api:');
+  } else {
+    fail('greenhouse.detect() must reject an http:// api:');
+  }
+
+  // detect() — malformed api: URL → null, not a crash.
+  if (greenhouse.detect({ name: 'Broken', api: 'not a url' }) === null) {
+    pass('greenhouse.detect() returns null for a malformed api: URL');
+  } else {
+    fail('greenhouse.detect() should treat a malformed api: as unclaimable');
+  }
+
+  // detect() — negative and non-string careers_url cases.
+  if (greenhouse.detect({ name: 'X', careers_url: 'https://example.com/careers' }) === null) {
+    pass('greenhouse.detect() returns null for a non-greenhouse careers_url');
+  } else {
+    fail('greenhouse.detect() should return null for non-greenhouse URLs');
+  }
+
+  if (greenhouse.detect({ name: 'X' }) === null
+      && greenhouse.detect({ name: 'X', careers_url: null }) === null
+      && greenhouse.detect({ name: 'X', careers_url: 7 }) === null) {
+    pass('greenhouse.detect() returns null for missing / null / non-string careers_url');
+  } else {
+    fail('greenhouse.detect() should treat non-string careers_url as missing');
+  }
+
+  // fetch() — request URL, SSRF guard, and normalization from the real
+  // boards-api shape: { jobs: [{ title, absolute_url, location: {name}, first_published }] }.
+  const sample = {
+    jobs: [
+      {
+        id: 101,
+        title: 'Senior Backend Engineer',
+        absolute_url: 'https://job-boards.greenhouse.io/acme/jobs/101',
+        location: { name: 'Berlin, Germany' },
+        first_published: '2026-07-01T09:30:00-04:00',
+      },
+      {
+        id: 102,
+        // no title → '' ; no location → '' ; no first_published → postedAt undefined
+        absolute_url: 'https://job-boards.greenhouse.io/acme/jobs/102',
+      },
+      { id: 103, title: 'Ghost Role' },                                    // no absolute_url — dropped
+      { id: 104, title: 'Bad Date', absolute_url: 'https://job-boards.greenhouse.io/acme/jobs/104', first_published: 'not-a-date' },
+    ],
+  };
+
+  let capturedUrl = null;
+  let capturedOpts = null;
+  const fetched = await greenhouse.fetch(
+    { name: 'Acme', careers_url: 'https://job-boards.greenhouse.io/acme' },
+    { fetchJson: async (url, opts) => { capturedUrl = url; capturedOpts = opts; return sample; } },
+  );
+
+  if (capturedUrl === 'https://boards-api.greenhouse.io/v1/boards/acme/jobs?content=true' && capturedOpts?.redirect === 'error') {
+    pass('greenhouse.fetch() hits the derived boards-api URL with content=true and redirect:"error" (SSRF guard)');
+  } else {
+    fail(`greenhouse.fetch() url=${JSON.stringify(capturedUrl)} opts=${JSON.stringify(capturedOpts)}`);
+  }
+
+  // content=true must be set idempotently on an entry.api that already pins it.
+  let pinnedUrl = null;
+  await greenhouse.fetch(
+    { name: 'Pinned', api: 'https://boards-api.greenhouse.io/v1/boards/pinned/jobs?content=true' },
+    { fetchJson: async (url) => { pinnedUrl = url; return { jobs: [] }; } },
+  );
+  if (pinnedUrl === 'https://boards-api.greenhouse.io/v1/boards/pinned/jobs?content=true')
+    pass('greenhouse.fetch() does not duplicate an entry.api that already carries content=true');
+  else fail(`greenhouse.fetch() pinned url=${JSON.stringify(pinnedUrl)}`);
+
+  if (fetched.length === 3)
+    pass('greenhouse.fetch() drops rows without absolute_url (3 of 4 kept)');
+  else fail(`greenhouse.fetch() returned ${fetched.length} jobs (expected 3)`);
+
+  if (fetched[0]?.title === 'Senior Backend Engineer'
+      && fetched[0]?.url === 'https://job-boards.greenhouse.io/acme/jobs/101'
+      && fetched[0]?.company === 'Acme'
+      && fetched[0]?.listingIdentity?.ats_provider === 'greenhouse'
+      && fetched[0]?.listingIdentity?.board_slug === 'acme'
+      && fetched[0]?.listingIdentity?.posting_id === '101'
+      && fetched[0]?.location === 'Berlin, Germany'
+      && fetched[0]?.postedAt === Date.parse('2026-07-01T09:30:00-04:00'))
+    pass('greenhouse.fetch() maps ATS identity, title/URL/company/location/date');
+  else fail(`greenhouse.fetch() row 0 = ${JSON.stringify(fetched[0])}`);
+
+  if (JSON.stringify(fetched[0]?.locations) === JSON.stringify(['Berlin, Germany'])
+      && !('locations' in fetched[1]))
+    pass('greenhouse.fetch() emits locations for a single location and omits it when empty');
+  else fail(`greenhouse.fetch() locations row 0 = ${JSON.stringify(fetched[0]?.locations)}, row 1 = ${JSON.stringify(fetched[1]?.locations)}`);
+
+  if (fetched[1]?.title === '' && fetched[1]?.location === '' && fetched[1]?.postedAt === undefined)
+    pass('greenhouse.fetch() defaults missing title/location to "" and omits postedAt when first_published is absent');
+  else fail(`greenhouse.fetch() row 1 = ${JSON.stringify(fetched[1])}`);
+
+  if (fetched[2]?.postedAt === undefined)
+    pass('greenhouse.fetch() yields undefined postedAt for an unparseable first_published (NaN-safe)');
+  else fail(`greenhouse.fetch() row 2 postedAt = ${JSON.stringify(fetched[2]?.postedAt)}`);
+
+  // ── content=true → description (#3175) ──────────────────────────────
+  // The boards API embeds posting bodies as DOUBLE-encoded HTML: one decode
+  // pass reveals the tags, the second (after stripping) resolves text-level
+  // entities. script/style bodies must never leak into the plain text, since
+  // visa_filter/content_filter match by substring.
+  const contentSample = {
+    jobs: [
+      {
+        id: 301,
+        title: 'Sponsor',
+        absolute_url: 'https://job-boards.greenhouse.io/acme/jobs/301',
+        // &lt;script&gt;tracking()&lt;/script&gt; + &lt;style&gt; must vanish;
+        // "&amp;amp;" proves the second decode pass; "&#39;" proves numeric
+        // entities inside visible text survive to the end.
+        content: '&lt;div&gt;&lt;script&gt;tracking()&lt;/script&gt;&lt;style&gt;.x{}&lt;/style&gt;&lt;h2&gt;About &amp;amp; Us&lt;/h2&gt;&lt;p&gt;We offer &#39;visa sponsorship&#39; for &lt;b&gt;H-1B&lt;/b&gt; roles.&lt;/p&gt;&lt;/div&gt;',
+      },
+      {
+        id: 302,
+        title: 'No Body',
+        absolute_url: 'https://job-boards.greenhouse.io/acme/jobs/302',
+        // no content field — description key must be absent entirely
+      },
+      {
+        id: 303,
+        title: 'Empty Body',
+        absolute_url: 'https://job-boards.greenhouse.io/acme/jobs/303',
+        content: '',
+      },
+    ],
+  };
+  const withBodies = await greenhouse.fetch(
+    { name: 'Acme', careers_url: 'https://job-boards.greenhouse.io/acme' },
+    { fetchJson: async () => contentSample },
+  );
+
+  if (withBodies[0]?.description === "About & Us We offer 'visa sponsorship' for H-1B roles.")
+    pass('greenhouse.fetch() double-decodes the posting body into clean plain-text description');
+  else fail(`greenhouse.fetch() row 0 description = ${JSON.stringify(withBodies[0]?.description)}`);
+
+  if (!('description' in (withBodies[1] || {})) && !('description' in (withBodies[2] || {})))
+    pass('greenhouse.fetch() omits the description key when the board ships no body');
+  else fail(`greenhouse.fetch() description keys = ${JSON.stringify(withBodies.map(j => 'description' in j))}`);
+
+  if (withBodies[0] && !('content' in withBodies[0]))
+    pass('greenhouse.fetch() does not leak the raw content field into the normalized job');
+  else fail('greenhouse.fetch() leaked raw content');
+
+  // Cap: a full JD body is ~10 KB of HTML; the stripped text is sliced so scan
+  // payloads stay sane (same rationale as alibaba's 4000-char cap).
+  const longBody = await greenhouse.fetch(
+    { name: 'Acme', careers_url: 'https://job-boards.greenhouse.io/acme' },
+    { fetchJson: async () => ({ jobs: [{ id: 9, title: 'Long', absolute_url: 'https://job-boards.greenhouse.io/acme/jobs/9', content: '&lt;p&gt;' + 'x'.repeat(5000) + '&lt;/p&gt;' }] }) },
+  );
+  if (longBody[0]?.description?.length === 4000 && /^x+$/.test(longBody[0].description))
+    pass('greenhouse.fetch() caps the stripped description at 4000 chars');
+  else fail(`greenhouse.fetch() capped length = ${longBody[0]?.description?.length}`);
+
+  // Unit: contentToText contract on the shapes the API can produce.
+  if (contentToText(null) === '' && contentToText(undefined) === '' && contentToText(42) === '' && contentToText('') === '')
+    pass('contentToText() returns "" for missing / non-string / empty content');
+  else fail('contentToText() should return "" for non-string and empty input');
+
+  // Epoch-0 first_published must survive (the `|| undefined` trap toEpochMs avoids).
+  const epochZero = await greenhouse.fetch(
+    { name: 'Acme', careers_url: 'https://job-boards.greenhouse.io/acme' },
+    { fetchJson: async () => ({ jobs: [{ title: 'Old', absolute_url: 'https://job-boards.greenhouse.io/acme/jobs/1', first_published: '1970-01-01T00:00:00.000Z' }] }) },
+  );
+  if (epochZero[0]?.postedAt === 0)
+    pass('greenhouse.fetch() preserves a valid epoch-0 first_published as postedAt 0');
+  else fail(`greenhouse.fetch() epoch-0 postedAt = ${JSON.stringify(epochZero[0]?.postedAt)}`);
+
+  // Empty vs broken (#6906, ADDING_A_PROVIDER.md "Defensive parsing"): only the
+  // documented container, present and empty, is an empty board. Any other
+  // envelope throws, naming the keys (or the type) it got, so a changed API or
+  // an error served with a 200 cannot read as "no open roles".
+  const ghEntry = { name: 'Acme', careers_url: 'https://job-boards.greenhouse.io/acme' };
+  for (const method of ['fetch', 'fetchListing']) {
+    const emptyBoard = await greenhouse[method](ghEntry, { fetchJson: async () => ({ jobs: [] }) });
+    if (Array.isArray(emptyBoard) && emptyBoard.length === 0) pass(`greenhouse.${method}() returns [] for { jobs: [] }`);
+    else fail(`greenhouse.${method}() { jobs: [] } → ${JSON.stringify(emptyBoard)}`);
+
+    const brokenCases = [
+      [{}, '[]'],
+      [{ error: 'rate limited' }, '[error]'],
+      [{ jobs: null }, '[jobs]'],
+      [{ jobs: {} }, '[jobs]'],
+      ['oops', '[string]'],
+      [null, '[null]'],
+    ];
+    let brokenOk = true;
+    for (const [body, got] of brokenCases) {
+      let out;
+      let err = null;
+      try { out = await greenhouse[method](ghEntry, { fetchJson: async () => body }); } catch (e) { err = e; }
+      const msg = String(/** @type {any} */ (err)?.message || '');
+      if (!err || !msg.startsWith('greenhouse: unexpected response for Acme') || !msg.includes(`got: ${got}`)) {
+        brokenOk = false;
+        fail(`greenhouse.${method}() body=${JSON.stringify(body)} should throw naming ${got}; got ${err ? JSON.stringify(msg) : `a return of ${JSON.stringify(out)}`}`);
+        break;
+      }
+    }
+    if (brokenOk) pass(`greenhouse.${method}() throws, naming what it got, for a body that is not { jobs: [...] }`);
+  }
+
+  // Guard chain runs BEFORE any request: an untrusted api: must throw without
+  // ever calling fetchJson.
+  let untrustedFetchCalled = false;
+  try {
+    await greenhouse.fetch(
+      { name: 'Evil', api: 'https://evil.example/v1/boards/acme/jobs' },
+      { fetchJson: async () => { untrustedFetchCalled = true; return { jobs: [] }; } },
+    );
+    fail('greenhouse.fetch() should throw for an untrusted api: host');
+  } catch (e) {
+    if (!untrustedFetchCalled && /untrusted hostname/.test(e.message)) {
+      pass('greenhouse.fetch() throws on an untrusted api: host before any request is made');
+    } else {
+      fail(`greenhouse.fetch() untrusted api: fetchCalled=${untrustedFetchCalled}, error=${e.message}`);
+    }
+  }
+
+  // ── Office enrichment (work-model-only locations) ─────────────────
+  // Boards like Cloudflare put "Hybrid"/"In-Office"/"Distributed" in
+  // location.name and the city in offices[], which /jobs does not return.
+
+  if (isWorkModelOnly('Hybrid') && isWorkModelOnly('In-Office') && isWorkModelOnly('Distributed')
+      && isWorkModelOnly('Distributed; Hybrid') && isWorkModelOnly(' remote '))
+    pass('isWorkModelOnly() detects bare work-model strings, incl. ";"-joined and padded');
+  else fail('isWorkModelOnly() missed a bare work-model string');
+
+  if (!isWorkModelOnly('Hybrid - London') && !isWorkModelOnly('Remote (Canada)')
+      && !isWorkModelOnly('Austin, TX') && !isWorkModelOnly('') && !isWorkModelOnly(null))
+    pass('isWorkModelOnly() leaves locations that already carry geography (and empty/non-string) alone');
+  else fail('isWorkModelOnly() wrongly claimed a location that carries geography');
+
+  if (officesUrlFor('https://boards-api.greenhouse.io/v1/boards/acme/jobs') === 'https://boards-api.greenhouse.io/v1/boards/acme/offices'
+      && officesUrlFor('https://boards-api.greenhouse.io/v1/boards/acme/jobs/123') === null)
+    pass('officesUrlFor() maps a board jobs URL to /offices and declines a single-job URL');
+  else fail(`officesUrlFor() = ${JSON.stringify(officesUrlFor('https://boards-api.greenhouse.io/v1/boards/acme/jobs'))}`);
+
+  const officesBody = {
+    offices: [
+      {
+        name: 'Austin, TX',
+        departments: [{ jobs: [{ id: 201 }, { id: 202 }] }, { jobs: null }],
+        children: [{ name: 'Seattle, WA', departments: [{ jobs: [{ id: 202 }] }] }],
+      },
+      { name: '', departments: [{ jobs: [{ id: 203 }] }] },   // unnamed office — skipped
+      null,                                                    // malformed — skipped
+    ],
+  };
+  const officeMap = buildOfficeMap(officesBody);
+  if (officeMap.get(201)?.has('Austin, TX') && officeMap.get(202)?.size === 2
+      && officeMap.get(202)?.has('Seattle, WA') && !officeMap.has(203))
+    pass('buildOfficeMap() walks nested offices/departments, unions multi-office jobs, skips unnamed');
+  else fail(`buildOfficeMap() = ${JSON.stringify([...officeMap].map(([k, v]) => [k, [...v]]))}`);
+
+  if (buildOfficeMap(null).size === 0 && buildOfficeMap({ offices: 'nope' }).size === 0)
+    pass('buildOfficeMap() returns an empty map for malformed bodies');
+  else fail('buildOfficeMap() should tolerate malformed bodies');
+
+  if (JSON.stringify(extractSortedOfficeNames([{ name: '  Austin, TX ' }, { name: 'Seattle, WA' }, { name: 'Austin, TX' }, { name: '' }, null])) === JSON.stringify(['Austin, TX', 'Seattle, WA']))
+    pass('extractSortedOfficeNames() trims, skips unnamed, dedupes, and sorts office objects');
+  else fail(`extractSortedOfficeNames() object array failed`);
+
+  if (JSON.stringify(extractSortedOfficeNames(new Set(['  Seattle, WA', 'Austin, TX ', 'Austin, TX']))) === JSON.stringify(['Austin, TX', 'Seattle, WA']))
+    pass('extractSortedOfficeNames() handles Set of strings');
+  else fail(`extractSortedOfficeNames() Set failed`);
+
+  if (JSON.stringify(extractSortedOfficeNames(null)) === '[]' && JSON.stringify(extractSortedOfficeNames([])) === '[]')
+    pass('extractSortedOfficeNames() returns [] for null/empty');
+  else fail(`extractSortedOfficeNames() null/empty failed`);
+
+  const tooLargeErr = () => Object.assign(new Error('HTTP body exceeded maxBytes of 10485760'), { code: 'response_too_large' });
+
+  // End-to-end: inline offices on content=true payload fold in with zero /offices calls (#6911).
+  const inlineRequested = [];
+  const inlineEnriched = await greenhouse.fetch(
+    { name: 'Cloudflare', careers_url: 'https://job-boards.greenhouse.io/cloudflare' },
+    {
+      fetchJson: async (url) => {
+        inlineRequested.push(url);
+        if (url.endsWith('/offices')) return officesBody;
+        return {
+          jobs: [
+            {
+              id: 201,
+              title: 'Systems Engineer',
+              absolute_url: 'https://job-boards.greenhouse.io/cloudflare/jobs/201',
+              location: { name: 'In-Office' },
+              offices: [{ id: 1, name: 'Austin, TX' }],
+            },
+            {
+              id: 202,
+              title: 'Staff SWE',
+              absolute_url: 'https://job-boards.greenhouse.io/cloudflare/jobs/202',
+              location: { name: 'Distributed; Hybrid' },
+              offices: [{ id: 1, name: 'Austin, TX' }, { id: 2, name: 'Seattle, WA' }],
+            },
+            {
+              id: 999,
+              title: 'Unmapped',
+              absolute_url: 'https://job-boards.greenhouse.io/cloudflare/jobs/999',
+              location: { name: 'Hybrid' },
+              offices: [],
+            },
+          ],
+        };
+      },
+    },
+  );
+
+  if (inlineRequested.length === 1 && !inlineRequested.some(u => u.endsWith('/offices')))
+    pass('greenhouse.fetch() enriches inline offices and makes zero /offices calls when bodiesInline');
+  else fail(`greenhouse.fetch() requested ${JSON.stringify(inlineRequested)}`);
+
+  if (inlineEnriched[0]?.location === 'In-Office · Austin, TX')
+    pass('greenhouse.fetch() folds the inline office city into a work-model-only location');
+  else fail(`greenhouse.fetch() inline row 0 location = ${JSON.stringify(inlineEnriched[0]?.location)}`);
+
+  if (inlineEnriched[1]?.location === 'Distributed; Hybrid · Austin, TX · Seattle, WA')
+    pass('greenhouse.fetch() folds every inline office of a multi-site role, " · "-joined');
+  else fail(`greenhouse.fetch() inline row 1 location = ${JSON.stringify(inlineEnriched[1]?.location)}`);
+
+  if (inlineEnriched[2]?.location === 'Hybrid')
+    pass('greenhouse.fetch() leaves a job with missing or empty inline offices on its bare work-model string');
+  else fail(`greenhouse.fetch() inline row 2 location = ${JSON.stringify(inlineEnriched[2]?.location)}`);
+
+  if (JSON.stringify(inlineEnriched[0]?.locations) === JSON.stringify(['Austin, TX'])
+      && JSON.stringify(inlineEnriched[1]?.locations) === JSON.stringify(['Austin, TX', 'Seattle, WA'])
+      && !('locations' in inlineEnriched[2]))
+    pass('greenhouse.fetch() emits sorted inline offices without work model in locations, and omits locations when work-model-only has no offices');
+  else fail(`greenhouse.fetch() inline enriched locations = ${JSON.stringify([inlineEnriched[0]?.locations, inlineEnriched[1]?.locations, inlineEnriched[2]?.locations])}`);
+
+  const [berlinJob] = await greenhouse.fetch(
+    { name: 'Acme', careers_url: 'https://job-boards.greenhouse.io/acme' },
+    {
+      fetchJson: async () => ({
+        jobs: [
+          {
+            id: 101,
+            title: 'Engineer',
+            absolute_url: 'https://job-boards.greenhouse.io/acme/jobs/101',
+            location: { name: 'Berlin' },
+            offices: [{ id: 1, name: 'Berlin' }, { id: 2, name: 'Paris' }],
+          },
+        ],
+      }),
+    },
+  );
+  if (berlinJob?.location === 'Berlin'
+      && JSON.stringify(berlinJob?.locations) === JSON.stringify(['Berlin', 'Paris'])) {
+    pass('greenhouse.fetch() leaves real city in location and emits deduped inline offices in locations');
+  } else {
+    fail(`greenhouse.fetch() Berlin inline offices = location: ${JSON.stringify(berlinJob?.location)}, locations: ${JSON.stringify(berlinJob?.locations)}`);
+  }
+
+  const [hybridInlineJob] = await greenhouse.fetch(
+    { name: 'Acme', careers_url: 'https://job-boards.greenhouse.io/acme' },
+    {
+      fetchJson: async () => ({
+        jobs: [
+          {
+            id: 102,
+            title: 'Engineer',
+            absolute_url: 'https://job-boards.greenhouse.io/acme/jobs/102',
+            location: { name: 'Hybrid' },
+            offices: [{ id: 1, name: 'Austin, TX' }, { id: 2, name: 'Remote' }],
+          },
+        ],
+      }),
+    },
+  );
+  if (hybridInlineJob?.location === 'Hybrid · Austin, TX · Remote'
+      && JSON.stringify(hybridInlineJob?.locations) === JSON.stringify(['Austin, TX'])) {
+    pass('greenhouse.fetch() folds "Remote" into inline location while omitting it from locations');
+  } else {
+    fail(`greenhouse.fetch() hybrid inline remote = location: ${JSON.stringify(hybridInlineJob?.location)}, locations: ${JSON.stringify(hybridInlineJob?.locations)}`);
+  }
+
+  // Inline office order stability (#3750, #6911): reversed payload offices must give the same sorted string.
+  const [reversedInline] = await greenhouse.fetch(
+    { name: 'Cloudflare', careers_url: 'https://job-boards.greenhouse.io/cloudflare' },
+    {
+      fetchJson: async () => ({
+        jobs: [
+          {
+            id: 202,
+            title: 'Staff SWE',
+            absolute_url: 'https://job-boards.greenhouse.io/cloudflare/jobs/202',
+            location: { name: 'Distributed; Hybrid' },
+            offices: [{ id: 2, name: 'Seattle, WA' }, { id: 1, name: 'Austin, TX' }],
+          },
+        ],
+      }),
+    },
+  );
+  if (reversedInline?.location === 'Distributed; Hybrid · Austin, TX · Seattle, WA')
+    pass('greenhouse.fetch() sorts inline offices, so payload order cannot rewrite the location');
+  else fail(`greenhouse.fetch() payload office order leaked into the location: ${JSON.stringify(reversedInline?.location)}`);
+
+  // Fallback: when content=true fails with response_too_large, /offices is still requested (#6911).
+  const requested = [];
+  const enriched = await greenhouse.fetch(
+    { name: 'Cloudflare', careers_url: 'https://job-boards.greenhouse.io/cloudflare' },
+    {
+      fetchJson: async (url) => {
+        if (url.includes('content=true')) throw tooLargeErr();
+        requested.push(url);
+        if (url.endsWith('/offices')) return officesBody;
+        return {
+          jobs: [
+            { id: 201, title: 'Systems Engineer', absolute_url: 'https://job-boards.greenhouse.io/cloudflare/jobs/201', location: { name: 'In-Office' } },
+            { id: 202, title: 'Staff SWE', absolute_url: 'https://job-boards.greenhouse.io/cloudflare/jobs/202', location: { name: 'Distributed; Hybrid' } },
+            { id: 999, title: 'Unmapped', absolute_url: 'https://job-boards.greenhouse.io/cloudflare/jobs/999', location: { name: 'Hybrid' } },
+          ],
+        };
+      },
+    },
+  );
+
+  // /offices outgrows the shared 10 MB / 10 s defaults (Stripe's: 29.2 MB), so
+  // the call must carry its own larger ceiling, or every run aborts it.
+  let officesOpts = null;
+  await greenhouse.fetch(
+    { name: 'Stripe', careers_url: 'https://stripe.com/jobs/search', api: 'https://boards-api.greenhouse.io/v1/boards/stripe/jobs' },
+    {
+      fetchJson: async (url, opts) => {
+        if (url.includes('content=true')) throw tooLargeErr();
+        if (url.endsWith('/offices')) { officesOpts = opts; return officesBody; }
+        return { jobs: [{ id: 201, title: 'Strategy & Operations', absolute_url: 'https://stripe.com/jobs/listing/x/201', location: { name: 'Hybrid' } }] };
+      },
+    },
+  );
+  if (officesOpts && officesOpts.maxBytes >= 32 * 1024 * 1024 && officesOpts.timeoutMs >= 30_000 && officesOpts.redirect === 'error')
+    pass('greenhouse.fetch() gives /offices its own body and time ceiling (Stripe /offices is 29 MB) and keeps redirect: error');
+  else fail(`greenhouse.fetch() /offices options = ${JSON.stringify(officesOpts)}`);
+
+  if (requested.length === 2 && requested[1] === 'https://boards-api.greenhouse.io/v1/boards/cloudflare/offices')
+    pass('greenhouse.fetch() requests /offices when the board reports work-model-only locations');
+  else fail(`greenhouse.fetch() requested ${JSON.stringify(requested)}`);
+
+  if (enriched[0]?.location === 'In-Office · Austin, TX')
+    pass('greenhouse.fetch() folds the office city into a work-model-only location');
+  else fail(`greenhouse.fetch() enriched row 0 location = ${JSON.stringify(enriched[0]?.location)}`);
+
+  if (enriched[1]?.location === 'Distributed; Hybrid · Austin, TX · Seattle, WA')
+    pass('greenhouse.fetch() folds every office of a multi-site role, " · "-joined');
+  else fail(`greenhouse.fetch() enriched row 1 location = ${JSON.stringify(enriched[1]?.location)}`);
+
+  if (enriched[2]?.location === 'Hybrid')
+    pass('greenhouse.fetch() leaves a job absent from /offices on its bare work-model string');
+  else fail(`greenhouse.fetch() enriched row 2 location = ${JSON.stringify(enriched[2]?.location)}`);
+
+  if (JSON.stringify(enriched[0]?.locations) === JSON.stringify(['Austin, TX'])
+      && JSON.stringify(enriched[1]?.locations) === JSON.stringify(['Austin, TX', 'Seattle, WA'])
+      && !('locations' in enriched[2]))
+    pass('greenhouse.fetch() emits sorted offices without work model in locations, and omits locations when work-model-only has no offices');
+  else fail(`greenhouse.fetch() enriched locations = ${JSON.stringify([enriched[0]?.locations, enriched[1]?.locations, enriched[2]?.locations])}`);
+
+  const remoteOfficeBody = {
+    offices: [
+      { name: 'Austin, TX', departments: [{ jobs: [{ id: 103 }] }] },
+      { name: 'Remote', departments: [{ jobs: [{ id: 103 }] }] },
+    ],
+  };
+  const [hybridFallbackJob] = await greenhouse.fetch(
+    { name: 'Acme', careers_url: 'https://job-boards.greenhouse.io/acme' },
+    {
+      fetchJson: async (url) => {
+        if (url.includes('content=true')) throw tooLargeErr();
+        if (url.endsWith('/offices')) return remoteOfficeBody;
+        return {
+          jobs: [{ id: 103, title: 'Engineer', absolute_url: 'https://job-boards.greenhouse.io/acme/jobs/103', location: { name: 'Hybrid' } }],
+        };
+      },
+    },
+  );
+  if (hybridFallbackJob?.location === 'Hybrid · Austin, TX · Remote'
+      && JSON.stringify(hybridFallbackJob?.locations) === JSON.stringify(['Austin, TX'])) {
+    pass('greenhouse.fetch() folds "Remote" into fallback location while omitting it from locations');
+  } else {
+    fail(`greenhouse.fetch() hybrid fallback remote = location: ${JSON.stringify(hybridFallbackJob?.location)}, locations: ${JSON.stringify(hybridFallbackJob?.locations)}`);
+  }
+
+  // Order stability (#3750). The folded city list must not inherit the order
+  // Greenhouse happened to return its offices in: that order is not promised to
+  // be stable, and this string is what lands in scan-history.tsv AND what
+  // scan.mjs keys the location dedupe on. Same two offices as above, declared
+  // the other way round — the emitted location must be byte-identical.
+  const reversedOffices = {
+    offices: [
+      {
+        name: 'Seattle, WA',
+        departments: [{ jobs: [{ id: 202 }] }],
+        children: [{ name: 'Austin, TX', departments: [{ jobs: [{ id: 202 }] }] }],
+      },
+    ],
+  };
+  const [reversed] = await greenhouse.fetch(
+    { name: 'Cloudflare', careers_url: 'https://job-boards.greenhouse.io/cloudflare' },
+    {
+      fetchJson: async (url) => {
+        if (url.includes('content=true')) throw tooLargeErr();
+        return url.endsWith('/offices') ? reversedOffices : {
+          jobs: [{ id: 202, title: 'Staff SWE', absolute_url: 'https://job-boards.greenhouse.io/cloudflare/jobs/202', location: { name: 'Distributed; Hybrid' } }],
+        };
+      },
+    },
+  );
+  if (reversed?.location === 'Distributed; Hybrid · Austin, TX · Seattle, WA')
+    pass('greenhouse.fetch() sorts the folded offices, so /offices ordering cannot rewrite the location');
+  else fail(`greenhouse.fetch() office order leaked into the location: ${JSON.stringify(reversed?.location)}`);
+
+  // Cost guard: a board that already reports cities must not pay for /offices.
+  const geoRequests = [];
+  await greenhouse.fetch(
+    { name: 'Datadog', careers_url: 'https://job-boards.greenhouse.io/datadog' },
+    {
+      fetchJson: async (url) => {
+        geoRequests.push(url);
+        return { jobs: [{ id: 1, title: 'SRE', absolute_url: 'https://job-boards.greenhouse.io/datadog/jobs/1', location: { name: 'Paris, France' } }] };
+      },
+    },
+  );
+  if (geoRequests.length === 1)
+    pass('greenhouse.fetch() skips /offices entirely when locations already carry geography');
+  else fail(`greenhouse.fetch() made ${geoRequests.length} requests for a geo-location board (expected 1)`);
+
+  // Enrichment is best-effort: a failing /offices must not fail the scan, but
+  // it must say so — a silent catch makes a systemic /offices regression
+  // indistinguishable from a board that simply has no /offices.
+  const degradedWarnings = [];
+  const originalConsoleError = console.error;
+  console.error = (m) => degradedWarnings.push(m);
+  let degraded;
+  try {
+    degraded = await greenhouse.fetch(
+      { name: 'Cloudflare', careers_url: 'https://job-boards.greenhouse.io/cloudflare' },
+      {
+        fetchJson: async (url) => {
+          if (url.includes('content=true')) throw tooLargeErr();
+          if (url.endsWith('/offices')) throw new Error('404');
+          return { jobs: [{ id: 201, title: 'Systems Engineer', absolute_url: 'https://job-boards.greenhouse.io/cloudflare/jobs/201', location: { name: 'In-Office' } }] };
+        },
+      },
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+  if (degraded.length === 1 && degraded[0]?.location === 'In-Office')
+    pass('greenhouse.fetch() degrades to the bare work-model string when /offices fails');
+  else fail(`greenhouse.fetch() degraded = ${JSON.stringify(degraded)}`);
+
+  if (degradedWarnings.some((w) => /greenhouse: Cloudflare .*404/.test(String(w))))
+    pass('greenhouse.fetch() logs the board and cause when /offices enrichment fails');
+  else fail(`greenhouse.fetch() should warn on failed enrichment, got: ${JSON.stringify(degradedWarnings)}`);
+
+  // A promise may reject with a non-Error. Reading .message off null would
+  // throw *inside* the catch and abort the whole board — the exact failure the
+  // best-effort fallback exists to prevent.
+  for (const thrown of [null, undefined, 'plain string', 42]) {
+    const nonErrWarnings = [];
+    const nonErrConsole = console.error;
+    console.error = (m) => nonErrWarnings.push(m);
+    let nonErrRows;
+    let threw = null;
+    try {
+      nonErrRows = await greenhouse.fetch(
+        { name: 'Cloudflare', careers_url: 'https://job-boards.greenhouse.io/cloudflare' },
+        {
+          fetchJson: async (url) => {
+            if (url.includes('content=true')) throw tooLargeErr();
+            if (url.endsWith('/offices')) throw thrown;
+            return { jobs: [{ id: 201, title: 'Systems Engineer', absolute_url: 'https://job-boards.greenhouse.io/cloudflare/jobs/201', location: { name: 'In-Office' } }] };
+          },
+        },
+      );
+    } catch (e) {
+      threw = e;
+    } finally {
+      console.error = nonErrConsole;
+    }
+    const label = String(thrown);
+    if (!threw && nonErrRows?.length === 1 && nonErrRows[0]?.location === 'In-Office' && nonErrWarnings.length === 1)
+      pass(`greenhouse.fetch() survives a non-Error /offices rejection (${label}) and still warns`);
+    else fail(`greenhouse.fetch() non-Error rejection (${label}): threw=${threw?.message}, rows=${JSON.stringify(nonErrRows)}, warnings=${JSON.stringify(nonErrWarnings)}`);
+  }
+
+  // Underivable entry → typed error, no request.
+  try {
+    await greenhouse.fetch(
+      { name: 'NoBoard', careers_url: 'https://example.com/careers' },
+      { fetchJson: async () => { throw new Error('must not be called'); } },
+    );
+    fail('greenhouse.fetch() should throw when no API URL can be derived');
+  } catch (e) {
+    if (/cannot derive API URL for NoBoard/.test(e.message)) {
+      pass('greenhouse.fetch() throws "cannot derive API URL" for an undetectable entry');
+    } else {
+      fail(`greenhouse.fetch() threw the wrong error: ${e.message}`);
+    }
+  }
+
+  // Oversized board: content=true overflows → plain list; with the opt-in,
+  // bodies for title-kept postings only, capped, paced, retried, no redirects.
+  {
+    const tooLarge = () => Object.assign(new Error('HTTP body exceeded maxBytes of 10485760'), { code: 'response_too_large' });
+    const listing = { jobs: [
+      { id: 1, title: 'Strategy Manager', absolute_url: 'https://job-boards.greenhouse.io/big/jobs/1', location: { name: 'Costa Mesa' } },
+      { id: 2, title: 'Welder', absolute_url: 'https://job-boards.greenhouse.io/big/jobs/2', location: { name: 'Costa Mesa' } },
+      { id: 3, title: 'Strategy Lead', absolute_url: 'https://job-boards.greenhouse.io/big/jobs/3', location: { name: 'Costa Mesa' } },
+    ] };
+    const optIn = { name: 'Big', careers_url: 'https://job-boards.greenhouse.io/big', greenhouse: { fetchDetails: true } };
+    const run = async (entry, extra = {}) => {
+      const calls = [];
+      const sleeps = [];
+      const warn = console.warn; const err = console.error;
+      console.warn = () => {}; console.error = () => {};
+      try {
+        const rows = await greenhouse.fetch(entry, {
+          titleWanted: (t) => /strategy/i.test(t),
+          sleep: async (ms) => { sleeps.push(ms); },
+          fetchJson: async (url, opts) => {
+            calls.push({ url, opts });
+            if (url.includes('content=true')) throw tooLarge();
+            if (/\/jobs\/\d+$/.test(url)) {
+              if (extra.detail) return extra.detail(url);
+              return { id: 1, content: '&lt;p&gt;Lead strategy.&lt;/p&gt;' };
+            }
+            // A fresh copy per call: the provider writes bodies onto the jobs it
+            // was given, and one run must never see another run's bodies.
+            return structuredClone(listing);
+          },
+          ...(extra.ctx || {}),
+        });
+        return { rows, calls, sleeps };
+      } finally { console.warn = warn; console.error = err; }
+    };
+    const details = (calls) => calls.filter((c) => /\/jobs\/\d+$/.test(c.url));
+
+    const on = await run(optIn);
+    const strat = on.rows.find((r) => r.title === 'Strategy Manager');
+    const welder = on.rows.find((r) => r.title === 'Welder');
+    if (on.rows.length === 3 && strat?.description === 'Lead strategy.' && welder && welder.description === undefined
+      && !details(on.calls).some((c) => c.url.endsWith('/jobs/2')) && details(on.calls).length === 2) {
+      pass('greenhouse.fetch() with fetchDetails reads an oversized board from the plain list, fetching bodies only for title-kept postings');
+    } else {
+      fail(`greenhouse oversized fallback rows=${JSON.stringify(on.rows)} calls=${JSON.stringify(on.calls.map((c) => c.url))}`);
+    }
+    if (on.calls.length > 0 && on.calls.every((c) => c.opts?.redirect === 'error')) {
+      pass('greenhouse.fetch() refuses redirects on the list, the plain-list fallback and every detail request');
+    } else {
+      fail(`greenhouse redirect opts: ${JSON.stringify(on.calls.map((c) => c.opts))}`);
+    }
+
+    // A percent-encoded slug in an explicit api: stays encoded once in detail URLs.
+    const encoded = await run({ name: 'Big', api: 'https://boards-api.greenhouse.io/v1/boards/%62ig/jobs', greenhouse: { fetchDetails: true } });
+    const encodedDetails = details(encoded.calls).map((c) => c.url);
+    if (encodedDetails.length === 2 && encodedDetails.every((u) => u.startsWith('https://boards-api.greenhouse.io/v1/boards/%62ig/jobs/'))) {
+      pass('greenhouse.fetch() keeps a percent-encoded board slug encoded once in detail URLs');
+    } else {
+      fail(`greenhouse encoded slug detail URLs: ${JSON.stringify(encodedDetails)}`);
+    }
+
+    const off = await run({ name: 'Big', careers_url: 'https://job-boards.greenhouse.io/big' });
+    if (off.rows.length === 3 && details(off.calls).length === 0 && off.rows.truncated?.reason === 'descriptions-omitted' && off.rows.truncated.fetched === 0 && off.rows.truncated.total === 3) {
+      pass('greenhouse.fetch() marks an oversized board partial when it returns no descriptions');
+    } else {
+      fail(`greenhouse detail without opt-in: ${JSON.stringify(off.calls.map((c) => c.url))} truncated=${JSON.stringify(off.rows.truncated)}`);
+    }
+
+    const probe = await run(optIn, { ctx: { maxPages: 1 } });
+    if (details(probe.calls).length === 0 && probe.rows.truncated === undefined) pass('greenhouse.fetch() fetches no detail during a health probe and does not mark the probe partial');
+    else fail(`greenhouse detail during probe: ${JSON.stringify(probe.calls.map((c) => c.url))} truncated=${JSON.stringify(probe.rows.truncated)}`);
+
+    const capped = await run({ ...optIn, greenhouse: { fetchDetails: true, detailLimit: 1 } });
+    if (details(capped.calls).length === 1) pass('greenhouse.fetch() caps detail requests at detailLimit');
+    else fail(`greenhouse detailLimit: ${details(capped.calls).length} detail calls`);
+
+    let attempts = 0;
+    const flaky = await run(optIn, { detail: () => { attempts++; if (attempts === 1) throw Object.assign(new Error('HTTP 503'), { status: 503 }); return { content: 'ok' }; } });
+    if (flaky.rows.find((r) => r.title === 'Strategy Manager')?.description === 'ok') pass('greenhouse.fetch() retries a transient detail failure before giving up the body');
+    else fail(`greenhouse detail retry: ${JSON.stringify(flaky.rows)}`);
+
+    let notFoundCalls = 0;
+    const failing = await run(optIn, { detail: () => { notFoundCalls++; throw Object.assign(new Error('HTTP 404'), { status: 404 }); } });
+    const failedBodies = failing.rows.filter((r) => /strategy/i.test(r.title)).map((r) => r.description);
+    if (failing.rows.length === 3 && failing.sleeps.includes(200) && notFoundCalls === 2
+      && failedBodies.length === 2 && failedBodies.every((d) => d === undefined)) pass('greenhouse.fetch() keeps postings whose detail fetch failed, paced between attempts, and does not retry a 404');
+    else fail(`greenhouse detail failure: rows=${failing.rows.length} sleeps=${JSON.stringify(failing.sleeps)} calls=${notFoundCalls} bodies=${JSON.stringify(failedBodies)}`);
+
+    try {
+      await greenhouse.fetch(
+        { name: 'Big', careers_url: 'https://job-boards.greenhouse.io/big' },
+        { fetchJson: async () => { throw Object.assign(new Error('HTTP 404'), { status: 404 }); } },
+      );
+      fail('greenhouse.fetch() must not swallow a non-size error');
+    } catch (e) {
+      if (/404/.test(e.message)) pass('greenhouse.fetch() still throws a non-size error');
+      else fail(`greenhouse.fetch() threw ${e.message}`);
+    }
+  }
+
+} catch (e) {
+  fail(`greenhouse provider tests crashed: ${e.message}`);
+}

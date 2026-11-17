@@ -1,0 +1,19 @@
+# Fork-owned files: tracked in this fork, not shipped by upstream, never touched
+# by update-system.mjs. One repo-relative path per line (see LOCAL_PATHS_FILE).
+
+# Scan pipeline
+dedup-utils.mjs
+mid-filter.mjs
+scan-semantic.mjs
+analyze-filter-patterns.mjs
+test-linkedin-config.mjs
+
+# Tracker and pipeline helpers
+add-task.mjs
+sync-tasks.mjs
+triage-pending.mjs
+update-pipeline-scores.mjs
+
+# Nightly scheduler wrappers
+nightly-careerops.sh
+nightly-hibernate.cmd

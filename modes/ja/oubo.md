@@ -1,115 +1,168 @@
 # モード: oubo -- 応募ライブアシスタント
 
-候補者がブラウザで応募フォームを記入しているときのインタラクティブモード。画面に表示されている内容を読み取り、事前評価のコンテキストを読み込み、フォームの各質問にパーソナライズされた回答を生成する。
+> Free-text answers と cover-letter fields には `voice-dna.md`（存在する場合）を適用する。Full guardrail、conversational voice included（Tier 1 + Tier 2）。`_writing.md` → Voice DNA を参照。
 
-## 要件
+候補者がこのプロジェクトが起動する Playwright ブラウザで応募フォームを入力しているときの interactive mode。画面上の内容を読み、事前評価済みの求人 context を読み込み、フォームの各質問に personalized responses を生成する。
 
-- **Playwright が表示されている場合が最適**：候補者がブラウザを見れて、Claude がページとインタラクトできる。
-- **Playwright なし**：候補者がスクリーンショットを共有するか、質問を手動で貼り付ける。
+## Requirements
 
-## ワークフロー
+- **Best with Playwright in visible mode:** visible mode では、候補者が browser を見られ、Claude が page と interact できる。
+- **Without Playwright:** 候補者が screenshot を共有するか、質問を手動で貼り付ける。
 
+## Workflow
+
+```text
+1. DETECT      → このプロジェクトの Playwright ブラウザで求人を開く
+2. IDENTIFY    → Extract company + role from the page
+3. SEARCH      → Match against existing reports in reports/
+4. LOAD        → Read full report + Section H / `## Application Answers` (if they exist) — **Posting identity** が成り立ってから
+5. PREFLIGHT   → Confirm posting liveness + that the form is the report's posting (**Posting identity**) before drafting
+6. ANALYZE     → Identify ALL visible form questions
+7. GENERATE    → For each question, generate a personalized response
+8. PRESENT     → Show formatted responses for copy-paste
 ```
-1. 検出    → Chrome のアクティブタブを読む（スクリーンショット/URL/タイトル）
-2. 特定    → ページから企業名 + 求人を抽出
-3. 検索    → reports/ 内の既存レポートとマッチング
-4. 読込    → 完全なレポート + ブロック G（存在する場合）を読み込む
-5. 比較    → 画面の求人は評価済みのものと一致するか？変更されていれば → 通知
-6. 分析    → フォームに表示されているすべての質問を特定
-7. 生成    → 各質問に対してパーソナライズされた回答を生成
-8. 提示    → コピペ用にフォーマットされた回答を表示
-```
 
-## ステップ 1 -- 求人を検出
+## Scope
 
-**Playwright あり：** アクティブページのスナップショットを取得。タイトル、URL、表示内容を読む。
+Follow the Scope section in `modes/apply.md`. Run `node apply-scope.mjs root` and stay inside the directories it prints. Launch with `node apply-scope.mjs launch-options`. Do not read `DevToolsActivePort` or attach to an existing browser. Do not submit the form.
 
-**Playwright なし：** 候補者に以下を依頼：
-- フォームのスクリーンショットを共有（Read tool で画像を読める）
-- またはフォームの質問をテキストとして貼り付け
-- または企業名 + 求人を伝えてもらってコンテキストを検索
 
-## ステップ 2 -- コンテキストの特定と検索
+## Step 5 -- Preflight gate
 
-1. ページから企業名と求人タイトルを抽出
-2. `reports/` 内で企業名を検索（Grep、大文字小文字区別なし）
-3. マッチあり → 完全なレポートを読み込む
-4. ブロック G あり → 以前の回答下書きをベースとして読み込む
-5. マッチなし → 通知し、クイック auto-pipeline の実行を提案
+Application answers を生成する前に、form が意図した active job を指していることを確認する。この gate は page detection、company/role identification、matching report load の後に実行する。
 
-## ステップ 3 -- 求人の変更を検出
+1. Visible URL、page title、company、role、closed/expired signals を読む。
+2. URL がある場合、Playwright で liveness を確認する：
+   - active posting evidence: title/role + job description または form fields + submit/apply path
+   - closed posting evidence: expired/closed/no longer accepting applications、JD がなく nav/footer だけ、generic careers/search への hard redirect、404/410
+3. Visible company と posting を matched report と比較する（下の **Posting identity** を参照）。
+4. Identity が成り立たない場合、matched report は別の application のもの。drafting 前に stop して聞く：
+   "The form appears to be for [visible company] -- [visible role], which is not the posting in the matched report, [report company] -- [report role]. Do you want me to evaluate this posting as a new one, draft answers without saving them to a report, or stop?"
+   - **Evaluate as new**：visible posting に auto-pipeline を実行する。専用の report と tracker row が書かれるので、その report で続ける。
+   - **Draft without saving**：matched report とその tailored CV は使わず、visible posting、`cv.md`、candidate の profile だけから draft する。Step 8 で `## Application Answers` は書かず、Step 9 で status も設定しない。この application に属する report がないため。
+   - matched report の回答をこの posting に adapt しない：別の posting 向けに draft されたもので、そこに保存するとその report の application の記録を上書きする。
+5. Identity が成り立ち title だけが変わった場合は、Step 3 で決める（新しい title に adapt するか re-evaluate するか）。
+6. Posting が closed に見える場合、candidate が known reason で明示的に override しない限り、final copy の生成を拒否する。
+7. Candidate が questions だけ、または screenshot だけを貼ったため liveness を確認できない場合、その limitation を明示し、drafting 前に company、role、active posting の確認を求める。
 
-画面の求人が評価済みのものと異なる場合：
-- **候補者に通知：**「求人が [X] から [Y] に変更されています。再評価しますか、それとも新しいタイトルに回答を適応させますか？」
-- **適応する場合：** 再評価せず新しいタイトルに回答を調整
-- **再評価する場合：** 完全評価 A-F を実行、レポートを更新、ブロック G を再生成
-- **tracker を更新：** 必要に応じて `applications.md` の求人タイトルを変更
+この preflight が解決するまで Step 6 に進まない。
 
-## ステップ 4 -- フォームの質問を分析
+**Posting identity (#5854).** 定義は `modes/apply.md` → Step 5 → **Posting identity** に従う：同じ employer（候補者が subsidiary、brand、rename、その client 向けの agency posting だと確認した場合も含む）かつ同じ posting（URL または req ID）。Application form の host が report の `**URL:**` と違うだけでは match は崩れない。別の req ID、または同じ employer の別 posting なら崩れる。Title は identity に含めない。Posting が evaluation 後に retitle されても同じ application で、回答はその report に属する。
 
-表示されているすべての質問を特定：
-- 自由テキスト欄（志望動機、この求人に応募する理由、モチベーションなど）
-- ドロップダウン（この求人をどこで知ったか、就労資格など）
-- はい/いいえ（転居、ビザ、稼働開始時期など）
-- 給与欄（希望年収、給与レンジ）
-- アップロード欄（履歴書、カバーレター PDF）
+**Applying to several roles in one sitting?** この preflight は目の前の単一 form を確認する。Multi-role session の前、特に `--verify` なしの scan で追加された未確認の entries がある場合は、`pipeline` mode の **Liveness sweep** を先に実行する（`node check-liveness.mjs --file <urls>`）。これにより `data/pipeline.md` から dead postings がまとめて落ち、expired role の tab を開かずに済む。
 
-各質問を分類：
-- **ブロック G で回答済み** → 既存の回答を適応
-- **新しい質問** → レポート + `cv.md` から回答を生成
+## Step 1 -- Detect the job
 
-## ステップ 5 -- 回答を生成
+**With Playwright:** `node apply-scope.mjs launch-options` で起動したウィンドウに求人を開き、title、URL、visible content を読む。
 
-各質問について、以下に従って回答を生成：
+**Without Playwright:** 候補者に以下を依頼する：
+- Form の screenshot を共有（Read tool で画像を読める）
+- または form questions を text として貼り付け
+- または company + role を伝えてもらい、こちらで検索する
 
-1. **レポートのコンテキスト**：ブロック B の proof point、ブロック F の STAR ストーリーを使用
-2. **以前のブロック G**：下書きがあればベースとして使い、洗練する
-3. **「御社を選んでいる」トーン**：auto-pipeline と同じフレームワーク — 自信を持って、卑屈にならない
-4. **具体性**：画面に見える JD の具体的な内容を参照
-5. **career-ops の proof point**：「追加情報」欄があれば含める
+## Step 2 -- Identify and search for context
+
+1. Page から company name と role title を抽出
+2. `reports/` を company name で検索（case-insensitive grep）
+3. Match があれば、各 matching report の header（company、role、`**URL:**`）だけを読み、URL か req ID がこの posting と一致する report を選ぶ。はっきりしなければ候補者に確認する。Full report と 4 は Step 5 で **Posting identity** が成り立ってから load する。別の posting なら load せずに **Evaluate as new** か **Draft without saving** に進む
+4. Section H（draft answers）か `## Application Answers` があれば、それを base として load
+5. Match がなければ notify し、quick auto-pipeline の実行を提案
+
+## Step 3 -- Detect changes in the role
+
+この step は、form がまだ report の posting である間だけ適用する：同じ employer かつ同じ posting（`modes/apply.md` → Step 5 → **Posting identity**）。title は判定に含めない。title が変わっておらず、company に一致する report が 1 つだけでも、すべての form でこれを確認する：別の posting が同じ title を持つことがあり、その場合 report は使わない。company に一致する report が複数ある場合は、まず URL か req ID がこの posting と一致する report を選び、はっきりしなければ候補者に確認する。別の employer、または同じ employer の別 posting は role の変更ではない：report の回答をそれに adapt しない。代わりに **Evaluate as new**（新しい posting として evaluate する：auto-pipeline、専用の report）か **Draft without saving**（どの report にも保存せずに回答を draft する）を選ぶ。どちらも Step 5 の同名の選択肢と同じで、**Draft without saving** では matched report、その回答、tailored CV を使わない。
+
+画面上の role が evaluation 済みの role と異なる場合：
+- **Notify the candidate:** "The role has changed from [X] to [Y]. Do you want me to re-evaluate or adapt the responses to the new title?"
+- **If adapt:** Candidate が mismatch を明示的に accept した後に限り、re-evaluate せず新しい role に responses を adjust
+- **If re-evaluate:** Full A-F evaluation を実行し、report を update し、Section H を regenerate
+- **Update tracker:** `data/applications.md` は直接編集しない。
+  - **Re-evaluate した場合:** 新しい role title を入れた TSV を書き（`_shared.md` の rule 9）、`node merge-tracker.mjs` でマージする。Report は同じファイルを update するので番号は変わらず、merge はその番号で TSV を既存の行に対応づける：title は置き換わり、status は維持される。
+  - **Adapt した場合:** title は変更しない。Report が evaluate した role を示すものだから。変更があったことは note として記録する：`node set-status.mjs --report <report#> <現在の status> --note "Posting retitled at apply time, row keeps the evaluated title"`。行の現在の status を渡せば status は変わらず、note だけが追記される。Note はこのような固定の文言にし、`[Y]` は入れない。新しい title はページ由来のテキストであり、ページ由来のテキストは command line に渡さない。
+
+## Step 6 -- Analyze form questions
+
+Visible questions をすべて特定する：
+- Free text fields（cover letter、why this role など）
+- Dropdowns（how did you hear、work authorization など）
+- Yes/No（relocation、visa など）
+- Salary fields（range、expectation）
+- Upload fields（resume、cover letter PDF）
+
+**Draft without saving**（Step 5）の場合、この posting に属する report はない：すべての question を new として扱い、matched report、その Section H、`## Application Answers`、tailored CV を回答に使わない。
+
+各 question を分類する：
+- **Already answered in Section H or `## Application Answers`** → 既存 response を adapt
+- **New question** → report + `cv.md` から response を generate
+
+各 field について、application form contract を preserve する：
+- `field_type`: `text`, `textarea`, `select`, `radio`, `checkbox`, `number`, `file`, or `unknown`
+- `required`: `yes`, `no`, or `unknown`
+- `limit`: exact character/word limit if visible; otherwise `unknown`
+- `options`: visible options for select/radio/checkbox fields
+- `needs_candidate_confirmation`: `yes` for legal, demographic, work authorization, visa, relocation, salary, disability, veteran, sponsorship, background-check, or self-identification questions unless the answer is explicitly present in `config/profile.yml`
+
+Legal、demographic、work-authorization、visa/sponsorship、salary、disability、veteran、background-check、relocation、self-identification fields の回答を捏造してはならない。回答が `config/profile.yml` または visible context に明示されていない場合は、`needs_candidate_confirmation` として mark し、候補者に確認するための最も安全な質問を出す。
+
+## Step 7 -- Generate responses
+
+**Draft without saving**（Step 5）の場合、下の 1 と 2、および tailored CV は使わない：どれも別の posting の matched report から来ている。Visible posting、`cv.md`、candidate の profile から generate する。
+
+各 question について、以下に従って response を生成する：
+
+1. **Report context:** Block B の proof points、Block F の STAR stories を使う
+2. **Previous Section H / `## Application Answers`:** Draft か final response があれば base として使い refine
+3. **"I'm choosing you" tone:** Same auto-pipeline framework
+4. **Specificity:** 画面上に見える JD の specific detail を reference
+5. **career-ops proof point:** "Additional info" field があれば含める
+6. **Recruiter-side risk map:** `modes/heuristics/recruiter-side.md` を使い、question が解消しようとしている doubt（motivation、stack fit、logistics、comp、work-auth、availability、seniority）を特定し、そこに直接答える
+7. **Disclosure discipline:** Logistics questions には truthfully に答えるが、unrelated motivation/fit answers で sensitive or HR-only details を自発的に出さない
 
 **日本市場で頻出するフォーム特有の質問：**
-- **希望年収（月額/年額、税込み）** → `profile.yml` のレンジを日本円で、「パッケージ全体に応じて応相談」と注記
-- **雇用形態の希望（正社員/業務委託）** → `profile.yml` に従って回答、または該当する場合は「どちらも対応可能」
-- **稼働開始可能日** → 現在の退職予告期間を考慮した現実的な日付（正社員：通常 1-2 ヶ月）
-- **就労資格** → 明確に回答。日本人の場合：「日本国籍、就労資格は不要」
-- **語学力** → 言語ごとにレベルを記載（ネイティブ、ビジネスレベル、日常会話レベル、初級）
-- **転居の可否** → `profile.yml` のロケーション設定に従って回答
+- **希望年収（月額/年額、税込み）** → `profile.yml` のレンジを日本円で示し、「パッケージ全体に応じて応相談」と注記
+- **雇用形態の希望（正社員/業務委託）** → `profile.yml` に従って回答。該当する場合は「どちらも対応可能」
+- **稼働開始可能日** → 現在の退職予告期間を考慮した現実的な日付（正社員なら通常 1-2 ヶ月）
+- **就労資格** → 明確に回答。未記載なら candidate confirmation が必要
+- **語学力** → 言語ごとに level を記載（native、business、conversational、basic）
+- **転居の可否** → `profile.yml` の location settings に従う
 
-**出力フォーマット：**
+**Output format:**
 
-```
-## [企業名] -- [求人タイトル] への回答
+```text
+## Responses for [Company] -- [Role]
 
-ベース: Report #NNN | スコア: X.X/5 | アーキタイプ: [タイプ]
+Based on: Report #NNN | Score: X.X/5 | Archetype: [type]
+[**Draft without saving** の場合は上の行を次に置き換える："No report: drafted for this posting, not saved"]
 
 ---
 
-### 1. [フォームの質問（原文）]
-> [コピペ用の回答]
+### 1. [Exact form question]
+> [Response ready for copy-paste, or "Ask candidate: ..." if the field needs confirmation]
 
-### 2. [次の質問]
-> [回答]
+### 2. [Next question]
+> [Response]
 
 ...
 
 ---
 
-注記:
-- [求人に関する所見、変更点など]
-- [候補者がレビューすべきパーソナライゼーションの提案]
+Notes:
+- [Any observations about the role, changes, etc.]
+- [Personalization suggestions the candidate should review]
 ```
 
-## ステップ 6 -- 応募後（任意）
+## Step 8 -- Post-apply (optional)
 
-候補者が応募を送信したことを確認した場合：
-1. `applications.md` のステータスを「Evaluated」から「Applied」に更新
-2. レポートのブロック G を最終回答で更新
-3. 次のステップを提案：LinkedIn アウトリーチ用に `/career-ops contacto`
+何かを保存する前に、そして下の各書き込み（status と回答）の直前にもう一度、form がまだ report の posting であることを確認する（`modes/apply.md` → Step 8 → **Write only to the report of this posting**）。同じ employer かつ同じ posting → 以下の step はこの report に対して行う。新しい title への adapt や re-evaluation の後も同じ。別の employer または別 posting → この report には決して書かない：新しい posting 用に書かれた report を使う。なければ status を設定せず、回答も保存せず、application がまだ tracking されていないことを候補者に伝える。
 
-## スクロール対応
+候補者が application を submitted したと確認した場合：
+1. 正規 CLI で status を "Applied" に update: `node set-status.mjs --report <report#> Applied`（`applications.md` のテーブルを手動編集しない）
+2. Final responses を report の `## Application Answers` section に `**State:** submitted` で記録: `node application-answers.mjs --report reports/NNN-company-role-date.md --input answers.json --state submitted`（JSON の field は `node application-answers.mjs --help` を参照）。Section G（Posting Legitimacy）と Section H（evaluation の draft）は変更しない
+3. Next step として LinkedIn outreach 用の `/career-ops contacto` を提案
 
-フォームの質問が表示範囲を超える場合：
-- 候補者にスクロールして別のスクリーンショットを共有してもらう
-- または残りの質問を貼り付けてもらう
-- フォーム全体をカバーするまで繰り返し処理
+## Scroll handling
+
+Form questions が visible area を超える場合：
+- 候補者に scroll して別 screenshot を共有してもらう
+- または remaining questions を paste してもらう
+- Form 全体を cover するまで iteration で処理

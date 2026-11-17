@@ -1,14 +1,14 @@
 ---
-description: AI job search command center -- show menu or evaluate job description
+name: career-ops
+description: career-ops AI job search agent: evaluate offers, scan portals, track applications
 ---
 
-Career-ops router. Arguments provided: "$ARGUMENTS"
+# career-ops
 
-If arguments contain a job description or URL (keywords like "responsibilities", "requirements", "qualifications", "about the role", "http", "https"), the skill will execute auto-pipeline mode.
-
-Otherwise, the discovery menu will be shown.
+$ARGUMENTS
 
 Load the career-ops skill:
-```
+
+```javascript
 skill({ name: "career-ops" })
 ```
