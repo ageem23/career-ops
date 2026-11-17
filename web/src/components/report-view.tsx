@@ -41,7 +41,7 @@ import { extractDeepPrompt } from "@/lib/deep-prompt.mjs";
 import { CvGateCard } from "@/components/cv-gate-card";
 import { OutreachPanel } from "@/components/outreach-panel";
 import { ClaudeCodeMenu, type ClaudeCodeItem } from "@/components/claude-code-menu";
-import { askPrompt, salaryPrompt, sourceEditPrompt } from "@/lib/claude-code-handoff.mjs";
+import { askPrompt, coverBuildPrompt, salaryPrompt, sourceEditPrompt } from "@/lib/claude-code-handoff.mjs";
 import type { Task } from "@/lib/tasks.mjs";
 import type { CvGateState } from "@/lib/cv-gate-server";
 
@@ -74,6 +74,7 @@ export function ReportView({
   tasks = [],
   today = "",
   claudeCwd = "",
+  coverRunLog = null,
 }: {
   id: string;
   app: Application | null;
@@ -103,6 +104,8 @@ export function ReportView({
   contactoPrompt?: string;
   /** Project folder an interactive Claude Code session opens in (claude-code-handoff.mjs). */
   claudeCwd?: string;
+  /** The newest saved web cover draft for this application, as the handoff prompt names it (cover-run-log.mjs). */
+  coverRunLog?: string | null;
   /** This application's rows in data/tasks.md. */
   tasks?: Task[];
   /** Local YYYY-MM-DD, for due-date badges. */
@@ -133,6 +136,9 @@ export function ReportView({
     trackerRow: app?.n ?? null,
   };
   const claudeItems: ClaudeCodeItem[] = [
+    ...(app && report
+      ? [{ label: "Build cover letter", hint: "Run cover mode for this application: questions, draft, then the PDF", prompt: coverBuildPrompt({ ...handoffApp, runLog: coverRunLog }) }]
+      : []),
     ...(app
       ? [{ label: "Salary expectations", hint: "Recommend an answer, then record it in the tracker notes", prompt: salaryPrompt({ ...handoffApp, trackerRow: app.n }) }]
       : []),

@@ -4,6 +4,7 @@ import path from "node:path";
 import { careerOpsRoot } from "@/lib/career-ops";
 import { readJsonObject } from "@/lib/json-body";
 import { EVALUATION_GATE_REASONS } from "@/lib/evaluation-gate.mjs";
+import { coverBriefSection } from "@/lib/cover-run-log.mjs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,6 +15,9 @@ type Body = {
   subtitle?: string;
   page?: string;
   input?: string;
+  kind?: string;
+  /** A cover run's Step 5/6 answers, written to the log for the "Build cover letter" handoff. */
+  brief?: Record<string, string>;
   status?: "done" | "gated";
   gate?: { reason: string; message: string; confirmationRequired: boolean };
   result?: { score: number | null; summary: string };
@@ -44,19 +48,21 @@ export async function POST(req: Request) {
   }
   const steps = (Array.isArray(b.steps) ? b.steps : []).map((s) => `- ${s.kind === "tool" ? `🔧 ${s.label}` : s.label}`).join("\n");
   const verdict = b.result?.score != null ? `${b.result.score}/5 — ${b.result.summary || ""}` : "—";
+  const kind = typeof b.kind === "string" && /^[a-z][a-z0-9-]{0,40}$/.test(b.kind) ? b.kind : "";
+  const answers = kind === "cover" ? coverBriefSection(b.brief) : "";
   const md = `# Web run · ${b.title || b.id}
 
 - id: ${b.id}
 - page: ${b.page || "-"}
 - input: ${b.input || "-"}
-${b.status ? `- status: ${b.status}\n` : ""}- verdict: ${verdict}
+${kind ? `- kind: ${kind}\n` : ""}${b.status ? `- status: ${b.status}\n` : ""}- verdict: ${verdict}
 ${gate ? `
 ## Evaluation stop
 - reason: ${gate.reason}
 - confirmation required: ${gate.confirmationRequired ? "yes" : "no"}
 
 ${gate.message.trim()}
-` : ""}
+` : ""}${answers ? `\n${answers}` : ""}
 
 ## Steps
 ${steps}

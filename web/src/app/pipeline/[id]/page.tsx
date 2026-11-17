@@ -1,5 +1,6 @@
 import { notFound } from "next/navigation";
-import { readReport, findApplication, trackerCanDelete } from "@/lib/career-ops";
+import path from "node:path";
+import { careerOpsRoot, readReport, findApplication, trackerCanDelete } from "@/lib/career-ops";
 import { resolveTailoredCover } from "@/lib/apply/cover";
 import { ReportView } from "@/components/report-view";
 import { pipelineQuery } from "@/lib/pipeline-navigation.mjs";
@@ -16,6 +17,7 @@ import { localISODate } from "@/lib/followups";
 import { applyPostingUrl } from "@/lib/posting-url.mjs";
 import { applicationMetadata } from "@/lib/tab-title-server";
 import { resolveCodeRoot } from "@/lib/core/code-root.mjs";
+import { findLatestCoverRun, promptPath } from "@/lib/cover-run-log.mjs";
 
 export const dynamic = "force-dynamic";
 
@@ -44,6 +46,10 @@ export default async function ReportPage({ params, searchParams }: {
   const disk = await readCvDiskState(id, companyName, (app?.pdf ?? "").includes("✅"), reportNum);
   const pdfFileReady = disk.exists;
   const research = researchContext(id);
+  const claudeCwd = resolveCodeRoot(process.cwd(), process.env);
+  // The newest web cover draft for this application, for the Claude Code
+  // menu's "Build cover letter" (read from the saved run log, not pasted).
+  const coverRun = app && report ? findLatestCoverRun(path.join(careerOpsRoot(), ".career-ops-web", "runs"), id) : null;
   // Same resolution as the report page's "posting" link (a tracker URL cell can be a markdown link).
   const postingUrl =
     applyPostingUrl(parseReport(report?.content ?? "").fields.find((f) => f.label === "URL")?.value, app?.url, app?.applyLink) || "";
@@ -66,7 +72,8 @@ export default async function ReportPage({ params, searchParams }: {
       contactoPrompt={contactoPromptFor(app, postingUrl)}
       tasks={app ? tasksForApp(app.n) : []}
       today={localISODate()}
-      claudeCwd={resolveCodeRoot(process.cwd(), process.env)}
+      claudeCwd={claudeCwd}
+      coverRunLog={coverRun ? promptPath(claudeCwd, coverRun.file) : null}
     />
   );
 }

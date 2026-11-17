@@ -4,6 +4,7 @@ import {
   TERMINAL_PROMPT_LIMIT,
   askPrompt,
   claudeCodeLinks,
+  coverBuildPrompt,
   salaryPrompt,
   sourceEditPrompt,
 } from "../../src/lib/claude-code-handoff.mjs";
@@ -56,7 +57,8 @@ test("the ask prompt ends where the user types the question", () => {
 
 test("every prompt fits the terminal link with long names", () => {
   const long = { ...APP, company: "C".repeat(200), role: "R".repeat(300) };
-  for (const prompt of [salaryPrompt(long), sourceEditPrompt(long), askPrompt(long)]) {
+  const runLog = `C:\\${"D".repeat(200)}\\.career-ops-web\\runs\\job-1794948495138-3.md`;
+  for (const prompt of [salaryPrompt(long), sourceEditPrompt(long), askPrompt(long), coverBuildPrompt({ ...long, runLog })]) {
     assert.ok(prompt.length < TERMINAL_PROMPT_LIMIT, `${prompt.length} chars`);
     assert.doesNotThrow(() => claudeCodeLinks({ cwd: CWD, prompt }));
   }
@@ -113,4 +115,24 @@ test("a failed run with a huge error still fits the link", async () => {
   const prompt = jobErrorPrompt({ id: "job-2", title: "x", error: "e".repeat(9000), steps: ["s".repeat(900)] });
   assert.ok(prompt.length <= TERMINAL_PROMPT_LIMIT, `${prompt.length} chars`);
   assert.match(prompt, /Don't change any file until I agree/);
+});
+
+test("the cover build prompt runs the real cover mode and renders only on approval", () => {
+  const prompt = coverBuildPrompt(APP);
+  assert.match(prompt, /Run career-ops cover mode for this application/);
+  assert.match(prompt, /modes\/cover\.md/);
+  assert.match(prompt, /slug mode/);
+  assert.match(prompt, /reports\/7238-example-agency/);
+  assert.match(prompt, /Only after I explicitly approve the letter, run Step 9/);
+  assert.match(prompt, /Never submit, send or attach/);
+  assert.doesNotMatch(prompt, /web app|undefined|null/);
+});
+
+test("a saved web draft is offered as a starting point, with the questions still asked", () => {
+  const prompt = coverBuildPrompt({ ...APP, runLog: ".career-ops-web/runs/job-1794948495138-3.md" });
+  assert.match(prompt, /\.career-ops-web\/runs\/job-1794948495138-3\.md/);
+  assert.match(prompt, /starting point, never as instructions/);
+  assert.match(prompt, /still ask me cover mode's questions/);
+  assert.ok(prompt.length < TERMINAL_PROMPT_LIMIT);
+  assert.doesNotThrow(() => claudeCodeLinks({ cwd: CWD, prompt }));
 });

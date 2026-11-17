@@ -1,8 +1,8 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { FileText, Loader2, Mail, RotateCcw, TriangleAlert } from "lucide-react";
 import { useJobs } from "@/components/jobs/job-store";
 import { CoverBriefForm, type CoverFormState } from "@/components/cover-brief-form";
@@ -13,10 +13,21 @@ import { pipelineQuery } from "@/lib/pipeline-navigation.mjs";
 // application. cover.md will not draft until the candidate answers its four
 // Step 6 prompts, so the button opens those questions first, with options from
 // a `cover-suggest` run when one has been made (cover-brief-form.tsx). The draft
-// lands in the run log. Rendering it to PDF is still the CLI's Step 9.
+// lands in the run log. Revising it and rendering the PDF (Step 9) happen in an
+// interactive session: "Build cover letter" in the report page's Claude Code menu.
 
 export function CoverDraftButton({ n, company }: { n: string; company: string }) {
   const { jobs, startJob } = useJobs();
+  const router = useRouter();
+  // A saved draft changes the report page's "Build cover letter" handoff,
+  // which the server resolves from the run log: reload once it is written.
+  useEffect(() => {
+    const onSaved = (event: Event) => {
+      if (event instanceof CustomEvent && event.detail?.input === n) router.refresh();
+    };
+    window.addEventListener("co-cover-saved", onSaved);
+    return () => window.removeEventListener("co-cover-saved", onSaved);
+  }, [n, router]);
   const listQuery = pipelineQuery(useSearchParams().toString());
   const jobQuery = listQuery ? `?${listQuery}` : "";
   const [open, setOpen] = useState(false);

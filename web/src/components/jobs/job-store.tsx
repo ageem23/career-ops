@@ -207,11 +207,23 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
           settleRepairOf(status);
           // persist a readable log file so the CLI/assistant can read past runs
           if (status === "done" || status === "gated") {
+            // A cover run's answers go in its log too: the report page's
+            // "Build cover letter" handoff reads the draft and the answers
+            // from that file (cover-run-log.mjs).
+            const cover = opts.kind === "cover";
             fetch("/api/runs/save", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ id, title: opts.title, subtitle: opts.subtitle, page: opts.page, input: opts.input, status, gate, result, cost, steps, output: text }),
-            }).catch(() => {});
+              body: JSON.stringify({ id, title: opts.title, subtitle: opts.subtitle, page: opts.page, input: opts.input, kind: opts.kind, brief: cover ? opts.brief : undefined, status, gate, result, cost, steps, output: text }),
+            })
+              .then((res) => {
+                // The handoff is resolved server-side from the saved log, so
+                // the report page refreshes once the file is on disk.
+                if (cover && res.ok && typeof window !== "undefined") {
+                  window.dispatchEvent(new CustomEvent("co-cover-saved", { detail: { input: opts.input } }));
+                }
+              })
+              .catch(() => {});
             // Tell server-snapshot surfaces (Today, pipeline) to refetch — the
             // worker just wrote a real tracker row / report they don't yet see.
             if (status === "done" && typeof window !== "undefined" && (opts.kind === "evaluate" || opts.kind === "pdf")) {
